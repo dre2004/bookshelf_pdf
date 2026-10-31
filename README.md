@@ -1,5 +1,8 @@
 # bookshelf_pdf
 
+[![CI](https://github.com/dre2004/bookshelf_pdf/actions/workflows/ci.yml/badge.svg)](https://github.com/dre2004/bookshelf_pdf/actions/workflows/ci.yml)
+[![License: AGPL-3.0-or-later](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](LICENSE)
+
 A cross-platform PDF reader built for books — Windows, macOS and Linux.
 
 Rendering is powered by [PDFium](https://pdfium.googlesource.com/pdfium/) (the
@@ -61,6 +64,8 @@ scripts\win-env.cmd npm run tauri dev
 
 ## Building a release bundle
 
+Locally:
+
 ```bash
 npm run tauri build
 ```
@@ -68,6 +73,26 @@ npm run tauri build
 Installers land in `src-tauri/target/release/bundle/` (MSI/NSIS on Windows,
 dmg on macOS, deb/rpm/AppImage on Linux). The PDFium library is bundled as a
 resource automatically.
+
+### Release pipeline
+
+Push a version tag (`v0.1.0`, `v0.2.0`, …) and GitHub Actions builds every
+platform and attaches the installers to a **draft** GitHub Release — review it
+and publish:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+## Development
+
+- `npm test` — frontend unit tests (vitest)
+- `cargo test` in `src-tauri` — Rust unit tests plus a PDFium render smoke
+  test (run `npm run fetch:pdfium` first)
+- CI runs on every push and pull request: `cargo fmt --check`, strict clippy,
+  Rust tests, frontend tests and a full typechecked build
+  ([workflows](.github/workflows/))
 
 ## Architecture
 
