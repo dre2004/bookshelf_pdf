@@ -42,6 +42,48 @@ pub const KOKORO_VOICE_SPECS: &[(&str, &str, &str, &str)] = &[
 
 const HF_BASE: &str = "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main";
 
+/// Trims leading/trailing near-silence, keeping a small margin so onset
+/// consonants are not clipped.
+fn trim_silence(samples: &mut Vec<f32>, sample_rate: u32) {
+    const THRESHOLD: f32 = 0.005;
+    let margin = (sample_rate as usize * 30 / 1000).min(samples.len() / 4);
+    let Some(first) = samples.iter().position(|s| s.abs() > THRESHOLD) else {
+        samples.clear();
+        return;
+    };
+    let Some(last) = samples.iter().rposition(|s| s.abs() > THRESHOLD) else {
+        samples.clear();
+        return;
+    };
+    if first >= last {
+        samples.clear();
+        return;
+    }
+    let start = first.saturating_sub(margin);
+    let end = (last + 1 + margin).min(samples.len());
+    samples.drain(end..);
+    samples.drain(..start);
+}
+
+/// Substitutes homographs with a homophone when the preceding word makes
+/// the intent unambiguous. Heuristic, applied after typographic
+/// normalization; extend as mispronunciations are reported.
+fn homograph_substitute(prev: Option<&str>, word: &str) -> Option<&'static str> {
+    if !word.eq_ignore_ascii_case("read") {
+        return None;
+    }
+    // "to read", "how to read", "will/can/should read", ... = present
+    // tense (rhymes with "reed"). Bare "read" stays the dictionary's
+    // default (past tense).
+    const PRESENT_AFTER: &[&str] = &[
+        "to", "will", "can", "could", "should", "would", "must", "may", "might", "let's", "lets",
+        "want", "wants", "wanted", "going", "about", "how", "get", "help", "helps", "love",
+        "loves", "like", "likes", "liked",
+    ];
+    let prev = prev?.to_ascii_lowercase();
+    PRESENT_AFTER.contains(&prev.as_str()).then_some("reed")
+}
+
 /// Maps smart quotes/apostrophes/dashes to their ASCII equivalents for
 /// G2P; unknown characters are dropped by the tokenizer anyway.
 fn normalize_typographic(text: &str) -> String {
@@ -172,13 +214,16 @@ impl KokoroModel {
         // as "y-o-u-r-e").
         let text = normalize_typographic(text);
         let mut words = Vec::new();
+        let mut prev: Option<&str> = None;
         for word in text.split_whitespace() {
             use piper_plus_g2p::Phonemizer as _;
+            let spoken = homograph_substitute(prev, word).unwrap_or(word);
             let (tokens, _) = self
                 .phonemizer
-                .phonemize_with_prosody(word)
+                .phonemize_with_prosody(spoken)
                 .map_err(|e| format!("phonemize: {e}"))?;
             words.push(tokens.concat());
+            prev = Some(word);
         }
         let trailing: String = text
             .chars()
@@ -252,7 +297,12 @@ impl KokoroModel {
             let (_, samples) = outputs[0]
                 .try_extract_tensor::<f32>()
                 .map_err(|e| format!("audio output: {e}"))?;
-            audio.extend_from_slice(samples);
+            // Kokoro pads each window with silence; sentence-sized chunks
+            // would stack that dead air at every chunk boundary. Trim the
+            // edges (keeping a small margin) so narration flows.
+            let mut window = samples.to_vec();
+            trim_silence(&mut window, SAMPLE_RATE);
+            audio.extend_from_slice(&window);
         }
         Ok((audio, SAMPLE_RATE))
     }
@@ -429,6 +479,33 @@ mod g2p_tests {
             normalize_typographic("\u{201C}hi\u{201D} \u{2014} ok"),
             "\"hi\" - ok"
         );
+    }
+
+    #[test]
+    fn trim_silence_removes_dead_air_but_keeps_margin() {
+        let mut samples = vec![0.0; 1000];
+        for value in samples[400..600].iter_mut() {
+            *value = 0.5;
+        }
+        trim_silence(&mut samples, 24_000);
+        // margin = min(30ms, len/4) = min(720, 250) = 250, so the 200-sample
+        // burst keeps a 250-sample margin on each side.
+        assert_eq!(samples.len(), 700, "unexpected length: {}", samples.len());
+        assert!(samples.iter().any(|s| s.abs() > 0.1));
+
+        let mut silent = vec![0.0; 500];
+        trim_silence(&mut silent, 24_000);
+        assert!(silent.is_empty());
+    }
+
+    #[test]
+    fn present_tense_read_substitutes_reed() {
+        assert_eq!(homograph_substitute(Some("to"), "read"), Some("reed"));
+        assert_eq!(homograph_substitute(Some("To"), "Read"), Some("reed"));
+        assert_eq!(homograph_substitute(Some("how"), "read"), Some("reed"));
+        assert_eq!(homograph_substitute(None, "read"), None);
+        assert_eq!(homograph_substitute(Some("have"), "read"), None);
+        assert_eq!(homograph_substitute(Some("to"), "book"), None);
     }
 
     /// The original report: "If You're new here" with a typographic
