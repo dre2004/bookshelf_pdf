@@ -1,6 +1,6 @@
 [package]
 name = "bookshelf-pdf"
-version = "0.1.0"
+version = "0.2.0"
 description = "Cross-platform PDF book reader built with Tauri 2 and PDFium"
 authors = ["Andres"]
 license = "AGPL-3.0-or-later"

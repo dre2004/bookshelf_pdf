@@ -13,18 +13,23 @@ TypeScript frontend.
 ## Features
 
 - High-fidelity PDF rendering via PDFium, with a byte-bounded render cache
-- Paged mode (keyboard / on-screen page turns) and continuous scroll mode
+- Paged mode (single page or two-page spread) and continuous scroll mode
 - Fit-width / fit-page zoom plus discrete zoom steps
 - Library shelf with cover thumbnails, reading progress and a
   continue-reading card (stored in SQLite, non-destructive — files are never
   moved or modified)
 - Auto-resume: reading position (page + position within the page) is saved
   continuously and restored when reopening a book
-- Persistent settings: reading mode, theme and zoom survive restarts
-- Password-protected PDFs (unlock prompt)
+- Selectable text: copy natively or from the selection menu
+- Full-text search (Ctrl+F) with match navigation and on-page highlighting
+- Outline/table of contents, page thumbnails and named bookmarks (Ctrl+B)
+  in a sidebar
+- Highlights in four colors with per-highlight notes, anchored to text
+  positions and stored non-destructively
+- Persistent settings: mode, spread, theme and zoom survive restarts;
+  window size and position are remembered too
+- Password-protected PDFs (unlock prompt); PDF file association
 - Day / sepia / night themes
-- (Roadmap: named bookmarks, full-text search, text selection & copy, outline
-  and thumbnails, highlights & notes)
 
 ## Prerequisites
 
