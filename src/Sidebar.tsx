@@ -158,6 +158,17 @@ export default function Sidebar({
 }: Props) {
   const [scrollEl, setScrollEl] = useState<HTMLElement | null>(null);
 
+  /** Jump to the nearest bookmark before/after the current page, wrapping. */
+  const jumpBookmark = (direction: 1 | -1) => {
+    const pages = bookmarks.map((b) => b.page);
+    if (pages.length === 0) return;
+    const target =
+      direction === 1
+        ? pages.find((p) => p > page) ?? pages[0]
+        : [...pages].reverse().find((p) => p < page) ?? pages[pages.length - 1];
+    onJumpPage(target);
+  };
+
   return (
     <aside className="sidebar">
       <div className="sidebar-tabs" role="tablist">
@@ -210,6 +221,24 @@ export default function Sidebar({
           </div>
         ) : tab === "bookmarks" ? (
           <>
+            <div className="bookmark-nav">
+              <button
+                className="btn small"
+                disabled={bookmarks.length === 0}
+                onClick={() => jumpBookmark(-1)}
+                title="Previous bookmark"
+              >
+                ‹ Prev mark
+              </button>
+              <button
+                className="btn small"
+                disabled={bookmarks.length === 0}
+                onClick={() => jumpBookmark(1)}
+                title="Next bookmark"
+              >
+                Next mark ›
+              </button>
+            </div>
             <button className="btn primary sidebar-action" onClick={onAddBookmark}>
               + Bookmark page {page + 1}
             </button>

@@ -92,6 +92,10 @@ export default function App() {
   const [bookmarks, setBookmarks] = useState<Bookmark[]>([]);
   const [highlights, setHighlights] = useState<Highlight[]>([]);
 
+  // Back/forward navigation stacks (pages+offsets you jumped away from).
+  const [history, setHistory] = useState<{ page: number; offset: number }[]>([]);
+  const [future, setFuture] = useState<{ page: number; offset: number }[]>([]);
+
   const [search, setSearch] = useState<{
     open: boolean;
     query: string;
@@ -213,8 +217,13 @@ export default function App() {
     }
   }, []);
 
+  // Always-current reading position (survives flushes) — the source for
+  // back/forward history entries.
+  const positionRef = useRef<{ page: number; offset: number }>({ page: 0, offset: 0 });
+
   const scheduleSave = useCallback(
     (bookId: number, nextPage: number, offset: number) => {
+      positionRef.current = { page: nextPage, offset };
       if (bookId < 0) return;
       lastProgress.current = { bookId, page: nextPage, offset };
       if (saveTimer.current !== null) window.clearTimeout(saveTimer.current);
@@ -272,6 +281,9 @@ export default function App() {
         setDims(doc.pages);
         setPage(restore?.page ?? 0);
         setResume(restore);
+        positionRef.current = { page: restore?.page ?? 0, offset: restore?.offset ?? 0 };
+        setHistory([]);
+        setFuture([]);
         setPasswordFor(null);
         setPassword("");
         setView("reader");
@@ -365,9 +377,14 @@ export default function App() {
     [scheduleSave],
   );
 
-  /** Jump to a page (and fractional position) from sidebar/search actions. */
+  /** Jump to a page (and fractional position) from sidebar/search actions.
+   *  Jumps are recorded so Back can return to where you were reading. */
   const jumpTo = useCallback(
-    (target: number, offset = 0) => {
+    (target: number, offset = 0, opts?: { push?: boolean }) => {
+      if (opts?.push !== false) {
+        setHistory((h) => [...h.slice(-49), positionRef.current]);
+        setFuture([]);
+      }
       changePage(target);
       if (mode === "scroll" && offset > 0) {
         // The reader applies offsets only on document restore; approximate a
@@ -385,15 +402,29 @@ export default function App() {
     [changePage, mode],
   );
 
+  const goBack = useCallback(() => {
+    if (history.length === 0) return;
+    const target = history[history.length - 1];
+    setHistory((h) => h.slice(0, -1));
+    setFuture((f) => [...f.slice(-49), positionRef.current]);
+    jumpTo(target.page, target.offset, { push: false });
+  }, [history, jumpTo]);
+
+  const goForward = useCallback(() => {
+    if (future.length === 0) return;
+    const target = future[future.length - 1];
+    setFuture((f) => f.slice(0, -1));
+    setHistory((h) => [...h.slice(-49), positionRef.current]);
+    jumpTo(target.page, target.offset, { push: false });
+  }, [future, jumpTo]);
+
   // ---- bookmarks ----
   const addBookmarkNow = useCallback(async () => {
     const book = currentRef.current;
     if (!book || book.bookId < 0) return;
-    const progress = lastProgress.current;
-    const targetPage = page;
-    const offset = progress && progress.page === page ? progress.offset : 0;
+    const offset = positionRef.current.page === page ? positionRef.current.offset : 0;
     try {
-      await bookmarksAdd(book.bookId, targetPage, offset, `Page ${targetPage + 1}`);
+      await bookmarksAdd(book.bookId, page, offset, `Page ${page + 1}`);
       setBookmarks(await bookmarksList(book.bookId));
       setSidebarTab("bookmarks");
     } catch (e) {
@@ -558,6 +589,12 @@ export default function App() {
       }
       const last = current.doc.pageCount - 1;
       const step = mode === "paged" && spread ? 2 : 1;
+      if (e.altKey && (e.key === "ArrowLeft" || e.key === "ArrowRight")) {
+        e.preventDefault();
+        if (e.key === "ArrowLeft") goBack();
+        else goForward();
+        return;
+      }
       switch (e.key) {
         case "Escape":
           if (search.open) setSearch((s) => ({ ...s, open: false }));
@@ -622,6 +659,8 @@ export default function App() {
     spread,
     search.open,
     goLibrary,
+    goBack,
+    goForward,
     pickFile,
     scheduleSave,
     changeZoom,
@@ -657,6 +696,10 @@ export default function App() {
           onToggleSidebar={() => setSidebarTab((t) => (t === null ? "outline" : null))}
           onSearch={() => setSearch((s) => ({ ...s, open: true }))}
           onAddBookmark={() => void addBookmarkNow()}
+          onBack={goBack}
+          onForward={goForward}
+          canBack={history.length > 0}
+          canForward={future.length > 0}
           spread={spread}
           onSpreadChange={changeSpread}
         />

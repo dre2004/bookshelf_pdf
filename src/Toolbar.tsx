@@ -20,6 +20,10 @@ interface Props {
   onToggleSidebar: () => void;
   onSearch: () => void;
   onAddBookmark: () => void;
+  onBack: () => void;
+  onForward: () => void;
+  canBack: boolean;
+  canForward: boolean;
   spread: boolean;
   onSpreadChange: (spread: boolean) => void;
 }
@@ -42,6 +46,10 @@ export default function Toolbar({
   onToggleSidebar,
   onSearch,
   onAddBookmark,
+  onBack,
+  onForward,
+  canBack,
+  canForward,
   spread,
   onSpreadChange,
 }: Props) {
@@ -90,6 +98,22 @@ export default function Toolbar({
       </div>
 
       <div className="toolbar-group">
+        <button
+          className="btn icon"
+          disabled={!canBack}
+          onClick={onBack}
+          title="Back to where you were reading (Alt+←)"
+        >
+          ←
+        </button>
+        <button
+          className="btn icon"
+          disabled={!canForward}
+          onClick={onForward}
+          title="Forward (Alt+→)"
+        >
+          →
+        </button>
         <button className="btn icon" disabled={disabled} onClick={() => onPageChange(page - 1)} title="Previous page (Page Up / ←)">
           ‹
         </button>

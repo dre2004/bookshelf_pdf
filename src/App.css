@@ -741,6 +741,16 @@ body,
   margin-bottom: 10px;
 }
 
+.bookmark-nav {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.bookmark-nav .btn {
+  flex: 1;
+}
+
 .outline-list {
   list-style: none;
   margin: 0;
