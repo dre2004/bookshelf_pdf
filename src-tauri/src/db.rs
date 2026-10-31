@@ -151,7 +151,15 @@ impl Db {
             params![path, title, page_count as i64, now],
         )
         .map_err(|e| e.to_string())?;
-        Ok(conn.last_insert_rowid())
+        // last_insert_rowid() is wrong on the conflict path (it returns the
+        // rowid of whatever insert ran last on this connection), which handed
+        // back invalid book ids for already-registered books. Read the row.
+        conn.query_row(
+            "SELECT id FROM books WHERE path = ?1",
+            params![path],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())
     }
 
     pub fn set_cover(&self, book_id: i64, png: Vec<u8>) -> Result<(), String> {
@@ -489,6 +497,25 @@ mod tests {
         let a = books.iter().find(|b| b.path == "a.pdf").unwrap();
         assert_eq!(a.title, "A (edited)");
         assert_eq!(a.page_count, 42);
+    }
+
+    #[test]
+    fn add_or_touch_returns_stable_id_despite_interleaved_inserts() {
+        // Reopening a registered book takes the ON CONFLICT update path, so
+        // last_insert_rowid() (the old implementation) would return the
+        // rowid of the latest insert on the connection — e.g. a settings
+        // row — which broke bookmark foreign keys and silently dropped
+        // progress saves for existing books.
+        let db = test_db();
+        let id = db.add_or_touch_book("a.pdf", "A", 10).unwrap();
+        db.settings_set("theme", "\"night\"").unwrap();
+        db.settings_set("readMode", "\"scroll\"").unwrap();
+        let id_again = db.add_or_touch_book("a.pdf", "A", 10).unwrap();
+        assert_eq!(id, id_again);
+
+        // And the id is usable for child rows.
+        db.add_bookmark(id_again, 3, 0.0, "works now").unwrap();
+        assert_eq!(db.list_bookmarks(id_again).unwrap().len(), 1);
     }
 
     #[test]
