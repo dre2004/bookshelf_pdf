@@ -22,10 +22,11 @@ jobs:
             pdfium-target: linux-x64
           - platform: windows-latest
             pdfium-target: win32-x64
+          # Apple Silicon native: ort-sys cannot cross-link the x86_64
+          # xcframework slice on arm64 runners, so Intel builds wait on an
+          # onnxruntime load-dynamic setup.
           - platform: macos-latest
-            pdfium-target: darwin-universal
-            rust-targets: x86_64-apple-darwin,aarch64-apple-darwin
-            tauri-args: --target universal-apple-darwin
+            pdfium-target: darwin-arm64
 
     runs-on: ${{ matrix.platform }}
     env:
