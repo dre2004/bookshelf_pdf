@@ -5,8 +5,8 @@ use std::{
     collections::HashMap,
     path::PathBuf,
     sync::{
-        atomic::{AtomicU32, Ordering},
         Arc, Mutex,
+        atomic::{AtomicU32, Ordering},
     },
 };
 
@@ -95,14 +95,19 @@ impl Engine {
         if let Ok(resource_dir) = app.path().resource_dir() {
             candidates.push(resource_dir.join("pdfium").join(PDFIUM_LIBRARY_FILENAME));
         }
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(dir) = exe.parent() {
-                candidates.push(dir.join(PDFIUM_LIBRARY_FILENAME));
-                candidates.push(dir.join("pdfium").join(PDFIUM_LIBRARY_FILENAME));
-            }
+        if let Some(dir) = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|p| p.to_path_buf()))
+        {
+            candidates.push(dir.join(PDFIUM_LIBRARY_FILENAME));
+            candidates.push(dir.join("pdfium").join(PDFIUM_LIBRARY_FILENAME));
         }
         if let Ok(cwd) = std::env::current_dir() {
-            candidates.push(cwd.join("resources").join("pdfium").join(PDFIUM_LIBRARY_FILENAME));
+            candidates.push(
+                cwd.join("resources")
+                    .join("pdfium")
+                    .join(PDFIUM_LIBRARY_FILENAME),
+            );
             candidates.push(
                 cwd.join("src-tauri")
                     .join("resources")
@@ -212,11 +217,9 @@ impl Engine {
                 .map_err(|e| ApiError::RenderFailed {
                     reason: pdfium_error_reason(&e),
                 })?;
-            bitmap
-                .as_image()
-                .map_err(|e| ApiError::RenderFailed {
-                    reason: pdfium_error_reason(&e),
-                })?
+            bitmap.as_image().map_err(|e| ApiError::RenderFailed {
+                reason: pdfium_error_reason(&e),
+            })?
         };
 
         // Fast deflate keeps encode time small; page images are cache-only
@@ -267,6 +270,7 @@ struct RenderCache {
     entries: HashMap<CacheKey, (Arc<Vec<u8>>, u64)>,
     total_bytes: usize,
     tick: u64,
+    max_bytes: usize,
 }
 
 type CacheKey = (u32, PdfPageIndex, u32);
@@ -276,10 +280,15 @@ const RENDER_CACHE_MAX_BYTES: usize = 192 * 1024 * 1024;
 
 impl RenderCache {
     fn new() -> Self {
+        Self::with_max_bytes(RENDER_CACHE_MAX_BYTES)
+    }
+
+    fn with_max_bytes(max_bytes: usize) -> Self {
         Self {
             entries: HashMap::new(),
             total_bytes: 0,
             tick: 0,
+            max_bytes,
         }
     }
 
@@ -300,7 +309,7 @@ impl RenderCache {
             self.total_bytes = self.total_bytes.saturating_sub(old.len());
         }
         self.total_bytes += len;
-        while self.total_bytes > RENDER_CACHE_MAX_BYTES && self.entries.len() > 1 {
+        while self.total_bytes > self.max_bytes && self.entries.len() > 1 {
             let evict_key = self
                 .entries
                 .iter()
@@ -322,5 +331,62 @@ impl RenderCache {
                 true
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(bytes: u8) -> Arc<Vec<u8>> {
+        Arc::new(vec![0u8; bytes as usize])
+    }
+
+    #[test]
+    fn cache_hit_and_miss() {
+        let mut cache = RenderCache::with_max_bytes(1000);
+        assert!(cache.get(&(1, 0, 800)).is_none());
+        cache.insert((1, 0, 800), entry(10));
+        assert_eq!(cache.get(&(1, 0, 800)).unwrap().len(), 10);
+        assert!(cache.get(&(1, 1, 800)).is_none());
+    }
+
+    #[test]
+    fn eviction_removes_least_recently_used() {
+        let mut cache = RenderCache::with_max_bytes(35);
+        cache.insert((1, 0, 800), entry(10)); // LRU order: p0
+        cache.insert((1, 1, 800), entry(10)); // p0, p1
+        cache.insert((1, 2, 800), entry(10)); // p0, p1, p2
+        assert_eq!(cache.total_bytes, 30);
+        cache.get(&(1, 0, 800)); // touch p0 -> p1, p2, p0
+
+        cache.insert((1, 3, 800), entry(10)); // 40 > 35 -> evicts p1
+
+        assert!(cache.get(&(1, 1, 800)).is_none());
+        assert!(cache.get(&(1, 0, 800)).is_some());
+        assert!(cache.get(&(1, 2, 800)).is_some());
+        assert!(cache.get(&(1, 3, 800)).is_some());
+        assert_eq!(cache.total_bytes, 30);
+    }
+
+    #[test]
+    fn reinserting_same_key_keeps_total_bytes_consistent() {
+        let mut cache = RenderCache::with_max_bytes(30);
+        cache.insert((1, 0, 800), entry(10));
+        cache.insert((1, 0, 800), entry(20));
+        cache.insert((1, 0, 800), entry(10));
+        assert_eq!(cache.total_bytes, 10);
+        assert_eq!(cache.entries.len(), 1);
+    }
+
+    #[test]
+    fn retain_doc_drops_only_that_document() {
+        let mut cache = RenderCache::with_max_bytes(1000);
+        cache.insert((1, 0, 800), entry(10));
+        cache.insert((2, 0, 800), entry(10));
+        cache.retain_doc(1);
+        assert!(cache.get(&(1, 0, 800)).is_none());
+        assert!(cache.get(&(2, 0, 800)).is_some());
+        assert_eq!(cache.total_bytes, 10);
     }
 }

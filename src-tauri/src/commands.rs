@@ -54,7 +54,10 @@ pub fn book_register(
 }
 
 #[tauri::command]
-pub fn book_state(db: tauri::State<'_, Arc<Db>>, book_id: i64) -> Result<Option<BookState>, String> {
+pub fn book_state(
+    db: tauri::State<'_, Arc<Db>>,
+    book_id: i64,
+) -> Result<Option<BookState>, String> {
     Ok(db.book_state(book_id))
 }
 

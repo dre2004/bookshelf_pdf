@@ -37,7 +37,11 @@ fn render_blank_page_to_png() {
         .set_format(PdfBitmapFormat::BGRA)
         .set_clear_color(PdfColor::WHITE);
     let bitmap = page.render_with_config(&config).unwrap();
-    assert!((380..=420).contains(&bitmap.width()), "unexpected width {}", bitmap.width());
+    assert!(
+        (380..=420).contains(&bitmap.width()),
+        "unexpected width {}",
+        bitmap.width()
+    );
 
     let image = bitmap.as_image().unwrap();
     let mut png = Vec::new();
@@ -45,5 +49,9 @@ fn render_blank_page_to_png() {
         .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
         .unwrap();
     assert_eq!(&png[0..4], b"\x89PNG", "output is not a PNG");
-    assert!(png.len() > 500, "PNG suspiciously small: {} bytes", png.len());
+    assert!(
+        png.len() > 500,
+        "PNG suspiciously small: {} bytes",
+        png.len()
+    );
 }

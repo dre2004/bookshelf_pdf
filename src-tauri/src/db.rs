@@ -4,7 +4,7 @@
 
 use std::{collections::HashMap, path::Path, sync::Mutex};
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use tauri::Manager;
 
@@ -50,6 +50,11 @@ impl Db {
 
     fn connect(path: &Path) -> Result<Connection, String> {
         let conn = Connection::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        Self::init_schema(&conn)?;
+        Ok(conn)
+    }
+
+    fn init_schema(conn: &Connection) -> Result<(), String> {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              CREATE TABLE IF NOT EXISTS books (
@@ -69,10 +74,15 @@ impl Db {
              );",
         )
         .map_err(|e| format!("migrate: {e}"))?;
-        Ok(conn)
+        Ok(())
     }
 
-    pub fn add_or_touch_book(&self, path: &str, title: &str, page_count: u32) -> Result<i64, String> {
+    pub fn add_or_touch_book(
+        &self,
+        path: &str,
+        title: &str,
+        page_count: u32,
+    ) -> Result<i64, String> {
         let conn = self.conn.lock().unwrap();
         let now = now_ms();
         conn.execute(
@@ -114,7 +124,12 @@ impl Db {
             .flatten()
     }
 
-    pub fn update_progress(&self, book_id: i64, last_page: i32, last_offset: f64) -> Result<(), String> {
+    pub fn update_progress(
+        &self,
+        book_id: i64,
+        last_page: i32,
+        last_offset: f64,
+    ) -> Result<(), String> {
         self.conn
             .lock()
             .unwrap()
@@ -187,17 +202,22 @@ impl Db {
                 })
             })
             .map_err(|e| e.to_string())?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
     }
 
     pub fn settings_get_all(&self) -> Result<HashMap<String, String>, String> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt =
-            conn.prepare("SELECT key, value FROM settings").map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        let mut stmt = conn
+            .prepare("SELECT key, value FROM settings")
             .map_err(|e| e.to_string())?;
-        rows.collect::<Result<HashMap<_, _>, _>>().map_err(|e| e.to_string())
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<HashMap<_, _>, _>>()
+            .map_err(|e| e.to_string())
     }
 
     pub fn settings_set(&self, key: &str, value: &str) -> Result<(), String> {
@@ -219,4 +239,104 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_db() -> Db {
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+        Db::init_schema(&conn).expect("init schema");
+        Db {
+            conn: Mutex::new(conn),
+        }
+    }
+
+    #[test]
+    fn settings_roundtrip_and_overwrite() {
+        let db = test_db();
+        assert!(db.settings_get_all().unwrap().is_empty());
+
+        db.settings_set("theme", "\"night\"").unwrap();
+        db.settings_set("theme", "\"sepia\"").unwrap();
+        db.settings_set("readMode", "\"scroll\"").unwrap();
+
+        let all = db.settings_get_all().unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all.get("theme").unwrap(), "\"sepia\"");
+        assert_eq!(all.get("readMode").unwrap(), "\"scroll\"");
+    }
+
+    #[test]
+    fn add_or_touch_updates_existing_book() {
+        let db = test_db();
+        let id_first = db.add_or_touch_book("a.pdf", "A", 10).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let id_again = db.add_or_touch_book("a.pdf", "A (edited)", 42).unwrap();
+        let id_other = db.add_or_touch_book("b.pdf", "B", 5).unwrap();
+
+        assert_eq!(id_first, id_again);
+        assert_ne!(id_first, id_other);
+
+        let books = db.list_books().unwrap();
+        let a = books.iter().find(|b| b.path == "a.pdf").unwrap();
+        assert_eq!(a.title, "A (edited)");
+        assert_eq!(a.page_count, 42);
+    }
+
+    #[test]
+    fn progress_save_and_restore() {
+        let db = test_db();
+        let id = db.add_or_touch_book("book.pdf", "Book", 200).unwrap();
+
+        assert_eq!(db.book_state(id).expect("state exists").last_page, 0);
+
+        db.update_progress(id, 87, 0.42).unwrap();
+        let state = db.book_state(id).expect("state exists");
+        assert_eq!(state.last_page, 87);
+        assert!((state.last_offset - 0.42).abs() < 1e-9);
+
+        let books = db.list_books().unwrap();
+        assert_eq!(books[0].progress_pct, 44); // 87/200 rounded
+    }
+
+    #[test]
+    fn remove_book_deletes_only_target() {
+        let db = test_db();
+        let a = db.add_or_touch_book("a.pdf", "A", 10).unwrap();
+        let b = db.add_or_touch_book("b.pdf", "B", 10).unwrap();
+        db.remove_book(a).unwrap();
+
+        let books = db.list_books().unwrap();
+        assert_eq!(books.len(), 1);
+        assert_eq!(books[0].book_id, b);
+    }
+
+    #[test]
+    fn list_books_orders_by_recently_opened() {
+        let db = test_db();
+        let a = db.add_or_touch_book("a.pdf", "A", 10).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let b = db.add_or_touch_book("b.pdf", "B", 10).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        db.update_progress(a, 1, 0.0).unwrap(); // touches last_opened_at
+
+        let books = db.list_books().unwrap();
+        assert_eq!(books[0].book_id, a);
+        assert_eq!(books[1].book_id, b);
+    }
+
+    #[test]
+    fn cover_roundtrip() {
+        let db = test_db();
+        let id = db.add_or_touch_book("a.pdf", "A", 10).unwrap();
+
+        assert!(db.cover(id).is_none());
+        assert!(!db.list_books().unwrap()[0].has_cover);
+
+        db.set_cover(id, vec![1, 2, 3]).unwrap();
+        assert_eq!(db.cover(id).unwrap(), vec![1, 2, 3]);
+        assert!(db.list_books().unwrap()[0].has_cover);
+    }
 }
