@@ -1,6 +1,7 @@
 mod commands;
 mod db;
 mod pdfium_engine;
+mod tts;
 
 use std::sync::Arc;
 
@@ -89,8 +90,10 @@ pub fn run() {
         .setup(|app| {
             let engine = Engine::new(app.handle()).map_err(std::io::Error::other)?;
             let db = Db::open(app.handle()).map_err(std::io::Error::other)?;
+            let tts = tts::TtsEngine::new(app.handle().clone());
             app.manage(Arc::new(engine));
             app.manage(Arc::new(db));
+            app.manage(Arc::new(tts));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -114,7 +117,12 @@ pub fn run() {
             commands::library_remove,
             commands::settings_all,
             commands::settings_set,
-            commands::get_startup_file
+            commands::get_startup_file,
+            commands::tts_voices,
+            commands::tts_speak,
+            commands::tts_pause,
+            commands::tts_resume,
+            commands::tts_stop
         ])
         .register_asynchronous_uri_scheme_protocol("pdfimg", |ctx, request, responder| {
             let engine = ctx.app_handle().state::<Arc<Engine>>().inner().clone();

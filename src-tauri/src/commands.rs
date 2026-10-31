@@ -6,6 +6,7 @@ use crate::db::{BookState, BookSummary, Bookmark, Db, Highlight, NewHighlight};
 use crate::pdfium_engine::{
     ApiError, DocumentInfo, Engine, OutlineNode, PageInfo, PageTextData, SearchMatch,
 };
+use crate::tts::{TtsEngine, TtsVoiceInfo};
 
 #[tauri::command]
 pub fn open_document(
@@ -186,4 +187,37 @@ pub fn get_startup_file() -> Option<String> {
     std::env::args()
         .skip(1)
         .find(|arg| arg.to_lowercase().ends_with(".pdf"))
+}
+
+// ---- on-device narration (Piper) ----
+
+#[tauri::command]
+pub fn tts_voices(engine: tauri::State<'_, Arc<TtsEngine>>) -> Result<Vec<TtsVoiceInfo>, String> {
+    Ok(engine.list_voices())
+}
+
+#[tauri::command]
+pub fn tts_speak(
+    engine: tauri::State<'_, Arc<TtsEngine>>,
+    text: String,
+    page: i32,
+    voice_id: String,
+    rate: f64,
+) -> Result<(), String> {
+    engine.speak(&text, page, &voice_id, rate as f32)
+}
+
+#[tauri::command]
+pub fn tts_pause(engine: tauri::State<'_, Arc<TtsEngine>>) {
+    engine.pause();
+}
+
+#[tauri::command]
+pub fn tts_resume(engine: tauri::State<'_, Arc<TtsEngine>>) {
+    engine.resume();
+}
+
+#[tauri::command]
+pub fn tts_stop(engine: tauri::State<'_, Arc<TtsEngine>>) {
+    engine.stop();
 }

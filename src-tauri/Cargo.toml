@@ -29,6 +29,9 @@ image = { version = "0.25.10", default-features = false, features = ["png"] }
 rusqlite = { version = "0.41.1", features = ["bundled"] }
 tauri-plugin-window-state = "2.5.0"
 tauri-plugin-single-instance = "2.5.5"
+rodio = "0.23.0"
+piper-plus = { version = "0.5.3", features = ["inference"] }
+piper-plus-g2p = { version = "0.5.3", features = ["bundled-dicts"] }
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
