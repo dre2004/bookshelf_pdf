@@ -1,9 +1,14 @@
 import type { NarrationController } from "./narration";
 
-/** ±15% per step, clamped to 0.50-2.00x, rounded to 2dp. */
+/** The fixed narration speed ladder. */
+export const SPEED_STEPS = [0.5, 0.75, 1.0, 1.25, 2.0, 2.5];
+
+/** Moves to the next/previous ladder step from the current rate. */
 export function stepped(rate: number, direction: 1 | -1): number {
-  const next = direction === 1 ? rate * 1.15 : rate / 1.15;
-  return Math.min(2, Math.max(0.5, Math.round(next * 100) / 100));
+  if (direction === 1) {
+    return SPEED_STEPS.find((step) => step > rate + 0.001) ?? SPEED_STEPS[SPEED_STEPS.length - 1];
+  }
+  return [...SPEED_STEPS].reverse().find((step) => step < rate - 0.001) ?? SPEED_STEPS[0];
 }
 
 interface Props {
@@ -63,7 +68,6 @@ export default function NarrationBar({
           +
         </button>
       </div>
-      <span className="muted">{narration.rate.toFixed(2)}×</span>
       <button
         className="btn icon"
         onClick={() => onPageChange((narration.page ?? currentPage) - 1)}
