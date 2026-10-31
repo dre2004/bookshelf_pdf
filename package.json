@@ -9,7 +9,8 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "fetch:pdfium": "node scripts/fetch-pdfium.mjs",
-    "test": "vitest run"
+    "test": "vitest run",
+    "icon": "node scripts/make-icon.mjs && tauri icon assets/app-icon.png"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
@@ -23,6 +24,7 @@
     "@types/react": "^19.1.8",
     "@types/react-dom": "^19.1.6",
     "@vitejs/plugin-react": "^6.0.2",
+    "sharp": "^0.35.5",
     "typescript": "~6.0.3",
     "vite": "^8.0.16",
     "vitest": "^5.0.5"

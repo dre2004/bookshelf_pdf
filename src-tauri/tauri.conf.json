@@ -35,6 +35,15 @@
     ],
     "resources": {
       "resources/pdfium/": "pdfium/"
-    }
+    },
+    "fileAssociations": [
+      {
+        "ext": ["pdf"],
+        "name": "PDF Document",
+        "description": "PDF document",
+        "role": "Viewer",
+        "mimeType": "application/pdf"
+      }
+    ]
   }
 }

@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use db::Db;
 use pdfium_engine::Engine;
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 /// Serves rendered pages and stored cover thumbnails over a custom `pdfimg`
 /// URI scheme so the webview can load them as plain image URLs — the browser
@@ -55,6 +55,24 @@ fn handle_page_request(engine: &Engine, db: &Db, path: &str) -> ProtocolResponse
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // Must stay the first plugin: it decides whether this process is the
+        // single app instance or a forwarding launcher.
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            if let Some(path) = argv
+                .iter()
+                .skip(1)
+                .rev()
+                .find(|arg| arg.to_lowercase().ends_with(".pdf"))
+            {
+                let _ = app.emit("open-file", path.clone());
+            }
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
+        .plugin(tauri_plugin_window_state::Builder::default().build())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
@@ -84,7 +102,8 @@ pub fn run() {
             commands::library_list,
             commands::library_remove,
             commands::settings_all,
-            commands::settings_set
+            commands::settings_set,
+            commands::get_startup_file
         ])
         .register_asynchronous_uri_scheme_protocol("pdfimg", |ctx, request, responder| {
             let engine = ctx.app_handle().state::<Arc<Engine>>().inner().clone();

@@ -27,6 +27,8 @@ pdfium-render = "0.9.4"
 tauri-plugin-dialog = "2.8.4"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 rusqlite = { version = "0.41.1", features = ["bundled"] }
+tauri-plugin-window-state = "2.5.0"
+tauri-plugin-single-instance = "2.5.5"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

@@ -84,6 +84,11 @@ export async function settingsSet(key: string, value: string): Promise<void> {
   return invoke("settings_set", { key, value });
 }
 
+/** PDF passed on the command line at launch (double-clicked file), if any. */
+export async function getStartupFile(): Promise<string | null> {
+  return invoke<string | null>("get_startup_file");
+}
+
 // ---- text, search, outline ----
 
 export async function getPageText(docId: number, page: number): Promise<PageTextData> {

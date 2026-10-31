@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ask, open as openFileDialog } from "@tauri-apps/plugin-dialog";
+import { listen } from "@tauri-apps/api/event";
 import Toolbar from "./Toolbar";
 import Reader from "./Reader";
 import Library from "./Library";
@@ -15,6 +16,7 @@ import {
   closeDocument,
   getPageDims,
   getOutline,
+  getStartupFile,
   highlightsAdd,
   highlightsList,
   highlightsRemove,
@@ -107,6 +109,8 @@ export default function App() {
   const lastProgress = useRef<{ bookId: number; page: number; offset: number } | null>(null);
   const searchTimer = useRef<number | null>(null);
   const searchSeq = useRef(0);
+  // Boot/listeners run before openPath exists as a stable callback.
+  const openPathRef = useRef<((path: string) => Promise<void>) | null>(null);
 
   // ---- boot: hydrate persisted settings and the library ----
   useEffect(() => {
@@ -133,8 +137,25 @@ export default function App() {
         /* library stays empty; reading still works */
       }
       setReady(true);
+      // A PDF double-clicked while the app was closed arrives via argv.
+      try {
+        const startup = await getStartupFile();
+        if (startup) void openPathRef.current?.(startup);
+      } catch {
+        /* no startup file */
+      }
     };
     void boot();
+  }, []);
+
+  // Files opened while the app is already running (single-instance forward).
+  useEffect(() => {
+    const unlisten = listen<string>("open-file", (event) => {
+      if (event.payload) void openPathRef.current?.(event.payload);
+    });
+    return () => {
+      void unlisten.then((fn) => fn());
+    };
   }, []);
 
   const persist = useCallback((key: string, value: unknown) => {
@@ -293,6 +314,10 @@ export default function App() {
       filters: [{ name: "PDF documents", extensions: ["pdf"] }],
     });
     if (typeof picked === "string") void openPath(picked);
+  }, [openPath]);
+
+  useEffect(() => {
+    openPathRef.current = openPath;
   }, [openPath]);
 
   const goLibrary = useCallback(() => {

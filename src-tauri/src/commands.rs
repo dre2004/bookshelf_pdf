@@ -178,3 +178,12 @@ pub fn settings_set(
 ) -> Result<(), String> {
     db.settings_set(&key, &value)
 }
+
+/// PDF path passed on the command line (e.g. double-clicking a file while
+/// the app is closed), if any.
+#[tauri::command]
+pub fn get_startup_file() -> Option<String> {
+    std::env::args()
+        .skip(1)
+        .find(|arg| arg.to_lowercase().ends_with(".pdf"))
+}
