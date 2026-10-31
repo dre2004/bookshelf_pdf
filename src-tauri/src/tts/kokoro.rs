@@ -42,6 +42,19 @@ pub const KOKORO_VOICE_SPECS: &[(&str, &str, &str, &str)] = &[
 
 const HF_BASE: &str = "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main";
 
+/// Maps smart quotes/apostrophes/dashes to their ASCII equivalents for
+/// G2P; unknown characters are dropped by the tokenizer anyway.
+fn normalize_typographic(text: &str) -> String {
+    text.chars()
+        .map(|c| match c {
+            '\u{2019}' | '\u{2018}' => '\'',
+            '\u{201C}' | '\u{201D}' => '"',
+            '\u{2013}' | '\u{2014}' => '-',
+            other => other,
+        })
+        .collect()
+}
+
 /// Char-level phoneme tokenizer parsed straight from `tokenizer.json`
 /// (115 single-character tokens; unknown characters are dropped, exactly
 /// what the reference normalizer achieves by stripping them).
@@ -153,6 +166,11 @@ impl KokoroModel {
     /// English text → IPA (word boundaries preserved, sentence punctuation
     /// kept for natural pausing).
     fn phonemize(&self, text: &str) -> Result<String, String> {
+        // Typographic punctuation must become ASCII before G2P: publishers
+        // use U+2019 etc., which breaks dictionary lookups and makes the
+        // fallback spell words letter by letter ("you<U+2019>re" is heard
+        // as "y-o-u-r-e").
+        let text = normalize_typographic(text);
         let mut words = Vec::new();
         for word in text.split_whitespace() {
             use piper_plus_g2p::Phonemizer as _;
@@ -383,5 +401,45 @@ mod tests {
             audio.len()
         );
         assert!(audio.iter().any(|s| s.abs() > 0.01), "audio is silent");
+    }
+}
+
+#[cfg(test)]
+mod g2p_tests {
+    use super::*;
+    use piper_plus_g2p::Phonemizer as _;
+
+    #[test]
+    fn contractions_phonemize_correctly() {
+        let p = EnglishPhonemizer::new_bundled().expect("phonemizer");
+        for word in ["you're", "don't", "it's", "won't"] {
+            let (tokens, _) = p.phonemize_with_prosody(word).expect("g2p");
+            let joined: String = tokens.concat();
+            // Letter-name fallback produces long spelled-out IPA;
+            // dictionary hits are short.
+            assert!(joined.chars().count() <= 8, "{word} -> {joined}");
+        }
+    }
+
+    #[test]
+    fn typographic_punctuation_is_normalized() {
+        assert_eq!(normalize_typographic("you\u{2019}re"), "you're");
+        assert_eq!(normalize_typographic("don\u{2019}t"), "don't");
+        assert_eq!(
+            normalize_typographic("\u{201C}hi\u{201D} \u{2014} ok"),
+            "\"hi\" - ok"
+        );
+    }
+
+    /// The original report: "If You're new here" with a typographic
+    /// apostrophe used to spell out letter names.
+    #[test]
+    fn curly_apostrophe_contraction_phonemizes_like_ascii() {
+        let p = EnglishPhonemizer::new_bundled().expect("phonemizer");
+        let curly = format!("you{}re", '\u{2019}');
+        let normalized = normalize_typographic(&curly);
+        let (a, _) = p.phonemize_with_prosody(&normalized).expect("g2p");
+        let (b, _) = p.phonemize_with_prosody("you're").expect("g2p");
+        assert_eq!(a.concat(), b.concat());
     }
 }

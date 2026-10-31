@@ -85,6 +85,50 @@ pub struct TtsEngine {
 struct PlaybackControl {
     stop: Arc<AtomicBool>,
     player: Option<Arc<rodio::Player>>,
+    /// Wall-clock reference for scheduling highlight events at the moment
+    /// their audio plays, while synthesis runs ahead (prefetch). Pausing
+    /// the player also pauses this clock.
+    clock: Arc<Mutex<Option<PlaybackClock>>>,
+}
+
+/// Playback time that excludes pauses: `start` is when the first chunk's
+/// audio began, `paused_total` accumulates completed pauses, and
+/// `pause_started` marks an in-flight pause.
+#[derive(Clone, Copy)]
+struct PlaybackClock {
+    start: std::time::Instant,
+    paused_total: std::time::Duration,
+    pause_started: Option<std::time::Instant>,
+}
+
+impl PlaybackClock {
+    fn new() -> Self {
+        Self {
+            start: std::time::Instant::now(),
+            paused_total: std::time::Duration::ZERO,
+            pause_started: None,
+        }
+    }
+
+    fn playing_elapsed(&self) -> std::time::Duration {
+        let in_pause = self
+            .pause_started
+            .map(|began| began.elapsed())
+            .unwrap_or_default();
+        self.start.elapsed() - self.paused_total - in_pause
+    }
+
+    fn pause(&mut self) {
+        if self.pause_started.is_none() {
+            self.pause_started = Some(std::time::Instant::now());
+        }
+    }
+
+    fn resume(&mut self) {
+        if let Some(began) = self.pause_started.take() {
+            self.paused_total += began.elapsed();
+        }
+    }
 }
 
 impl TtsEngine {
@@ -100,6 +144,7 @@ impl TtsEngine {
             playback: Mutex::new(PlaybackControl {
                 stop: Arc::new(AtomicBool::new(false)),
                 player: None,
+                clock: Arc::new(Mutex::new(None)),
             }),
             device: Mutex::new(None),
         }
@@ -225,6 +270,7 @@ impl TtsEngine {
     pub fn stop(&self) {
         let mut playback = self.playback.lock().unwrap();
         playback.stop.store(true, Ordering::Relaxed);
+        *playback.clock.lock().unwrap() = None;
         if let Some(player) = playback.player.take() {
             player.clear();
             player.stop();
@@ -232,13 +278,21 @@ impl TtsEngine {
     }
 
     pub fn pause(&self) {
-        if let Some(player) = self.playback.lock().unwrap().player.as_ref() {
+        let playback = self.playback.lock().unwrap();
+        if let Some(clock) = playback.clock.lock().unwrap().as_mut() {
+            clock.pause();
+        }
+        if let Some(player) = playback.player.as_ref() {
             player.pause();
         }
     }
 
     pub fn resume(&self) {
-        if let Some(player) = self.playback.lock().unwrap().player.as_ref() {
+        let playback = self.playback.lock().unwrap();
+        if let Some(clock) = playback.clock.lock().unwrap().as_mut() {
+            clock.resume();
+        }
+        if let Some(player) = playback.player.as_ref() {
             player.play();
         }
     }
@@ -251,16 +305,81 @@ impl TtsEngine {
 
         let text = text.to_string();
         let player = self.player()?;
+        let app = self.app.clone();
 
-        let stop = {
+        let (stop, clock) = {
             let mut playback = self.playback.lock().unwrap();
             let stop = Arc::new(AtomicBool::new(false));
+            let clock = Arc::new(Mutex::new(None::<PlaybackClock>));
             playback.stop = stop.clone();
+            playback.clock = clock.clone();
             playback.player = Some(player.clone());
-            stop
+            (stop, clock)
+        };
+        // Audio queued so far (seconds); chunk highlights are scheduled at
+        // their projected play offset while synthesis runs ahead.
+        let queued = Arc::new(Mutex::new(0f64));
+
+        // Appends a chunk and schedules its highlight (and, at the final
+        // offset, PageDone) against the playback clock.
+        let schedule = {
+            let clock = clock.clone();
+            let queued = queued.clone();
+            let stop = stop.clone();
+            let app = app.clone();
+            move |samples: Vec<f32>,
+                  sample_rate: std::num::NonZero<u32>,
+                  page: i32,
+                  range: Option<(usize, usize)>| {
+                let sample_rate = sample_rate.get();
+                let duration = samples.len() as f64 / sample_rate as f64;
+                let offset_secs;
+                {
+                    let mut queued = queued.lock().unwrap();
+                    offset_secs = *queued;
+                    *queued += duration;
+                }
+                let offset = std::time::Duration::from_secs_f64(offset_secs.max(0.0));
+                {
+                    let mut clock = clock.lock().unwrap();
+                    if clock.is_none() {
+                        *clock = Some(PlaybackClock::new());
+                    }
+                }
+                let event_app = app.clone();
+                let event_clock = clock.clone();
+                let event_stop = stop.clone();
+                std::thread::spawn(move || {
+                    loop {
+                        if event_stop.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        let due = {
+                            let guard = event_clock.lock().unwrap();
+                            match guard.as_ref() {
+                                Some(clock) => clock.playing_elapsed() >= offset,
+                                // Stopped while scheduling: clock cleared.
+                                None => return,
+                            }
+                        };
+                        if due {
+                            let event = match range {
+                                Some((start, end)) => TtsEvent::Progress {
+                                    page,
+                                    start: start as i64,
+                                    end: end as i64,
+                                },
+                                None => TtsEvent::PageDone { page },
+                            };
+                            let _ = event_app.emit("tts-event", event);
+                            return;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(25));
+                    }
+                });
+            }
         };
 
-        let app = self.app.clone();
         let rate = rate.clamp(0.5, 2.0);
         let chunks = split_for_tts(&text, MAX_CHUNK_CHARS);
 
@@ -289,22 +408,19 @@ impl TtsEngine {
                     player.append(rodio::buffer::SamplesBuffer::new(
                         channels,
                         sample_rate,
-                        samples,
+                        samples.clone(),
                     ));
-                    // Highlight fires as the chunk's audio starts; wait for
-                    // playback to drain before queueing the next chunk so
-                    // highlights never run ahead of the audio.
-                    let _ = app.emit(
-                        "tts-event",
-                        TtsEvent::Progress {
-                            page,
-                            start: start as i64,
-                            end: end as i64,
-                        },
-                    );
-                    player.sleep_until_end();
+                    // Highlight is scheduled at this chunk's projected play
+                    // time; synthesis of the next chunk proceeds while the
+                    // audio plays, so narration flows without gaps.
+                    schedule(samples, sample_rate, page, Some((start, end)));
                 }
-                let _ = app.emit("tts-event", TtsEvent::PageDone { page });
+                schedule(
+                    Vec::new(),
+                    std::num::NonZero::new(24_000).expect("rate"),
+                    page,
+                    None,
+                );
             });
             return Ok(());
         }
@@ -346,21 +462,16 @@ impl TtsEngine {
                 player.append(rodio::buffer::SamplesBuffer::new(
                     channels,
                     sample_rate,
-                    samples,
+                    samples.clone(),
                 ));
-                let _ = app.emit(
-                    "tts-event",
-                    TtsEvent::Progress {
-                        page,
-                        start: start as i64,
-                        end: end as i64,
-                    },
-                );
-                // Same playback pacing as the Kokoro path: the highlight
-                // for this chunk is live while its audio plays.
-                player.sleep_until_end();
+                schedule(samples, sample_rate, page, Some((start, end)));
             }
-            let _ = app.emit("tts-event", TtsEvent::PageDone { page });
+            schedule(
+                Vec::new(),
+                std::num::NonZero::new(24_000).expect("rate"),
+                page,
+                None,
+            );
         });
         Ok(())
     }
