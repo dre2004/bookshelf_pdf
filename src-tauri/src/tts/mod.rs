@@ -127,60 +127,200 @@ impl PlaybackClock {
     }
 }
 
-/// Playback pieces for one chunk: normally the chunk itself. When the
-/// chunk begins with heading-like text (outline title, section numbering,
-/// colon-ended or Title-Case lead) it splits into exactly two pieces —
-/// the heading, then the body — with the heading flagged for the long
-/// pause. Nothing else is ever split.
+/// A heading lead recognized at the start of a chunk, split into one or
+/// two heading pieces ("Chapter 0" kicker line, then the title line) with
+/// the pause each piece should play after it.
+pub(crate) struct HeadingLead {
+    pieces: Vec<((usize, usize), u32, String)>,
+}
+
+/// True for lines like "Chapter 0", "Part II", "Appendix B", "Section 4".
+fn is_chapter_kicker(line: &str) -> bool {
+    let words: Vec<&str> = line.split_whitespace().collect();
+    if words.len() != 2 {
+        return false;
+    }
+    matches!(
+        words[0].to_ascii_lowercase().as_str(),
+        "chapter" | "part" | "appendix" | "section"
+    ) && !words[1].is_empty()
+}
+
+pub(crate) fn split_heading_lead(
+    chars: &[char],
+    range: (usize, usize),
+    outline_titles: &[String],
+) -> Option<HeadingLead> {
+    let (start, end) = range;
+    if end - start < 3 || end - start > 200 {
+        return None;
+    }
+    let text: String = chars[start..end].iter().collect();
+
+    // Chapter-opening block: a kicker line ("Chapter 0") over the title
+    // line, with the title matching an outline title or standing as a
+    // short capitalized line on its own. All offsets below are char
+    // indices into `chars`, never byte offsets into `text`.
+    let first_newline = chars[start..end]
+        .iter()
+        .position(|c| *c == '\n' || *c == '\r');
+    if let Some(nl) = first_newline {
+        let line1: String = chars[start..start + nl]
+            .iter()
+            .collect::<String>()
+            .trim_end()
+            .to_string();
+        if is_chapter_kicker(&line1) {
+            let mut cursor = start + nl;
+            while matches!(chars.get(cursor), Some(c) if c.is_whitespace() && *c != '\n' && *c != '\r')
+            {
+                cursor += 1;
+            }
+            // skip consecutive newline whitespace
+            while matches!(chars.get(cursor), Some('\n') | Some('\r')) {
+                cursor += 1;
+            }
+            // Title line runs to the next line break.
+            let title_end = chars[cursor..end]
+                .iter()
+                .position(|c| *c == '\n' || *c == '\r')
+                .map(|k| cursor + k)
+                .unwrap_or(end);
+            let title_text: String = chars[cursor..title_end].iter().collect();
+            let title_trim = title_text.trim_end();
+            let title_is_heading = is_heading_like(title_trim, outline_titles)
+                || outline_titles
+                    .iter()
+                    .any(|t| normalize_for_match(t) == normalize_for_match(title_trim));
+            let mut pieces = vec![((start, cursor), HEADING_KICKER_PAUSE_MS, line1)];
+            if !title_trim.is_empty() && title_is_heading {
+                pieces.push(((cursor, title_end), HEADING_PAUSE_MS, title_text));
+            }
+            return Some(HeadingLead { pieces });
+        }
+    }
+
+    // Outline title at the very start of the chunk (e.g. "Preface" over
+    // the body "C has outlived..."). Split right after the title's
+    // matching characters.
+    for title in outline_titles {
+        let normalized_title = normalize_for_match(title);
+        if normalized_title.is_empty() {
+            continue;
+        }
+        let mut ti = title.chars().peekable();
+        let mut consumed_to = None;
+        for (idx, c) in text.chars().enumerate() {
+            match ti.peek() {
+                Some(&tc) if c.is_whitespace() && tc.is_whitespace() => {
+                    ti.next();
+                    consumed_to = Some(idx + 1);
+                }
+                Some(&tc) if c == tc => {
+                    ti.next();
+                    consumed_to = Some(idx + 1);
+                }
+                _ => break,
+            }
+        }
+        if ti.peek().is_none() && consumed_to.unwrap_or(0) < text.chars().count() {
+            let split = start + consumed_to.unwrap_or(0);
+            let heading: String = chars[start..split].iter().collect();
+            return Some(HeadingLead {
+                pieces: vec![((start, split), HEADING_PAUSE_MS, heading)],
+            });
+        }
+    }
+
+    // Numbered lead ("0.1 How to read this book", "Two tracks...").
+    let first_word = text
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    let number_core = first_word.trim_end_matches('.');
+    let numbered = !number_core.is_empty()
+        && number_core.chars().all(|c| c.is_ascii_digit() || c == '.')
+        && number_core
+            .chars()
+            .last()
+            .map(|c| c.is_ascii_digit())
+            .unwrap_or(false);
+    if !numbered {
+        return None;
+    }
+    for (idx, c) in text.chars().enumerate() {
+        if idx == 0 {
+            continue;
+        }
+        let terminator = matches!(c, '!' | '?' | ':' | '\n' | '\r')
+            || (c == '.' && {
+                let next = text.chars().nth(idx + 1);
+                !matches!(next, Some(n) if n.is_ascii_digit())
+            });
+        if !terminator {
+            continue;
+        }
+        let split = start + idx + 1;
+        if split >= end {
+            return None;
+        }
+        let lead: String = chars[start..split].iter().collect();
+        let lead_trim = lead
+            .trim_end()
+            .trim_end_matches(['.', '!', '?', ':'])
+            .trim_end();
+        if is_heading_like(lead_trim, outline_titles) {
+            return Some(HeadingLead {
+                pieces: vec![((start, split), HEADING_PAUSE_MS, lead)],
+            });
+        }
+        return None;
+    }
+    None
+}
+
+/// Playback pieces for one chunk: normally the chunk itself. When the chunk
+/// begins with a heading lead, the heading piece(s) come first with their
+/// own pauses, then the body with the standard inter-chunk gap. Nothing
+/// else is ever split.
 fn heading_aware_pieces(
     chars: &[char],
     chunk: (usize, usize),
     outline_titles: &[String],
     paragraph_breaks: &[usize],
-) -> Vec<((usize, usize), bool, bool, String)> {
+) -> Vec<((usize, usize), u32, String)> {
     let (start, end) = chunk;
-    let chunk_is_last_word = end >= chars.len();
-    let ends_paragraph = chunk_is_last_word
-        || paragraph_breaks.contains(&end.saturating_sub(1))
-        || paragraph_breaks.contains(&end);
+    // Pure boundary classification: whether a paragraph break sits at this
+    // chunk's end. The speak loops separately suppress the pause on the
+    // page's final piece, so "runs to end of text" is not a paragraph.
+    let ends_paragraph =
+        paragraph_breaks.contains(&end.saturating_sub(1)) || paragraph_breaks.contains(&end);
 
-    if let Some((heading, body)) = split_heading_lead(chars, chunk, outline_titles) {
-        let heading_text: String = chars[heading.0..heading.1].iter().collect();
-        let body_text: String = chars[body.0..body.1].iter().collect();
-        return vec![
-            (heading, true, false, heading_text),
-            (body, false, ends_paragraph, body_text),
-        ];
+    if let Some(lead) = split_heading_lead(chars, chunk, outline_titles) {
+        let mut pieces: Vec<((usize, usize), u32, String)> = lead.pieces;
+        let last_heading_end = pieces.last().map(|(r, _, _)| r.1).unwrap_or(start);
+        let body: String = chars[last_heading_end..end].iter().collect();
+        let body_pause = if ends_paragraph {
+            PARAGRAPH_PAUSE_MS
+        } else {
+            SENTENCE_PAUSE_MS
+        };
+        pieces.push(((last_heading_end, end), body_pause, body));
+        return pieces;
     }
 
     let text: String = chars[start..end].iter().collect();
-    vec![(chunk, false, ends_paragraph, text)]
-}
-
-fn gap_samples(
-    is_heading: bool,
-    ends_paragraph: bool,
-    is_last: bool,
-    sample_rate: u32,
-) -> Vec<f32> {
-    if is_last {
-        return Vec::new();
-    }
-    let milliseconds = if is_heading {
-        // User-tuned after listening.
-        HEADING_PAUSE_MS
-    } else if ends_paragraph {
-        // ~0.75-1.0 s standard between paragraphs.
+    let pause = if ends_paragraph {
         PARAGRAPH_PAUSE_MS
     } else {
-        // ~0.5 s between sentences; the engine's own prosody handles
-        // pauses inside a multi-sentence selection.
         SENTENCE_PAUSE_MS
     };
-    vec![0.0; sample_rate as usize * milliseconds as usize / 1000]
+    vec![(chunk, pause, text)]
 }
 
 const HEADING_PAUSE_MS: u32 = 2000;
+const HEADING_KICKER_PAUSE_MS: u32 = 800;
 const PARAGRAPH_PAUSE_MS: u32 = 800;
 const SENTENCE_PAUSE_MS: u32 = 400;
 
@@ -220,100 +360,6 @@ fn is_heading_like(trimmed: &str, outline_titles: &[String]) -> bool {
                 .map(|c| c.is_uppercase())
                 .unwrap_or(false)
         })
-}
-
-/// Splits a heading-like lead off the front of a chunk, returning
-/// (heading_range, body_range) when the chunk begins with a heading.
-pub(crate) fn split_heading_lead(
-    chars: &[char],
-    range: (usize, usize),
-    outline_titles: &[String],
-) -> Option<((usize, usize), (usize, usize))> {
-    let (start, end) = range;
-    if end - start < 3 || end - start > 160 {
-        return None;
-    }
-    let text: String = chars[start..end].iter().collect();
-
-    // 1. An outline title matching the chunk's lead wins outright: split
-    //    right after the title's last matching character.
-    for title in outline_titles {
-        let normalized_title = normalize_for_match(title);
-        if normalized_title.is_empty() {
-            continue;
-        }
-        // Walk char by char; skip whitespace differences (chunk may
-        // wrap the title across lines).
-        let mut ti = title.char_indices().peekable();
-        let mut consumed_to = None;
-        for (offset, c) in text.char_indices() {
-            match ti.peek() {
-                Some(&(toffset, tc)) if c.is_whitespace() && tc.is_whitespace() => {
-                    let _ = toffset;
-                    ti.next();
-                    consumed_to = Some(offset + 1);
-                }
-                Some(&(_, tc)) if c == tc => {
-                    ti.next();
-                    consumed_to = Some(offset + 1);
-                }
-                _ => break,
-            }
-        }
-        if ti.peek().is_none() && consumed_to.unwrap_or(0) < text.chars().count() {
-            let split = start + consumed_to.unwrap_or(0);
-            return Some(((start, split), (split, end)));
-        }
-    }
-
-    // 2. Structural: numbered lead ("0.1 ", "3.2.1 ") up to the first
-    //    sentence terminator or newline.
-    let first_word: String = text
-        .split_whitespace()
-        .next()
-        .unwrap_or_default()
-        .to_string();
-    // A section number is digits separated by dots ("0.1", "3.2.1"),
-    // optionally with a trailing dot ("0." list style).
-    let number_core = first_word.trim_end_matches('.');
-    let numbered = !number_core.is_empty()
-        && number_core.chars().all(|c| c.is_ascii_digit() || c == '.')
-        && number_core
-            .chars()
-            .last()
-            .map(|c| c.is_ascii_digit())
-            .unwrap_or(false);
-    if !numbered {
-        return None;
-    }
-
-    for (offset, c) in text.char_indices() {
-        if offset == 0 {
-            continue;
-        }
-        let terminator = matches!(c, '!' | '?' | ':' | '\n')
-            || (c == '.' && {
-                let next = text[offset + 1..].chars().next();
-                !matches!(next, Some(n) if n.is_ascii_digit())
-            });
-        if !terminator {
-            continue;
-        }
-        let split = start + offset + 1;
-        if split >= end {
-            return None;
-        }
-        let lead: String = chars[start..split].iter().collect();
-        let lead_trim = lead
-            .trim_end()
-            .trim_end_matches(['.', '!', '?', ':'])
-            .trim_end();
-        if is_heading_like(lead_trim, outline_titles) {
-            return Some(((start, split), (split, end)));
-        }
-        return None;
-    }
-    None
 }
 
 fn normalize_for_match(text: &str) -> String {
@@ -642,7 +688,7 @@ impl TtsEngine {
                         &outline_titles,
                         &paragraph_breaks,
                     );
-                    for (piece, is_heading, ends_paragraph, piece_text) in pieces {
+                    for (piece, pause_ms, piece_text) in pieces {
                         if stop.load(Ordering::Relaxed) {
                             return;
                         }
@@ -660,12 +706,16 @@ impl TtsEngine {
                         let sample_rate =
                             rodio::SampleRate::new(piece_rate).expect("nonzero sample rate");
                         let mut samples = samples;
-                        samples.extend(gap_samples(
-                            is_heading,
-                            ends_paragraph,
-                            piece == (start, end) && (start, end) == last_chunk,
-                            sample_rate.get(),
-                        ));
+                        // Each piece carries its own trailing pause; the
+                        // page's final piece ends clean so the next page
+                        // starts immediately.
+                        if piece.1 != last_chunk.1 {
+                            samples.extend(vec![
+                                0.0;
+                                sample_rate.get() as usize * pause_ms as usize
+                                    / 1000
+                            ]);
+                        }
                         player.append(rodio::buffer::SamplesBuffer::new(
                             rodio::ChannelCount::new(1).expect("nonzero channels"),
                             sample_rate,
@@ -702,7 +752,7 @@ impl TtsEngine {
                     &outline_titles,
                     &paragraph_breaks,
                 );
-                for (piece, is_heading, ends_paragraph, piece_text) in pieces {
+                for (piece, pause_ms, piece_text) in pieces {
                     if stop.load(Ordering::Relaxed) {
                         return;
                     }
@@ -729,12 +779,15 @@ impl TtsEngine {
                         samples.iter().map(|&s| s as f32 / 32768.0).collect();
                     let sample_rate =
                         rodio::SampleRate::new(piece_rate).expect("nonzero sample rate");
-                    samples.extend(gap_samples(
-                        is_heading,
-                        ends_paragraph,
-                        piece == (start, end) && (start, end) == last_chunk,
-                        sample_rate.get(),
-                    ));
+                    // Each piece carries its own trailing pause; the
+                    // page's final piece ends clean so the next page
+                    // starts immediately.
+                    if piece.1 != last_chunk.1 {
+                        samples.extend(vec![
+                            0.0;
+                            sample_rate.get() as usize * pause_ms as usize / 1000
+                        ]);
+                    }
                     player.append(rodio::buffer::SamplesBuffer::new(
                         rodio::ChannelCount::new(1).expect("nonzero channels"),
                         sample_rate,
@@ -855,42 +908,81 @@ mod heading_lead_tests {
         text.chars().collect()
     }
 
+    fn pieces(text: &str, outline: &[&str]) -> Vec<((usize, usize), u32, String)> {
+        let outline: Vec<String> = outline.iter().map(|s| s.to_string()).collect();
+        heading_aware_pieces(&chars(text), (0, text.chars().count()), &outline, &[])
+    }
+
+    #[test]
+    fn chapter_block_splits_into_kicker_title_and_body() {
+        // The real opening of page 11 of the test book.
+        let text = "Chapter 0\nIf You\u{2019}re New Here\nThis book begins with programs, and it begins quickly. Here is the first one.";
+        let outline = ["If You\u{2019}re New Here"];
+        let pieces = pieces(text, &outline);
+        assert_eq!(
+            pieces.len(),
+            3,
+            "expected kicker + title + body: {pieces:?}"
+        );
+        assert_eq!(pieces[0].2.trim(), "Chapter 0");
+        assert_eq!(pieces[0].1, HEADING_KICKER_PAUSE_MS);
+        assert_eq!(pieces[1].2.trim(), "If You\u{2019}re New Here");
+        assert_eq!(pieces[1].1, HEADING_PAUSE_MS);
+        assert!(
+            pieces[2].2.trim_start().starts_with("This book begins"),
+            "body wrong: {:?}",
+            pieces[2].2
+        );
+        assert_eq!(pieces[2].1, SENTENCE_PAUSE_MS);
+    }
+
+    #[test]
+    fn kicker_without_title_still_pauses() {
+        // "Chapter 3" over plain prose: no title line, so the kicker gets
+        // its beat and the rest reads as body.
+        let text = "Chapter 3\nOnce upon a time there was a language. It compiled fast.";
+        let pieces = pieces(text, &[]);
+        assert_eq!(pieces.len(), 2, "expected kicker + body: {pieces:?}");
+        assert_eq!(pieces[0].2.trim(), "Chapter 3");
+        assert_eq!(pieces[0].1, HEADING_KICKER_PAUSE_MS);
+        assert!(pieces[1].2.trim_start().starts_with("Once upon a time"));
+    }
+
     #[test]
     fn numbered_heading_splits_from_body_with_pause() {
         let text = "0.1 How to read this book. You will read this book carefully.";
-        let pieces = heading_aware_pieces(&chars(text), (0, text.chars().count()), &[], &[]);
+        let pieces = pieces(text, &[]);
         assert_eq!(pieces.len(), 2, "expected heading + body: {pieces:?}");
-        let (heading_range, is_heading, _, heading_text) = &pieces[0];
-        assert!(is_heading, "heading not flagged: {heading_text:?}");
+        let (_, heading_pause, heading_text) = &pieces[0];
+        assert_eq!(*heading_pause, HEADING_PAUSE_MS);
         assert!(
             heading_text.contains("How to read this book"),
             "heading incomplete: {heading_text:?}"
         );
-        let _ = heading_range;
         assert!(
-            pieces[1].3.starts_with(" You"),
+            pieces[1].2.starts_with(" You"),
             "body wrong: {:?}",
-            pieces[1].3
+            pieces[1].2
         );
     }
 
     #[test]
     fn outline_title_heading_without_period_splits() {
         let text = "If You Are New Here you should read chapter one first. It covers the basics.";
-        let outline = vec!["If You Are New Here".to_string()];
-        let pieces = heading_aware_pieces(&chars(text), (0, text.chars().count()), &outline, &[]);
+        let outline = ["If You Are New Here"];
+        let pieces = pieces(text, &outline);
         assert_eq!(pieces.len(), 2, "expected split: {pieces:?}");
-        assert!(pieces[0].1, "heading not flagged");
+        assert_eq!(pieces[0].1, HEADING_PAUSE_MS);
         // The heading ends at the outline title boundary, before "you should".
-        assert!(pieces[0].3.contains("New Here"));
+        assert!(pieces[0].2.contains("New Here"));
     }
 
     #[test]
     fn plain_body_never_splits() {
         let text = "The rain fell for days and the river rose over its banks. Fields flooded.";
-        let pieces = heading_aware_pieces(&chars(text), (0, text.chars().count()), &[], &[]);
+        let pieces = pieces(text, &[]);
         assert_eq!(pieces.len(), 1);
-        assert!(!pieces[0].1, "body flagged as heading");
+        assert_eq!(pieces[0].1, SENTENCE_PAUSE_MS);
     }
 }
 
@@ -900,21 +992,20 @@ mod pause_tests {
 
     #[test]
     fn pause_durations_match_narration_standards() {
-        // 2.2 s after headings, 0.8 s between paragraphs, 0.4 s between
-        // sentence groups; never a trailing pause on the final chunk.
-        assert_eq!(
-            gap_samples(true, false, false, 24_000).len(),
-            24_000 * 2000 / 1000
-        );
-        assert_eq!(
-            gap_samples(false, true, false, 24_000).len(),
-            24_000 * 800 / 1000
-        );
-        assert_eq!(
-            gap_samples(false, false, false, 24_000).len(),
-            24_000 * 400 / 1000
-        );
-        assert!(gap_samples(true, true, true, 24_000).is_empty());
+        // Each playback piece carries the pause that follows it: 2.0 s
+        // after a heading title, 0.8 s after a chapter kicker line and
+        // after a paragraph, 0.4 s between sentence groups.
+        let chars: Vec<char> = "A paragraph of text that ends the block.".chars().collect();
+        let n = chars.len();
+        let pieces = heading_aware_pieces(&chars, (0, n), &[], &[n]);
+        assert_eq!(pieces.len(), 1);
+        assert_eq!(pieces[0].1, PARAGRAPH_PAUSE_MS);
+
+        let chars: Vec<char> = "One sentence here. Another one follows.".chars().collect();
+        let n = chars.len();
+        let pieces = heading_aware_pieces(&chars, (0, n), &[], &[]);
+        assert_eq!(pieces.len(), 1);
+        assert_eq!(pieces[0].1, SENTENCE_PAUSE_MS);
     }
 
     #[test]
