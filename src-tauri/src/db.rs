@@ -76,6 +76,13 @@ impl Db {
             .path()
             .app_data_dir()
             .map_err(|e| format!("cannot resolve app data dir: {e}"))?;
+        // Verification instances keep their data separate so automated
+        // testing can never touch a real library or reading progress.
+        let dir = if crate::is_verify_instance() {
+            dir.join("verify-test")
+        } else {
+            dir
+        };
         std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create app data dir: {e}"))?;
         let db_path = dir.join("bookshelf.db");
         let conn = Self::connect(&db_path)?;

@@ -52,12 +52,21 @@ fn handle_page_request(engine: &Engine, db: &Db, path: &str) -> ProtocolResponse
     }
 }
 
+/// Verification instances (scripts/launch-verify.mjs) run with
+/// BOOKSHELF_VERIFY_INSTANCE set: they skip single-instance forwarding and
+/// window-state saving, and use their own database, so automated testing can
+/// never reach into an app instance someone is actively reading in.
+pub fn is_verify_instance() -> bool {
+    std::env::var_os("BOOKSHELF_VERIFY_INSTANCE").is_some()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let mut builder = tauri::Builder::default();
+    if !is_verify_instance() {
         // Must stay the first plugin: it decides whether this process is the
         // single app instance or a forwarding launcher.
-        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
             if let Some(path) = argv
                 .iter()
                 .skip(1)
@@ -71,8 +80,10 @@ pub fn run() {
                 let _ = window.show();
                 let _ = window.set_focus();
             }
-        }))
-        .plugin(tauri_plugin_window_state::Builder::default().build())
+        }));
+        builder = builder.plugin(tauri_plugin_window_state::Builder::default().build());
+    }
+    builder
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
