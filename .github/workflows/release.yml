@@ -61,6 +61,12 @@ jobs:
             librsvg2-dev \
             patchelf
 
+      # The ort static archive references compiler-rt builtins that ld
+      # does not pull in on its own (___isPlatformVersionAtLeast).
+      - name: Link compiler-rt builtins (ONNX Runtime)
+        if: runner.os == 'MacOS'
+        run: echo "RUSTFLAGS=-C link-arg=$(clang --print-file-name=libclang_rt.osx.a)" >> "$GITHUB_ENV"
+
       - name: Fetch PDFium for this platform
         run: node scripts/fetch-pdfium.mjs ${{ matrix.pdfium-target }}
 
