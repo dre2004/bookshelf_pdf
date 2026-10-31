@@ -16,14 +16,8 @@ import {
   settingsSet,
   toApiError,
 } from "./api";
-import type {
-  BookSummary,
-  DocumentInfo,
-  PageInfo,
-  ReadMode,
-  Theme,
-  ZoomMode,
-} from "./types";
+import type { BookSummary, DocumentInfo, PageInfo, ReadMode, Theme, ZoomMode } from "./types";
+import { settingsFromStorage } from "./settings";
 import "./App.css";
 
 type View = "library" | "reader";
@@ -45,33 +39,6 @@ function describeError(e: unknown): string {
     return api.reason ? `${label}: ${api.reason}` : label;
   }
   return String(e);
-}
-
-function parseStored<T>(raw: string | undefined, guard: (v: unknown) => T | null, fallback: T): T {
-  if (!raw) return fallback;
-  try {
-    return guard(JSON.parse(raw)) ?? fallback;
-  } catch {
-    return fallback;
-  }
-}
-
-function isReadMode(v: unknown): ReadMode | null {
-  return v === "paged" || v === "scroll" ? v : null;
-}
-
-function isTheme(v: unknown): Theme | null {
-  return v === "day" || v === "sepia" || v === "night" ? v : null;
-}
-
-function isZoom(v: unknown): ZoomMode | null {
-  if (typeof v !== "object" || v === null) return null;
-  const z = v as { kind?: unknown; value?: unknown };
-  if (z.kind === "fitWidth" || z.kind === "fitPage") return { kind: z.kind };
-  if (z.kind === "percent" && typeof z.value === "number" && z.value >= 25 && z.value <= 600) {
-    return { kind: "percent", value: z.value };
-  }
-  return null;
 }
 
 export default function App() {
@@ -102,9 +69,14 @@ export default function App() {
     const boot = async () => {
       try {
         const stored = await settingsAll();
-        setMode(parseStored(stored.readMode, isReadMode, "paged"));
-        setTheme(parseStored(stored.theme, isTheme, "day"));
-        setZoom(parseStored(stored.zoom, isZoom, { kind: "fitWidth" }));
+        const hydrated = settingsFromStorage(stored, {
+          mode: "paged",
+          theme: "day",
+          zoom: { kind: "fitWidth" },
+        });
+        setMode(hydrated.mode);
+        setTheme(hydrated.theme);
+        setZoom(hydrated.zoom);
         settingsReady.current = true;
       } catch {
         settingsReady.current = true;
