@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import {
   ttsInstallDefaultVoices,
+  ttsInstallKokoro,
   ttsPause,
   ttsResume,
   ttsSpeak,
@@ -22,6 +23,7 @@ export interface PiperVoice {
   id: string;
   label: string;
   lang: string;
+  engine: "piper" | "kokoro";
 }
 
 export interface NarrationVoiceOption {
@@ -29,7 +31,7 @@ export interface NarrationVoiceOption {
    *  voice's own URI otherwise. */
   uri: string;
   label: string;
-  engine: "piper" | "speech";
+  engine: "piper" | "kokoro" | "speech";
 }
 
 /** Local voices first, then by name — they tend to respond faster. */
@@ -76,10 +78,15 @@ export interface NarrationController {
     downloadedMb: number;
     error: string | null;
     start: () => void;
+    kokoroActive: boolean;
+    kokoroProgress: number; // 0..1
+    kokoroError: string | null;
+    startKokoro: () => void;
   };
 }
 
 const PIPER_PREFIX = "piper:";
+const KOKORO_PREFIX = "kokoro:";
 
 function isPiperVoice(uri: string): boolean {
   return uri.startsWith(PIPER_PREFIX);
@@ -130,9 +137,9 @@ export function useNarration({
 
   const options: NarrationVoiceOption[] = [
     ...piperVoices.map((voice) => ({
-      uri: `${PIPER_PREFIX}${voice.id}`,
-      label: `${voice.label} · on-device`,
-      engine: "piper" as const,
+      uri: voice.engine === "kokoro" ? `${KOKORO_PREFIX}${voice.id}` : `${PIPER_PREFIX}${voice.id}`,
+      label: voice.label,
+      engine: voice.engine,
     })),
     ...(supported
       ? systemVoices.map((voice) => ({
@@ -146,10 +153,18 @@ export function useNarration({
   /** Default pick: Daniela when installed, else the usual system heuristic. */
   const defaultVoiceURI = useCallback(
     (system: SpeechSynthesisVoice[], piper: PiperVoice[]): string => {
+      const heart = piper.find(
+        (voice) => voice.engine === "kokoro" && voice.id === "af_heart",
+      );
+      if (heart) return `${KOKORO_PREFIX}${heart.id}`;
       const daniela = piper.find((voice) => voice.id.includes("daniela"));
       if (daniela) return `${PIPER_PREFIX}${daniela.id}`;
       const firstPiper = piper[0];
-      if (firstPiper) return `${PIPER_PREFIX}${firstPiper.id}`;
+      if (firstPiper) {
+        return firstPiper.engine === "kokoro"
+          ? `${KOKORO_PREFIX}${firstPiper.id}`
+          : `${PIPER_PREFIX}${firstPiper.id}`;
+      }
       const list = sortVoices(system);
       const preferred =
         list.find((v) => v.localService && v.lang.startsWith(navigator.language)) ??
@@ -243,6 +258,51 @@ export function useNarration({
     };
   }, [refreshPiperVoices]);
 
+  // ---- Kokoro pack download ----
+  const [kokoroActive, setKokoroActive] = useState(false);
+  const [kokoroProgress, setKokoroProgress] = useState(0);
+  const [kokoroError, setKokoroError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const unlisten = listen<{
+      kind: "started" | "progress" | "done" | "failed";
+      totalBytes?: number;
+      downloadedBytes?: number;
+      reason?: string;
+    }>("kokoro-download", (event) => {
+      const payload = event.payload;
+      if (payload.kind === "started") {
+        setKokoroActive(true);
+        setKokoroError(null);
+        setKokoroProgress(0);
+      } else if (payload.kind === "progress") {
+        const total = payload.totalBytes ?? 0;
+        const downloaded = payload.downloadedBytes ?? 0;
+        if (total > 0) setKokoroProgress(Math.min(1, downloaded / total));
+      } else if (payload.kind === "done") {
+        setKokoroActive(false);
+        setKokoroProgress(1);
+        refreshPiperVoices();
+      } else if (payload.kind === "failed") {
+        setKokoroActive(false);
+        setKokoroError(payload.reason ?? "download failed");
+      }
+    });
+    return () => {
+      void unlisten.then((fn) => fn());
+    };
+  }, [refreshPiperVoices]);
+
+  const startKokoroDownload = useCallback(() => {
+    setKokoroError(null);
+    setKokoroActive(true);
+    setKokoroProgress(0);
+    ttsInstallKokoro().catch((e) => {
+      setKokoroActive(false);
+      setKokoroError(String(e));
+    });
+  }, []);
+
   const startDownload = useCallback(() => {
     setDownloadError(null);
     setDownloadActive(true);
@@ -260,7 +320,11 @@ export function useNarration({
 
   const stop = useCallback(() => {
     stoppedRef.current = true;
-    if (isPiperVoice(voiceURIRef.current) || speakingPageRef.current !== null) {
+    if (
+      isPiperVoice(voiceURIRef.current) ||
+      voiceURIRef.current.startsWith(KOKORO_PREFIX) ||
+      speakingPageRef.current !== null
+    ) {
       void ttsStop().catch(() => {});
     }
     if (supported) window.speechSynthesis.cancel();
@@ -281,14 +345,15 @@ export function useNarration({
       setPaused(false);
       setSpokenRange(null);
 
-      if (isPiperVoice(voiceURIRef.current)) {
+      const selection = voiceURIRef.current;
+      if (selection.startsWith(PIPER_PREFIX) || selection.startsWith(KOKORO_PREFIX)) {
         speakingPageRef.current = target;
         void getText(target)
           .then((text) =>
             ttsSpeak({
               text,
               page: target,
-              voiceId: voiceURIRef.current.slice(PIPER_PREFIX.length),
+              voiceId: selection,
               rate: rateRef.current,
             }),
           )
@@ -398,7 +463,7 @@ export function useNarration({
 
   const pause = useCallback(() => {
     if (!speaking) return;
-    if (isPiperVoice(voiceURIRef.current)) {
+    if (isPiperVoice(voiceURIRef.current) || voiceURIRef.current.startsWith(KOKORO_PREFIX)) {
       void ttsPause().catch(() => {});
     } else if (supported) {
       window.speechSynthesis.pause();
@@ -408,7 +473,7 @@ export function useNarration({
 
   const resume = useCallback(() => {
     if (!speaking) return;
-    if (isPiperVoice(voiceURIRef.current)) {
+    if (isPiperVoice(voiceURIRef.current) || voiceURIRef.current.startsWith(KOKORO_PREFIX)) {
       void ttsResume().catch(() => {});
     } else if (supported) {
       window.speechSynthesis.resume();
@@ -440,6 +505,10 @@ export function useNarration({
       downloadedMb,
       error: downloadError,
       start: startDownload,
+      kokoroActive,
+      kokoroProgress,
+      kokoroError,
+      startKokoro: startKokoroDownload,
     },
   };
 }

@@ -10,6 +10,7 @@
 //! EOS suffix (`^`, `_`, `$` tokens in the map).
 
 mod chunker;
+pub mod kokoro;
 pub mod voice_downloads;
 
 use std::{
@@ -27,6 +28,7 @@ use serde_json::Value;
 use tauri::{Emitter, Manager};
 
 use chunker::split_for_tts;
+use kokoro::KokoroModel;
 
 /// Character-count ceiling per synthesis call; keeps first-audio latency
 /// low and matches how the models were trained (sentence-ish units).
@@ -35,12 +37,14 @@ const MAX_CHUNK_CHARS: usize = 220;
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TtsVoiceInfo {
-    /// File stem, e.g. `es_AR-daniela-high`.
+    /// Selection key: `piper:<stem>` or `kokoro:<voice>`.
     pub id: String,
-    /// Human-friendly label, e.g. `Daniela — Spanish (Argentina)`.
+    /// Human-friendly label.
     pub label: String,
-    /// eSpeak locale from the model config, e.g. `es_AR`.
+    /// Locale, e.g. `es_AR` / `en-US`.
     pub lang: String,
+    /// Which engine synthesizes this voice.
+    pub engine: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -73,6 +77,7 @@ struct LoadedVoice {
 pub struct TtsEngine {
     app: tauri::AppHandle,
     loaded: Mutex<HashMap<String, Arc<LoadedVoice>>>,
+    kokoro: Mutex<Option<(PathBuf, Arc<KokoroModel>)>>,
     playback: Mutex<PlaybackControl>,
     device: Mutex<Option<rodio::MixerDeviceSink>>,
 }
@@ -91,6 +96,7 @@ impl TtsEngine {
         Self {
             app,
             loaded: Mutex::new(HashMap::new()),
+            kokoro: Mutex::new(None),
             playback: Mutex::new(PlaybackControl {
                 stop: Arc::new(AtomicBool::new(false)),
                 player: None,
@@ -128,7 +134,8 @@ impl TtsEngine {
         Ok(dir)
     }
 
-    /// Lists installed voice pairs across all voice locations.
+    /// Lists installed voice pairs and the Kokoro catalog (installed or
+    /// downloadable), across all voice locations.
     pub fn list_voices(&self) -> Vec<TtsVoiceInfo> {
         let mut voices = Vec::new();
         for dir in self.voices_dirs() {
@@ -137,13 +144,27 @@ impl TtsEngine {
             };
             for entry in entries.flatten() {
                 let path = entry.path();
-                let Some(id) = file_stem_of_model(&path) else {
+                let Some(stem) = file_stem_of_model(&path) else {
                     continue;
                 };
-                if voices.iter().any(|voice: &TtsVoiceInfo| voice.id == id) {
+                if voices.iter().any(|voice: &TtsVoiceInfo| voice.id == *stem) {
                     continue;
                 }
-                voices.push(voice_info(&id, &path));
+                voices.push(voice_info(&stem, &path));
+            }
+        }
+        if let Some(dir) = kokoro::kokoro_dirs(&self.app).first() {
+            let _ = dir; // catalog is static; presence of any pack dir gates it
+            for (id, name, gender, accent) in kokoro::KOKORO_VOICE_SPECS {
+                if voices.iter().any(|voice| voice.id == *id) {
+                    continue;
+                }
+                voices.push(TtsVoiceInfo {
+                    id: id.to_string(),
+                    label: format!("{name} — English ({accent}, {gender})"),
+                    lang: "en-US".into(),
+                    engine: "kokoro".into(),
+                });
             }
         }
         voices.sort_by(|a, b| a.id.cmp(&b.id));
@@ -187,6 +208,20 @@ impl TtsEngine {
         Ok(Arc::new(rodio::Player::connect_new(sink.mixer())))
     }
 
+    fn kokoro_model(&self) -> Result<(PathBuf, Arc<KokoroModel>), String> {
+        if let Some(pair) = self.kokoro.lock().unwrap().clone() {
+            return Ok(pair);
+        }
+        let dir = kokoro::kokoro_dirs(&self.app)
+            .into_iter()
+            .find(|dir| dir.join("model.onnx").is_file())
+            .ok_or("the Kokoro voice pack is not installed")?;
+        let model = Arc::new(KokoroModel::load(&dir)?);
+        let pair = (dir, model);
+        *self.kokoro.lock().unwrap() = Some(pair.clone());
+        Ok(pair)
+    }
+
     pub fn stop(&self) {
         let mut playback = self.playback.lock().unwrap();
         playback.stop.store(true, Ordering::Relaxed);
@@ -225,11 +260,60 @@ impl TtsEngine {
             stop
         };
 
-        let voice = self.voice(voice_id)?;
-        let chunks = split_for_tts(&text, MAX_CHUNK_CHARS);
-        let rate = rate.clamp(0.5, 2.0);
         let app = self.app.clone();
+        let rate = rate.clamp(0.5, 2.0);
+        let chunks = split_for_tts(&text, MAX_CHUNK_CHARS);
 
+        if let Some(kokoro_voice) = voice_id.strip_prefix("kokoro:").map(str::to_string) {
+            let (dir, model) = self.kokoro_model()?;
+            std::thread::spawn(move || {
+                for (start, end) in chunks {
+                    if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let chunk_text: String = text.chars().skip(start).take(end - start).collect();
+                    let (samples, sample_rate) =
+                        match model.synthesize(&dir, &chunk_text, &kokoro_voice, rate) {
+                            Ok(audio) => audio,
+                            Err(e) => {
+                                let _ = app.emit("tts-event", TtsEvent::Error { reason: e });
+                                return;
+                            }
+                        };
+                    if samples.is_empty() {
+                        continue;
+                    }
+                    let channels = rodio::ChannelCount::new(1).expect("nonzero channels");
+                    let sample_rate =
+                        rodio::SampleRate::new(sample_rate).expect("nonzero sample rate");
+                    player.append(rodio::buffer::SamplesBuffer::new(
+                        channels,
+                        sample_rate,
+                        samples,
+                    ));
+                    // Highlight fires as the chunk's audio starts; wait for
+                    // playback to drain before queueing the next chunk so
+                    // highlights never run ahead of the audio.
+                    let _ = app.emit(
+                        "tts-event",
+                        TtsEvent::Progress {
+                            page,
+                            start: start as i64,
+                            end: end as i64,
+                        },
+                    );
+                    player.sleep_until_end();
+                }
+                let _ = app.emit("tts-event", TtsEvent::PageDone { page });
+            });
+            return Ok(());
+        }
+
+        let piper_id = voice_id
+            .strip_prefix("piper:")
+            .unwrap_or(voice_id)
+            .to_string();
+        let voice = self.voice(&piper_id)?;
         std::thread::spawn(move || {
             for (start, end) in chunks {
                 if stop.load(Ordering::Relaxed) {
@@ -272,6 +356,9 @@ impl TtsEngine {
                         end: end as i64,
                     },
                 );
+                // Same playback pacing as the Kokoro path: the highlight
+                // for this chunk is live while its audio plays.
+                player.sleep_until_end();
             }
             let _ = app.emit("tts-event", TtsEvent::PageDone { page });
         });
@@ -415,6 +502,7 @@ fn voice_info(id: &str, model_path: &Path) -> TtsVoiceInfo {
         id: id.to_string(),
         label,
         lang,
+        engine: "piper".into(),
     }
 }
 

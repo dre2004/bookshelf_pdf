@@ -8,8 +8,10 @@ interface Props {
 
 export default function NarrationPanel({ narration, currentPage, onClose }: Props) {
   const { supported, options, speaking, paused } = narration;
-  const onDevice = options.filter((option) => option.engine === "piper");
+  const kokoro = options.filter((option) => option.engine === "kokoro");
+  const piper = options.filter((option) => option.engine === "piper");
   const system = options.filter((option) => option.engine === "speech");
+  const kokoroPackReady = kokoro.length > 0;
 
   return (
     <div className="narration-panel">
@@ -27,7 +29,24 @@ export default function NarrationPanel({ narration, currentPage, onClose }: Prop
         </p>
       ) : (
         <>
-          {onDevice.length === 0 && (
+          {!kokoroPackReady && (
+            <div className="voice-download">
+              <button
+                className="btn primary"
+                onClick={narration.download.startKokoro}
+                disabled={narration.download.kokoroActive}
+              >
+                {narration.download.kokoroActive
+                  ? `Downloading Kokoro voices… ${narration.download.kokoroProgress}%`
+                  : "⬇ Download natural neural voices (~115 MB)"}
+              </button>
+              <p className="muted narration-hint">
+                High-quality offline neural voices (Heart, Bella and more) — recommended over the
+                classic Piper set.
+              </p>
+            </div>
+          )}
+          {kokoroPackReady && piper.length === 0 && (
             <div className="voice-download">
               <button
                 className="btn primary"
@@ -64,8 +83,15 @@ export default function NarrationPanel({ narration, currentPage, onClose }: Prop
               onChange={(e) => narration.setVoiceURI(e.target.value)}
               disabled={speaking}
             >
-              {onDevice.length > 0 && (
-                <optgroup label="On-device (offline)">{onDevice.map((option) => (
+              {kokoro.length > 0 && (
+                <optgroup label="Natural neural (Kokoro)">{kokoro.map((option) => (
+                  <option key={option.uri} value={option.uri}>
+                    {option.label}
+                  </option>
+                ))}</optgroup>
+              )}
+              {piper.length > 0 && (
+                <optgroup label="Piper voices">{piper.map((option) => (
                   <option key={option.uri} value={option.uri}>
                     {option.label}
                   </option>

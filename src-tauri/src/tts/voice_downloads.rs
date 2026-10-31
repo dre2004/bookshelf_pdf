@@ -169,8 +169,7 @@ fn content_length(url: &str) -> Result<u64, String> {
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
-fn download_file(
+pub(crate) fn download_file(
     agent: &ureq::Agent,
     url: &str,
     path: &std::path::Path,
@@ -236,7 +235,6 @@ mod network_tests {
             response
                 .into_body()
                 .into_reader()
-                .take(200)
                 .read_to_string(&mut body)
                 .map_err(|e| e.into())
         });

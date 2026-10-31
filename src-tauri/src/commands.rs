@@ -191,6 +191,24 @@ pub fn get_startup_file() -> Option<String> {
 
 // ---- on-device narration (Piper) ----
 
+/// Downloads the Kokoro pack (model + tokenizer + curated voices);
+/// progress arrives as `kokoro-download` events.
+#[tauri::command]
+pub fn tts_install_kokoro(engine: tauri::State<'_, Arc<TtsEngine>>) -> Result<(), String> {
+    use tauri::Manager;
+    let dir = engine
+        .app_handle()
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("app data dir: {e}"))?
+        .join("kokoro");
+    let app = engine.app_handle().clone();
+    std::thread::spawn(move || {
+        let _ = crate::tts::kokoro::download_kokoro_pack(&app, &dir);
+    });
+    Ok(())
+}
+
 #[tauri::command]
 pub fn tts_voices(engine: tauri::State<'_, Arc<TtsEngine>>) -> Result<Vec<TtsVoiceInfo>, String> {
     Ok(engine.list_voices())

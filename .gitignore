@@ -25,3 +25,6 @@ dist-ssr
 
 # Piper voice models (run scripts/fetch-voices.mjs or copy .onnx + .onnx.json pairs)
 /engine/voices/*.onnx*
+
+# Kokoro pack (run scripts/fetch-voices.mjs or download from the app)
+/engine/kokoro/

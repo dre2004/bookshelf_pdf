@@ -33,6 +33,7 @@ rodio = "0.23.0"
 piper-plus = { version = "0.5.3", features = ["inference"] }
 piper-plus-g2p = { version = "0.5.3", features = ["bundled-dicts"] }
 ureq = "3.5.0"
+ort = { version = "=2.0.0-rc.15", default-features = false }
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

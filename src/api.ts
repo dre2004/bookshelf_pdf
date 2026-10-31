@@ -97,8 +97,19 @@ export async function getPageText(docId: number, page: number): Promise<PageText
 
 // ---- on-device narration (Piper) ----
 
-export async function ttsVoices(): Promise<{ id: string; label: string; lang: string }[]> {
+export interface TtsVoice {
+  id: string;
+  label: string;
+  lang: string;
+  engine: "piper" | "kokoro";
+}
+
+export async function ttsVoices(): Promise<TtsVoice[]> {
   return invoke("tts_voices");
+}
+
+export async function ttsInstallKokoro(): Promise<void> {
+  return invoke("tts_install_kokoro");
 }
 
 export async function ttsSpeak(args: {
