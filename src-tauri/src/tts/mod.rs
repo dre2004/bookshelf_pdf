@@ -153,7 +153,7 @@ fn gap_samples(
     vec![0.0; sample_rate as usize * milliseconds as usize / 1000]
 }
 
-const HEADING_PAUSE_MS: u32 = 1500;
+const HEADING_PAUSE_MS: u32 = 2000;
 const PARAGRAPH_PAUSE_MS: u32 = 800;
 const SENTENCE_PAUSE_MS: u32 = 400;
 
@@ -726,7 +726,7 @@ mod pause_tests {
         // sentence groups; never a trailing pause on the final chunk.
         assert_eq!(
             gap_samples(true, false, false, 24_000).len(),
-            24_000 * 1500 / 1000
+            24_000 * 2000 / 1000
         );
         assert_eq!(
             gap_samples(false, true, false, 24_000).len(),

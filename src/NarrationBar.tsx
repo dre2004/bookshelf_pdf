@@ -55,15 +55,14 @@ export default function NarrationBar({
         <button
           className="btn icon"
           onClick={() => narration.setRate(stepped(narration.rate, -1))}
-          title="Slower (-15%)"
+          title="Slower"
         >
           −
         </button>
-        <span className="speed-value">{narration.rate.toFixed(2)}×</span>
         <button
           className="btn icon"
           onClick={() => narration.setRate(stepped(narration.rate, 1))}
-          title="Faster (+15%)"
+          title="Faster"
         >
           +
         </button>
