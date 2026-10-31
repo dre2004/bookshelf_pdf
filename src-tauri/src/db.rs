@@ -5,7 +5,7 @@
 use std::{collections::HashMap, path::Path, sync::Mutex};
 
 use rusqlite::{Connection, OptionalExtension, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::Manager;
 
 #[derive(Debug, Clone, Serialize)]
@@ -28,6 +28,42 @@ pub struct BookSummary {
 pub struct BookState {
     pub last_page: i32,
     pub last_offset: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Bookmark {
+    pub id: i64,
+    pub page: i32,
+    pub offset: f64,
+    pub title: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Highlight {
+    pub id: i64,
+    pub page: i32,
+    pub start_char: i64,
+    pub end_char: i64,
+    pub text: String,
+    pub color: String,
+    pub note: String,
+    pub created_at: i64,
+}
+
+/// Input for creating a highlight; deserialized from the frontend command.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewHighlight {
+    pub book_id: i64,
+    pub page: i32,
+    pub start_char: i64,
+    pub end_char: i64,
+    pub text: String,
+    pub color: String,
+    pub note: String,
 }
 
 pub struct Db {
@@ -57,6 +93,7 @@ impl Db {
     fn init_schema(conn: &Connection) -> Result<(), String> {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
+             PRAGMA foreign_keys = ON;
              CREATE TABLE IF NOT EXISTS books (
                  id              INTEGER PRIMARY KEY,
                  path            TEXT NOT NULL UNIQUE,
@@ -71,6 +108,25 @@ impl Db {
              CREATE TABLE IF NOT EXISTS settings (
                  key   TEXT PRIMARY KEY,
                  value TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS bookmarks (
+                 id          INTEGER PRIMARY KEY,
+                 book_id     INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+                 page        INTEGER NOT NULL,
+                 offset      REAL NOT NULL DEFAULT 0,
+                 title       TEXT NOT NULL,
+                 created_at  INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS highlights (
+                 id          INTEGER PRIMARY KEY,
+                 book_id     INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+                 page        INTEGER NOT NULL,
+                 start_char  INTEGER NOT NULL,
+                 end_char    INTEGER NOT NULL,
+                 text        TEXT NOT NULL,
+                 color       TEXT NOT NULL DEFAULT 'yellow',
+                 note        TEXT NOT NULL DEFAULT '',
+                 created_at  INTEGER NOT NULL
              );",
         )
         .map_err(|e| format!("migrate: {e}"))?;
@@ -232,6 +288,156 @@ impl Db {
             .map_err(|e| e.to_string())?;
         Ok(())
     }
+
+    // ---- named bookmarks ----
+
+    pub fn add_bookmark(
+        &self,
+        book_id: i64,
+        page: i32,
+        offset: f64,
+        title: &str,
+    ) -> Result<Bookmark, String> {
+        let conn = self.conn.lock().unwrap();
+        let created_at = now_ms();
+        conn.execute(
+            "INSERT INTO bookmarks (book_id, page, offset, title, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![book_id, page, offset, title, created_at],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(Bookmark {
+            id: conn.last_insert_rowid(),
+            page,
+            offset,
+            title: title.to_string(),
+            created_at,
+        })
+    }
+
+    pub fn remove_bookmark(&self, bookmark_id: i64) -> Result<(), String> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM bookmarks WHERE id = ?1", params![bookmark_id])
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn list_bookmarks(&self, book_id: i64) -> Result<Vec<Bookmark>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, page, offset, title, created_at
+                 FROM bookmarks WHERE book_id = ?1
+                 ORDER BY page, created_at",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![book_id], |row| {
+                Ok(Bookmark {
+                    id: row.get(0)?,
+                    page: row.get(1)?,
+                    offset: row.get(2)?,
+                    title: row.get(3)?,
+                    created_at: row.get(4)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+    }
+
+    // ---- highlights & notes ----
+
+    pub fn add_highlight(&self, entry: &NewHighlight) -> Result<Highlight, String> {
+        let conn = self.conn.lock().unwrap();
+        let created_at = now_ms();
+        conn.execute(
+            "INSERT INTO highlights (book_id, page, start_char, end_char, text, color, note, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                entry.book_id,
+                entry.page,
+                entry.start_char,
+                entry.end_char,
+                entry.text,
+                entry.color,
+                entry.note,
+                created_at
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(Highlight {
+            id: conn.last_insert_rowid(),
+            page: entry.page,
+            start_char: entry.start_char,
+            end_char: entry.end_char,
+            text: entry.text.clone(),
+            color: entry.color.clone(),
+            note: entry.note.clone(),
+            created_at,
+        })
+    }
+
+    pub fn update_highlight(
+        &self,
+        highlight_id: i64,
+        color: Option<&str>,
+        note: Option<&str>,
+    ) -> Result<(), String> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE highlights SET
+                     color = COALESCE(?1, color),
+                     note = COALESCE(?2, note)
+                 WHERE id = ?3",
+                params![color, note, highlight_id],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn remove_highlight(&self, highlight_id: i64) -> Result<(), String> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "DELETE FROM highlights WHERE id = ?1",
+                params![highlight_id],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn list_highlights(&self, book_id: i64) -> Result<Vec<Highlight>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, page, start_char, end_char, text, color, note, created_at
+                 FROM highlights WHERE book_id = ?1
+                 ORDER BY page, start_char",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![book_id], |row| {
+                Ok(Highlight {
+                    id: row.get(0)?,
+                    page: row.get(1)?,
+                    start_char: row.get(2)?,
+                    end_char: row.get(3)?,
+                    text: row.get(4)?,
+                    color: row.get(5)?,
+                    note: row.get(6)?,
+                    created_at: row.get(7)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+    }
 }
 
 fn now_ms() -> i64 {
@@ -338,5 +544,75 @@ mod tests {
         db.set_cover(id, vec![1, 2, 3]).unwrap();
         assert_eq!(db.cover(id).unwrap(), vec![1, 2, 3]);
         assert!(db.list_books().unwrap()[0].has_cover);
+    }
+
+    #[test]
+    fn bookmarks_crud_and_ordering() {
+        let db = test_db();
+        let book = db.add_or_touch_book("a.pdf", "A", 100).unwrap();
+
+        db.add_bookmark(book, 42, 0.5, "Halfway").unwrap();
+        db.add_bookmark(book, 3, 0.0, "Start").unwrap();
+        db.add_bookmark(book, 42, 0.9, "Also halfway").unwrap();
+
+        let bookmarks = db.list_bookmarks(book).unwrap();
+        assert_eq!(bookmarks.len(), 3);
+        assert_eq!(bookmarks[0].page, 3); // ordered by page
+        assert_eq!(bookmarks[1].title, "Halfway"); // then by creation
+
+        db.remove_bookmark(bookmarks[0].id).unwrap();
+        assert_eq!(db.list_bookmarks(book).unwrap().len(), 2);
+
+        // Removing the book cascades to its bookmarks.
+        db.remove_book(book).unwrap();
+        assert!(db.list_bookmarks(book).unwrap().is_empty());
+    }
+
+    #[test]
+    fn highlights_crud_and_partial_updates() {
+        let db = test_db();
+        let book = db.add_or_touch_book("a.pdf", "A", 100).unwrap();
+
+        let hl = db
+            .add_highlight(&NewHighlight {
+                book_id: book,
+                page: 7,
+                start_char: 120,
+                end_char: 145,
+                text: "important passage".into(),
+                color: "yellow".into(),
+                note: String::new(),
+            })
+            .unwrap();
+        assert_eq!(hl.page, 7);
+        assert_eq!(hl.color, "yellow");
+
+        db.update_highlight(hl.id, Some("green"), Some("my note"))
+            .unwrap();
+        db.add_highlight(&NewHighlight {
+            book_id: book,
+            page: 9,
+            start_char: 10,
+            end_char: 20,
+            text: "another".into(),
+            color: "blue".into(),
+            note: String::new(),
+        })
+        .unwrap();
+
+        let highlights = db.list_highlights(book).unwrap();
+        assert_eq!(highlights.len(), 2);
+        let updated = highlights.iter().find(|h| h.id == hl.id).unwrap();
+        assert_eq!(updated.color, "green");
+        assert_eq!(updated.note, "my note");
+
+        // Updating only one field leaves the other intact.
+        db.update_highlight(hl.id, Some("red"), None).unwrap();
+        let updated = db.list_highlights(book).unwrap()[0].clone();
+        assert_eq!(updated.color, "red");
+        assert_eq!(updated.note, "my note");
+
+        db.remove_highlight(hl.id).unwrap();
+        assert_eq!(db.list_highlights(book).unwrap().len(), 1);
     }
 }

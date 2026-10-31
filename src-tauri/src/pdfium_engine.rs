@@ -43,6 +43,100 @@ pub struct DocumentInfo {
     pub pages: Vec<PageInfo>,
 }
 
+/// Character-level text geometry for one page. `chars[i]` corresponds to
+/// `boxes[i*4..i*4+4]` = (x, y, width, height) in PDF points, origin at the
+/// page's bottom-left corner.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PageTextData {
+    pub chars: String,
+    pub boxes: Vec<f32>,
+    pub width: f64,
+    pub height: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchMatch {
+    pub page: PdfPageIndex,
+    pub start: i64,
+    pub end: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutlineNode {
+    pub title: String,
+    /// Target page index, or -1 when the bookmark has no page destination.
+    pub page: PdfPageIndex,
+    pub children: Vec<OutlineNode>,
+}
+
+/// Collapses `\r\n` pairs into single spaces so queries match across line
+/// breaks; returns the normalized text plus a map from normalized index to
+/// original character index.
+fn normalize_for_search(chars: &[char]) -> (Vec<char>, Vec<usize>) {
+    let mut normalized = Vec::with_capacity(chars.len());
+    let mut index_map = Vec::with_capacity(chars.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '\r' && i + 1 < chars.len() && chars[i + 1] == '\n' {
+            normalized.push(' ');
+            index_map.push(i);
+            i += 2;
+        } else {
+            normalized.push(chars[i]);
+            index_map.push(i);
+            i += 1;
+        }
+    }
+    (normalized, index_map)
+}
+
+fn chars_equal(a: char, b: char, case_sensitive: bool) -> bool {
+    if case_sensitive {
+        a == b
+    } else {
+        a.to_lowercase().eq(b.to_lowercase())
+    }
+}
+
+fn find_matches(haystack: &[char], needle: &[char], case_sensitive: bool) -> Vec<(usize, usize)> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return Vec::new();
+    }
+    let mut matches = Vec::new();
+    'outer: for start in 0..=(haystack.len() - needle.len()) {
+        for (offset, expected) in needle.iter().enumerate() {
+            if !chars_equal(haystack[start + offset], *expected, case_sensitive) {
+                continue 'outer;
+            }
+        }
+        matches.push((start, start + needle.len()));
+    }
+    matches
+}
+
+fn outline_node(bookmark: &PdfBookmark<'_>, depth: usize) -> OutlineNode {
+    let page = bookmark
+        .destination()
+        .and_then(|dest| dest.page_index().ok())
+        .unwrap_or(-1);
+    let mut children = Vec::new();
+    if depth < 8 {
+        let mut child = bookmark.first_child();
+        while let Some(node) = child {
+            children.push(outline_node(&node, depth + 1));
+            child = node.next_sibling();
+        }
+    }
+    OutlineNode {
+        title: bookmark.title().unwrap_or_else(|| "(untitled)".into()),
+        page,
+        children,
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "code", rename_all = "snake_case")]
 pub enum ApiError {
@@ -182,6 +276,119 @@ impl Engine {
         let from = from.max(0).min(page_count);
         let to = to.max(from).min(page_count);
         Ok(collect_dims(doc, from, to))
+    }
+
+    /// Per-character text with bounding boxes for one page — the data behind
+    /// the selectable text layer, search highlighting and highlights.
+    pub fn page_text(
+        &self,
+        doc_id: u32,
+        page_index: PdfPageIndex,
+    ) -> Result<PageTextData, ApiError> {
+        let docs = self.docs.lock().unwrap();
+        let doc = docs.get(&doc_id).ok_or(ApiError::UnknownDocument)?;
+        let pages = doc.pages();
+        if page_index < 0 || page_index >= pages.len() {
+            return Err(ApiError::UnknownPage);
+        }
+        let page = pages.get(page_index).map_err(|e| ApiError::RenderFailed {
+            reason: pdfium_error_reason(&e),
+        })?;
+        let text = page.text().map_err(|e| ApiError::RenderFailed {
+            reason: pdfium_error_reason(&e),
+        })?;
+
+        let mut chars = String::with_capacity(text.len().max(0) as usize);
+        let mut boxes = Vec::with_capacity(chars.capacity() * 4);
+        for ch in text.chars().iter() {
+            chars.push(ch.unicode_char().unwrap_or('\u{FFFD}'));
+            match ch.loose_bounds() {
+                Ok(rect) => {
+                    boxes.push(rect.left().value);
+                    boxes.push(rect.bottom().value);
+                    boxes.push(rect.width().value);
+                    boxes.push(rect.height().value);
+                }
+                Err(_) => boxes.extend([0.0, 0.0, 0.0, 0.0]),
+            }
+        }
+
+        Ok(PageTextData {
+            chars,
+            boxes,
+            width: page.width().value as f64,
+            height: page.height().value as f64,
+        })
+    }
+
+    /// Case-(in)sensitive substring search over every page. Matches are
+    /// reported as char ranges aligned with `PageTextData::chars`, and match
+    /// across line breaks (PDFium emits `\r\n`) as a single space.
+    pub fn search_document(
+        &self,
+        doc_id: u32,
+        query: &str,
+        case_sensitive: bool,
+        max_results: usize,
+    ) -> Result<Vec<SearchMatch>, ApiError> {
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let query: Vec<char> = query.chars().collect();
+        let docs = self.docs.lock().unwrap();
+        let doc = docs.get(&doc_id).ok_or(ApiError::UnknownDocument)?;
+        let pages = doc.pages();
+
+        let mut matches = Vec::new();
+        for page_index in 0..pages.len() {
+            let page = match pages.get(page_index) {
+                Ok(page) => page,
+                Err(_) => continue,
+            };
+            let text = match page.text() {
+                Ok(text) => text,
+                Err(_) => continue,
+            };
+            let mut page_chars = Vec::with_capacity(text.len().max(0) as usize);
+            for ch in text.chars().iter() {
+                page_chars.push(ch.unicode_char().unwrap_or('\u{FFFD}'));
+            }
+
+            let (normalized, index_map) = normalize_for_search(&page_chars);
+            for (norm_start, norm_end) in find_matches(&normalized, &query, case_sensitive) {
+                // Map normalized positions back to real character indices.
+                let start = index_map[norm_start];
+                let end = if norm_end < index_map.len() {
+                    index_map[norm_end]
+                } else {
+                    page_chars.len()
+                };
+                matches.push(SearchMatch {
+                    page: page_index,
+                    start: start as i64,
+                    end: end as i64,
+                });
+                if matches.len() >= max_results {
+                    return Ok(matches);
+                }
+            }
+        }
+        Ok(matches)
+    }
+
+    /// The document's outline (table of contents) as a page-indexed tree.
+    pub fn outline(&self, doc_id: u32) -> Result<Vec<OutlineNode>, ApiError> {
+        let docs = self.docs.lock().unwrap();
+        let doc = docs.get(&doc_id).ok_or(ApiError::UnknownDocument)?;
+        let bookmarks = doc.bookmarks();
+
+        let mut roots = Vec::new();
+        let mut bookmark = bookmarks.iter().next();
+        while let Some(node) = bookmark {
+            roots.push(outline_node(&node, 0));
+            bookmark = node.next_sibling();
+        }
+        Ok(roots)
     }
 
     pub fn render_page_png(
@@ -388,5 +595,51 @@ mod tests {
         assert!(cache.get(&(1, 0, 800)).is_none());
         assert!(cache.get(&(2, 0, 800)).is_some());
         assert_eq!(cache.total_bytes, 10);
+    }
+
+    fn s(text: &str) -> Vec<char> {
+        text.chars().collect()
+    }
+
+    #[test]
+    fn find_matches_reports_all_occurrences() {
+        // "the" appears at 0, 4 ("theme") and 13 ("the book")
+        let haystack = s("the theme of the book");
+        let matches = find_matches(&haystack, &s("the"), true);
+        assert_eq!(matches, vec![(0, 3), (4, 7), (13, 16)]);
+    }
+
+    #[test]
+    fn find_matches_case_insensitive_by_default() {
+        let matches = find_matches(&s("Alpha beta ALPHA"), &s("alpha"), false);
+        assert_eq!(matches, vec![(0, 5), (11, 16)]);
+        assert!(find_matches(&s("Alpha"), &s("alpha"), true).is_empty());
+    }
+
+    #[test]
+    fn normalization_collapses_line_breaks_to_spaces() {
+        let raw = s("end of line.\r\nNew chapter");
+        let (normalized, map) = normalize_for_search(&raw);
+        let text: String = normalized.iter().collect();
+        assert_eq!(text, "end of line. New chapter");
+
+        // A cross-line query maps back to the full \r\n span.
+        let matches = find_matches(&normalized, &s("line. new"), false);
+        assert_eq!(matches.len(), 1);
+        let (norm_start, norm_end) = matches[0];
+        let start = map[norm_start];
+        let end = if norm_end < map.len() {
+            map[norm_end]
+        } else {
+            raw.len()
+        };
+        let matched: String = raw[start..end].iter().collect();
+        assert_eq!(matched, "line.\r\nNew");
+    }
+
+    #[test]
+    fn find_matches_handles_empty_needle_and_overflow() {
+        assert!(find_matches(&s("abc"), &[], false).is_empty());
+        assert!(find_matches(&s("ab"), &s("abc"), false).is_empty());
     }
 }

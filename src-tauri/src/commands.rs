@@ -2,8 +2,10 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use crate::db::{BookState, BookSummary, Db};
-use crate::pdfium_engine::{ApiError, DocumentInfo, Engine, PageInfo};
+use crate::db::{BookState, BookSummary, Bookmark, Db, Highlight, NewHighlight};
+use crate::pdfium_engine::{
+    ApiError, DocumentInfo, Engine, OutlineNode, PageInfo, PageTextData, SearchMatch,
+};
 
 #[tauri::command]
 pub fn open_document(
@@ -28,6 +30,88 @@ pub fn get_page_dims(
     to: i32,
 ) -> Result<Vec<PageInfo>, ApiError> {
     engine.get_page_dims(doc_id, from, to)
+}
+
+#[tauri::command]
+pub fn get_page_text(
+    engine: tauri::State<'_, Arc<Engine>>,
+    doc_id: u32,
+    page: i32,
+) -> Result<PageTextData, ApiError> {
+    engine.page_text(doc_id, page)
+}
+
+#[tauri::command]
+pub fn search_document(
+    engine: tauri::State<'_, Arc<Engine>>,
+    doc_id: u32,
+    query: String,
+    case_sensitive: bool,
+) -> Result<Vec<SearchMatch>, ApiError> {
+    engine.search_document(doc_id, &query, case_sensitive, 2000)
+}
+
+#[tauri::command]
+pub fn get_outline(
+    engine: tauri::State<'_, Arc<Engine>>,
+    doc_id: u32,
+) -> Result<Vec<OutlineNode>, ApiError> {
+    engine.outline(doc_id)
+}
+
+#[tauri::command]
+pub fn bookmarks_add(
+    db: tauri::State<'_, Arc<Db>>,
+    book_id: i64,
+    page: i32,
+    offset: f64,
+    title: String,
+) -> Result<Bookmark, String> {
+    db.add_bookmark(book_id, page, offset, &title)
+}
+
+#[tauri::command]
+pub fn bookmarks_remove(db: tauri::State<'_, Arc<Db>>, bookmark_id: i64) -> Result<(), String> {
+    db.remove_bookmark(bookmark_id)
+}
+
+#[tauri::command]
+pub fn bookmarks_list(
+    db: tauri::State<'_, Arc<Db>>,
+    book_id: i64,
+) -> Result<Vec<Bookmark>, String> {
+    db.list_bookmarks(book_id)
+}
+
+#[tauri::command]
+pub fn highlights_add(
+    db: tauri::State<'_, Arc<Db>>,
+    entry: NewHighlight,
+) -> Result<Highlight, String> {
+    db.add_highlight(&entry)
+}
+
+#[tauri::command]
+pub fn highlights_update(
+    db: tauri::State<'_, Arc<Db>>,
+    highlight_id: i64,
+    color: Option<String>,
+    note: Option<String>,
+) -> Result<(), String> {
+    db.update_highlight(highlight_id, color.as_deref(), note.as_deref())
+}
+
+#[tauri::command]
+pub fn highlights_remove(db: tauri::State<'_, Arc<Db>>, highlight_id: i64) -> Result<(), String> {
+    db.remove_highlight(highlight_id)
+}
+
+#[tauri::command]
+pub fn highlights_list(
+    db: tauri::State<'_, Arc<Db>>,
+    book_id: i64,
+) -> Result<Vec<Highlight>, String> {
+    db.list_highlights(book_id)
 }
 
 /// Registers a just-opened book in the library (or touches its last-opened
