@@ -89,6 +89,12 @@ resource automatically.
 
 ## License
 
-The application code is open source. PDFium itself is BSD-licensed
+Copyright © 2026 Andres.
+
+This project is licensed under the
+[GNU AGPL-3.0-or-later](https://www.gnu.org/licenses/agpl-3.0.en.html) — the
+strongest mainstream copyleft license. If you modify and distribute it (or run
+a modified version as a network service), you must share your source under the
+same license. PDFium itself is MIT/BSD-licensed
 (`src-tauri/resources/pdfium/LICENSE.pdfium.txt` after fetching); see also the
 third-party licenses of Tauri, pdfium-render and their dependencies.
