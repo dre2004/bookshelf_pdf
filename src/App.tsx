@@ -284,6 +284,28 @@ export default function App() {
   const openPath = useCallback(
     async (path: string, pwd?: string) => {
       if (currentRef.current?.path === path) {
+        // Re-entering the open book: the Reader remounted with scrollTop 0
+        // when the library opened, so the latest saved position must be
+        // restored again — otherwise the view desyncs from the page state
+        // and same-page chapter clicks die silently.
+        const book = currentRef.current;
+        if (book.bookId >= 0) {
+          try {
+            const state = await bookState(book.bookId);
+            if (state && (state.lastPage > 0 || state.lastOffset > 0)) {
+              const page = Math.min(state.lastPage, book.doc.pageCount - 1);
+              setPage(page);
+              positionRef.current = { page, offset: state.lastOffset };
+              setResume({ page, offset: state.lastOffset });
+            } else {
+              setPage(0);
+              positionRef.current = { page: 0, offset: 0 };
+              setResume(null);
+            }
+          } catch {
+            /* stay on the current page state */
+          }
+        }
         setView("reader");
         return;
       }
@@ -456,13 +478,17 @@ export default function App() {
   }, [narration.continuous, persist]);
 
   /** Jump to a page (and fractional position) from sidebar/search actions.
-   *  Jumps are recorded so Back can return to where you were reading. */
+   *  Jumps are recorded so Back can return to where you were reading. The
+   *  serial bumps on every jump so the Reader scrolls even when the target
+   *  equals the current page state (which otherwise no-ops in React). */
+  const [jumpSerial, setJumpSerial] = useState(0);
   const jumpTo = useCallback(
     (target: number, offset = 0, opts?: { push?: boolean }) => {
       if (opts?.push !== false) {
         setHistory((h) => [...h.slice(-49), positionRef.current]);
         setFuture([]);
       }
+      setJumpSerial((s) => s + 1);
       changePage(target);
       if (mode === "scroll" && offset > 0) {
         // The reader applies offsets only on document restore; approximate a
@@ -836,6 +862,7 @@ export default function App() {
               mode={mode}
               dims={dims}
               page={page}
+              jumpSerial={jumpSerial}
               onPageChange={changePage}
               onProgress={handleProgress}
               resume={resume}

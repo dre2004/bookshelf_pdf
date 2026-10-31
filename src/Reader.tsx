@@ -344,6 +344,9 @@ export interface ReaderProps {
   doc: DocumentInfo;
   dims: PageInfo[];
   page: number;
+  /** Increments on every sidebar/search jump, so a jump to the page the
+   *  state already names still scrolls (React skips same-value updates). */
+  jumpSerial: number;
   onPageChange: (page: number) => void;
   /** Called as reading position moves (page + position within the page 0..1). */
   onProgress: (page: number, offset: number) => void;
@@ -372,6 +375,7 @@ export default function Reader({
   doc,
   dims,
   page,
+  jumpSerial,
   onPageChange,
   onProgress,
   resume,
@@ -462,16 +466,22 @@ export default function Reader({
   }, [mode, doc.docId]);
 
   // Follow external page changes (toolbar, keyboard) by scrolling the page
-  // into view; scroll-driven changes are suppressed via lastReported.
+  // into view; scroll-driven changes are suppressed via lastReported. A
+  // jump (jumpSerial bump) always scrolls, even to the page the state
+  // already names — the view can legitimately be elsewhere after a remount.
+  const appliedJumpSerial = useRef(jumpSerial);
   useEffect(() => {
     if (mode !== "scroll") {
       lastReported.current = page;
+      appliedJumpSerial.current = jumpSerial;
       return;
     }
-    if (page === lastReported.current) return;
+    const isJump = jumpSerial !== appliedJumpSerial.current;
+    appliedJumpSerial.current = jumpSerial;
+    if (!isJump && page === lastReported.current) return;
     lastReported.current = page;
     pageEls.current.get(page)?.scrollIntoView({ block: "start", behavior: "auto" });
-  }, [page, mode]);
+  }, [page, mode, jumpSerial]);
 
   const lastProgressSent = useRef(0);
 
