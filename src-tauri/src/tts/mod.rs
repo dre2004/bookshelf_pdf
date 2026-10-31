@@ -396,8 +396,8 @@ fn heading_aware_pieces(
     all
 }
 
-const HEADING_PAUSE_MS: u32 = 2000;
-const HEADING_KICKER_PAUSE_MS: u32 = 800;
+const HEADING_PAUSE_MS: u32 = 1000;
+const HEADING_KICKER_PAUSE_MS: u32 = 1000;
 const PARAGRAPH_PAUSE_MS: u32 = 800;
 const SENTENCE_PAUSE_MS: u32 = 400;
 
@@ -770,7 +770,7 @@ impl TtsEngine {
                         return;
                     }
                     // A heading glued to body text becomes two pieces:
-                    // the heading (2s pause after), then the body.
+                    // the heading (1s pause after), then the body.
                     let pieces = heading_aware_pieces(
                         &text_chars,
                         (start, end),
@@ -1145,9 +1145,9 @@ mod pause_tests {
 
     #[test]
     fn pause_durations_match_narration_standards() {
-        // Each playback piece carries the pause that follows it: 2.0 s
-        // after a heading title, 0.8 s after a chapter kicker line and
-        // after a paragraph, 0.4 s between sentence groups.
+        // Each playback piece carries the pause that follows it: 1.0 s
+        // after a heading (chapter kicker or title), 0.8 s after a
+        // paragraph, 0.4 s between sentence groups.
         let chars: Vec<char> = "A paragraph of text that ends the block.".chars().collect();
         let n = chars.len();
         let pieces = heading_aware_pieces(&chars, (0, n), &[], &[n]);
