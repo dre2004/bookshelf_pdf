@@ -39,11 +39,16 @@ interface PageImageProps {
 }
 
 function PageImage({ docId, index, cssWidth, cssHeight }: PageImageProps) {
-  const [state, setState] = useState<"loading" | "loaded" | "failed">("loading");
+  // Status is keyed by URL: a cached image can fire `load` before React
+  // commits, so a plain reset-on-url-change state machine races and can
+  // leave the spinner stuck. Stale events for an old URL are ignored, and
+  // the ref check below catches images that finished before this mounted.
+  const [status, setStatus] = useState<{
+    url: string;
+    state: "loading" | "loaded" | "failed";
+  } | null>(null);
   const url = pageImageUrl(docId, index, renderWidth(cssWidth));
-  useEffect(() => {
-    setState("loading");
-  }, [url]);
+  const state = status?.url === url ? status.state : "loading";
 
   return (
     <div className="page-frame" style={{ width: cssWidth, height: cssHeight }}>
@@ -56,14 +61,18 @@ function PageImage({ docId, index, cssWidth, cssHeight }: PageImageProps) {
       )}
       <img
         key={url}
+        ref={(el) => {
+          if (el?.complete && el.naturalWidth > 0) setStatus({ url, state: "loaded" });
+        }}
         src={url}
         width={Math.round(cssWidth)}
         height={Math.round(cssHeight)}
         draggable={false}
         alt=""
+        decoding="async"
         className={`page-img ${state === "loaded" ? "visible" : ""}`}
-        onLoad={() => setState("loaded")}
-        onError={() => setState("failed")}
+        onLoad={() => setStatus({ url, state: "loaded" })}
+        onError={() => setStatus({ url, state: "failed" })}
       />
     </div>
   );
