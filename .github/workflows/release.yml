@@ -82,7 +82,7 @@ jobs:
             Download the asset for your platform from the list below.
 
             - **Windows**: `.msi` or `.exe` (NSIS) installer
-            - **macOS**: universal `.dmg` (Intel and Apple Silicon) —
+            - **macOS**: `aarch64.dmg` (Apple Silicon) —
               unsigned, so right-click → Open on first launch
             - **Linux**: `.deb`, `.rpm` or `.AppImage`
           releaseDraft: true
