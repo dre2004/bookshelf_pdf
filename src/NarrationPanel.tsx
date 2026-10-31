@@ -7,7 +7,9 @@ interface Props {
 }
 
 export default function NarrationPanel({ narration, currentPage, onClose }: Props) {
-  const { supported, voices, speaking, paused } = narration;
+  const { supported, options, speaking, paused } = narration;
+  const onDevice = options.filter((option) => option.engine === "piper");
+  const system = options.filter((option) => option.engine === "speech");
 
   return (
     <div className="narration-panel">
@@ -20,8 +22,8 @@ export default function NarrationPanel({ narration, currentPage, onClose }: Prop
 
       {!supported ? (
         <p className="muted narration-unsupported">
-          Speech synthesis isn't available in this platform's web view. Narration is supported on
-          Windows.
+          No narration engines available: this web view lacks speech synthesis and no on-device
+          voices are installed.
         </p>
       ) : (
         <>
@@ -32,12 +34,21 @@ export default function NarrationPanel({ narration, currentPage, onClose }: Prop
               onChange={(e) => narration.setVoiceURI(e.target.value)}
               disabled={speaking}
             >
-              {voices.length === 0 && <option value="">Loading voices…</option>}
-              {voices.map((voice) => (
-                <option key={voice.voiceURI} value={voice.voiceURI}>
-                  {voice.name} ({voice.lang})
-                </option>
-              ))}
+              {onDevice.length > 0 && (
+                <optgroup label="On-device (offline)">{onDevice.map((option) => (
+                  <option key={option.uri} value={option.uri}>
+                    {option.label}
+                  </option>
+                ))}</optgroup>
+              )}
+              {system.length > 0 && (
+                <optgroup label="System">{system.map((option) => (
+                  <option key={option.uri} value={option.uri}>
+                    {option.label}
+                  </option>
+                ))}</optgroup>
+              )}
+              {options.length === 0 && <option value="">Loading voices…</option>}
             </select>
           </label>
 

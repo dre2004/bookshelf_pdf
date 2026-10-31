@@ -95,6 +95,33 @@ export async function getPageText(docId: number, page: number): Promise<PageText
   return invoke<PageTextData>("get_page_text", { docId, page });
 }
 
+// ---- on-device narration (Piper) ----
+
+export async function ttsVoices(): Promise<{ id: string; label: string; lang: string }[]> {
+  return invoke("tts_voices");
+}
+
+export async function ttsSpeak(args: {
+  text: string;
+  page: number;
+  voiceId: string;
+  rate: number;
+}): Promise<void> {
+  return invoke("tts_speak", args);
+}
+
+export async function ttsPause(): Promise<void> {
+  return invoke("tts_pause");
+}
+
+export async function ttsResume(): Promise<void> {
+  return invoke("tts_resume");
+}
+
+export async function ttsStop(): Promise<void> {
+  return invoke("tts_stop");
+}
+
 export async function searchDocument(
   docId: number,
   query: string,

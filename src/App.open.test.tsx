@@ -62,6 +62,11 @@ vi.mock("./api", () => ({
   highlightsList: vi.fn().mockResolvedValue([]),
   highlightsRemove: vi.fn().mockResolvedValue(undefined),
   highlightsUpdate: vi.fn().mockResolvedValue(undefined),
+  ttsVoices: vi.fn().mockResolvedValue([]),
+  ttsSpeak: vi.fn().mockResolvedValue(undefined),
+  ttsPause: vi.fn().mockResolvedValue(undefined),
+  ttsResume: vi.fn().mockResolvedValue(undefined),
+  ttsStop: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock("@tauri-apps/plugin-dialog", () => ({

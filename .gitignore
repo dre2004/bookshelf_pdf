@@ -22,3 +22,6 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Piper voice models (run scripts/fetch-voices.mjs or copy .onnx + .onnx.json pairs)
+/engine/voices/*.onnx*

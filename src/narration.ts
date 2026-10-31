@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
+import { ttsPause, ttsResume, ttsSpeak, ttsStop, ttsVoices } from "./api";
 
 /** The page text fed to the engine is exactly `PageTextData.chars`, so
- *  boundary events' charIndex maps straight onto the page's character
+ *  progress events' char ranges map straight onto the page's character
  *  geometry — that's what powers the spoken-word highlight. */
 export interface SpokenRange {
   page: number;
@@ -9,8 +11,18 @@ export interface SpokenRange {
   end: number;
 }
 
-export function speechSupported(): boolean {
-  return typeof window !== "undefined" && "speechSynthesis" in window;
+export interface PiperVoice {
+  id: string;
+  label: string;
+  lang: string;
+}
+
+export interface NarrationVoiceOption {
+  /** Stable selection key; `piper:<id>` for on-device voices, the system
+   *  voice's own URI otherwise. */
+  uri: string;
+  label: string;
+  engine: "piper" | "speech";
 }
 
 /** Local voices first, then by name — they tend to respond faster. */
@@ -33,7 +45,8 @@ interface UseNarrationArgs {
 
 export interface NarrationController {
   supported: boolean;
-  voices: SpeechSynthesisVoice[];
+  /** All selectable voices: on-device (Piper) first, then system voices. */
+  options: NarrationVoiceOption[];
   speaking: boolean;
   paused: boolean;
   page: number | null;
@@ -50,6 +63,12 @@ export interface NarrationController {
   stop: () => void;
 }
 
+const PIPER_PREFIX = "piper:";
+
+function isPiperVoice(uri: string): boolean {
+  return uri.startsWith(PIPER_PREFIX);
+}
+
 export function useNarration({
   docId,
   page,
@@ -59,7 +78,8 @@ export function useNarration({
 }: UseNarrationArgs): NarrationController {
   const supported = speechSupported();
 
-  const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
+  const [systemVoices, setSystemVoices] = useState<SpeechSynthesisVoice[]>([]);
+  const [piperVoices, setPiperVoices] = useState<PiperVoice[]>([]);
   const [speaking, setSpeaking] = useState(false);
   const [paused, setPaused] = useState(false);
   const [spokenRange, setSpokenRange] = useState<SpokenRange | null>(null);
@@ -69,7 +89,12 @@ export function useNarration({
   const [rate, setRateState] = useState(1);
   const [continuous, setContinuousState] = useState(true);
 
-  // Live refs so in-flight utterances pick up setting changes.
+  // True while the selection is an automatic default rather than a user
+  // choice — lets the on-device list (which loads slower than system
+  // voices) win the default once it arrives.
+  const autoPicked = useRef(false);
+
+  // Live refs so in-flight playback picks up setting changes.
   const voiceURIRef = useRef(voiceURI);
   const rateRef = useRef(rate);
   const continuousRef = useRef(continuous);
@@ -87,32 +112,92 @@ export function useNarration({
     continuousRef.current = continuous;
   }, [continuous]);
 
-  // Voice list loads asynchronously in most engines.
+  const options: NarrationVoiceOption[] = [
+    ...piperVoices.map((voice) => ({
+      uri: `${PIPER_PREFIX}${voice.id}`,
+      label: `${voice.label} · on-device`,
+      engine: "piper" as const,
+    })),
+    ...(supported
+      ? systemVoices.map((voice) => ({
+          uri: voice.voiceURI,
+          label: `${voice.name} (${voice.lang})`,
+          engine: "speech" as const,
+        }))
+      : []),
+  ];
+
+  /** Default pick: Daniela when installed, else the usual system heuristic. */
+  const defaultVoiceURI = useCallback(
+    (system: SpeechSynthesisVoice[], piper: PiperVoice[]): string => {
+      const daniela = piper.find((voice) => voice.id.includes("daniela"));
+      if (daniela) return `${PIPER_PREFIX}${daniela.id}`;
+      const firstPiper = piper[0];
+      if (firstPiper) return `${PIPER_PREFIX}${firstPiper.id}`;
+      const list = sortVoices(system);
+      const preferred =
+        list.find((v) => v.localService && v.lang.startsWith(navigator.language)) ??
+        list.find((v) => v.lang.startsWith(navigator.language)) ??
+        list.find((v) => v.localService) ??
+        list[0];
+      return preferred?.voiceURI ?? "";
+    },
+    [],
+  );
+
+  // System voice list loads asynchronously in most engines.
   useEffect(() => {
     if (!supported) return;
     const synth = window.speechSynthesis;
     const load = () => {
       const list = sortVoices(synth.getVoices());
-      setVoices(list);
+      setSystemVoices(list);
       setVoiceURIState((current) => {
-        if (current && list.some((v) => v.voiceURI === current)) return current;
-        const preferred =
-          list.find((v) => v.localService && v.lang.startsWith(navigator.language)) ??
-          list.find((v) => v.lang.startsWith(navigator.language)) ??
-          list.find((v) => v.localService) ??
-          list[0];
-        return preferred?.voiceURI ?? "";
+        if (current && !autoPicked.current) return current;
+        if (current && isPiperVoice(current)) return current;
+        const next = defaultVoiceURI(list, []);
+        if (next) autoPicked.current = true;
+        return next || current;
       });
     };
     load();
     synth.addEventListener("voiceschanged", load);
     return () => synth.removeEventListener("voiceschanged", load);
-  }, [supported]);
+  }, [supported, defaultVoiceURI]);
+
+  // On-device voices come from the Rust engine; arriving last, they get the
+  // final say over any automatic default (Daniela wins when installed).
+  useEffect(() => {
+    let cancelled = false;
+    ttsVoices()
+      .then((voices) => {
+        if (cancelled) return;
+        setPiperVoices(voices);
+        setVoiceURIState((current) => {
+          if (current && !autoPicked.current) return current;
+          const next = defaultVoiceURI(systemVoices, voices);
+          if (next) autoPicked.current = true;
+          return next || current;
+        });
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [docId, defaultVoiceURI]);
+
+  const setVoiceURI = useCallback((uri: string) => {
+    autoPicked.current = false;
+    setVoiceURIState(uri);
+  }, []);
 
   const stop = useCallback(() => {
-    if (!supported) return;
     stoppedRef.current = true;
-    window.speechSynthesis.cancel();
+    if (isPiperVoice(voiceURIRef.current) || speakingPageRef.current !== null) {
+      void ttsStop().catch(() => {});
+    }
+    if (supported) window.speechSynthesis.cancel();
     speakingPageRef.current = null;
     lastBoundaryRef.current = 0;
     setSpeaking(false);
@@ -123,21 +208,35 @@ export function useNarration({
 
   const speakPage = useCallback(
     (target: number) => {
-      if (!supported) return;
       stoppedRef.current = false;
-      window.speechSynthesis.cancel();
-      speakingPageRef.current = target;
+      lastBoundaryRef.current = 0;
       setNarratingPage(target);
       setSpeaking(true);
       setPaused(false);
-      lastBoundaryRef.current = 0;
       setSpokenRange(null);
 
+      if (isPiperVoice(voiceURIRef.current)) {
+        speakingPageRef.current = target;
+        void getText(target)
+          .then((text) =>
+            ttsSpeak({
+              text,
+              page: target,
+              voiceId: voiceURIRef.current.slice(PIPER_PREFIX.length),
+              rate: rateRef.current,
+            }),
+          )
+          .catch(() => stop());
+        return;
+      }
+
+      if (!supported) return;
+      speakingPageRef.current = target;
+      window.speechSynthesis.cancel();
       void getText(target)
         .then((text) => {
           if (stoppedRef.current || speakingPageRef.current !== target) return;
           if (!text.trim()) {
-            // Blank page: skip straight to the next one.
             if (continuousRef.current && target + 1 < pageCount) {
               onAdvancePage(target + 1);
               speakPage(target + 1);
@@ -179,8 +278,44 @@ export function useNarration({
         })
         .catch(() => stop());
     },
-    [supported, getText, pageCount, onAdvancePage, stop],
+    [getText, pageCount, onAdvancePage, stop, supported],
   );
+
+  // On-device engine events: progress → highlight, pageDone → advance.
+  useEffect(() => {
+    const unlisten = listen<{
+      kind: "progress" | "pageDone" | "error";
+      page?: number;
+      start?: number;
+      end?: number;
+      reason?: string;
+    }>("tts-event", (event) => {
+      const payload = event.payload;
+      if (payload.kind === "progress" && payload.page != null) {
+        setSpokenRange({ page: payload.page, start: payload.start ?? 0, end: payload.end ?? 0 });
+      } else if (payload.kind === "error") {
+        stop();
+      } else if (payload.kind === "pageDone") {
+        const done = payload.page ?? narratingPageRef.current;
+        if (done == null) return;
+        if (continuousRef.current && done + 1 < pageCount) {
+          onAdvancePage(done + 1);
+          speakPage(done + 1);
+        } else {
+          stop();
+        }
+      }
+    });
+    return () => {
+      void unlisten.then((fn) => fn());
+    };
+  }, [speakPage, stop, onAdvancePage, pageCount]);
+
+  // Keep a ref of the narrating page for late pageDone events.
+  const narratingPageRef = useRef<number | null>(null);
+  useEffect(() => {
+    narratingPageRef.current = narratingPage;
+  }, [narratingPage]);
 
   // Changing documents stops narration.
   useEffect(() => {
@@ -196,26 +331,34 @@ export function useNarration({
   );
 
   const pause = useCallback(() => {
-    if (!supported || !speaking) return;
-    window.speechSynthesis.pause();
+    if (!speaking) return;
+    if (isPiperVoice(voiceURIRef.current)) {
+      void ttsPause().catch(() => {});
+    } else if (supported) {
+      window.speechSynthesis.pause();
+    }
     setPaused(true);
-  }, [supported, speaking]);
+  }, [speaking, supported]);
 
   const resume = useCallback(() => {
-    if (!supported || !speaking) return;
-    window.speechSynthesis.resume();
+    if (!speaking) return;
+    if (isPiperVoice(voiceURIRef.current)) {
+      void ttsResume().catch(() => {});
+    } else if (supported) {
+      window.speechSynthesis.resume();
+    }
     setPaused(false);
-  }, [supported, speaking]);
+  }, [speaking, supported]);
 
   return {
-    supported,
-    voices,
+    supported: supported || piperVoices.length > 0,
+    options,
     speaking,
     paused,
     page: narratingPage,
     spokenRange,
     voiceURI,
-    setVoiceURI: setVoiceURIState,
+    setVoiceURI,
     rate,
     setRate: setRateState,
     continuous,
@@ -225,4 +368,8 @@ export function useNarration({
     resume,
     stop,
   };
+}
+
+export function speechSupported(): boolean {
+  return typeof window !== "undefined" && "speechSynthesis" in window;
 }
