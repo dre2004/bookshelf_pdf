@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ask, open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import Toolbar from "./Toolbar";
 import Reader from "./Reader";
 import Library from "./Library";
@@ -357,6 +358,13 @@ export default function App() {
   useEffect(() => {
     openPathRef.current = openPath;
   }, [openPath]);
+
+  // Window title carries the open book's name; the toolbar stays lean.
+  useEffect(() => {
+    const title =
+      current && view === "reader" ? `Bookshelf PDF - ${current.title}` : "Bookshelf PDF";
+    void getCurrentWindow().setTitle(title).catch(() => {});
+  }, [current, view]);
 
   const goLibrary = useCallback(() => {
     flushProgress();
@@ -738,7 +746,6 @@ export default function App() {
     <div className="app">
       {view === "reader" ? (
         <Toolbar
-          fileName={current?.title ?? null}
           pageCount={current?.doc.pageCount ?? 0}
           page={page}
           onPageChange={changePage}

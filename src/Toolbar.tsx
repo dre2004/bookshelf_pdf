@@ -3,7 +3,6 @@ import type { ReadMode, Theme, ZoomMode } from "./types";
 import { stepZoom, zoomLabel } from "./zoom";
 
 interface Props {
-  fileName: string | null;
   pageCount: number;
   page: number;
   onPageChange: (page: number) => void;
@@ -31,7 +30,6 @@ interface Props {
 }
 
 export default function Toolbar({
-  fileName,
   pageCount,
   page,
   onPageChange,
@@ -89,7 +87,6 @@ export default function Toolbar({
         <button className="btn" onClick={onOpen} title="Open a PDF (Ctrl+O)">
           Open
         </button>
-        {fileName && <span className="file-name" title={fileName}>{fileName}</span>}
       </div>
 
       <div className="toolbar-group">

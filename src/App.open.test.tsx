@@ -73,6 +73,12 @@ vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn().mockResolvedValue(() => {}),
 }));
 
+vi.mock("@tauri-apps/api/window", () => ({
+  getCurrentWindow: vi.fn(() => ({
+    setTitle: vi.fn().mockResolvedValue(undefined),
+  })),
+}));
+
 beforeAll(() => {
   // jsdom lacks the browser APIs Reader relies on.
   class FakeObserver {
