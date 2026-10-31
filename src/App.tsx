@@ -6,6 +6,8 @@ import Reader from "./Reader";
 import Library from "./Library";
 import Sidebar, { type SidebarTab } from "./Sidebar";
 import SearchBar from "./SearchBar";
+import NarrationPanel from "./NarrationPanel";
+import { useNarration } from "./narration";
 import {
   bookProgressSave,
   bookRegister,
@@ -13,6 +15,7 @@ import {
   bookmarksAdd,
   bookmarksList,
   bookmarksRemove,
+  cachedPageText,
   closeDocument,
   getPageDims,
   getOutline,
@@ -104,6 +107,11 @@ export default function App() {
     searching: boolean;
   }>({ open: false, query: "", results: [], active: 0, searching: false });
 
+  const [narrationOpen, setNarrationOpen] = useState(false);
+  const [narrationVoice, setNarrationVoice] = useState("");
+  const [narrationRate, setNarrationRate] = useState(1);
+  const [narrationContinuous, setNarrationContinuous] = useState(true);
+
   const [error, setError] = useState<string | null>(null);
   const [passwordFor, setPasswordFor] = useState<{ path: string; incorrect: boolean } | null>(null);
   const [password, setPassword] = useState("");
@@ -131,6 +139,24 @@ export default function App() {
         setTheme(hydrated.theme);
         setZoom(hydrated.zoom);
         setSpread(hydrated.spread);
+        try {
+          const voice = JSON.parse(stored.narrationVoice ?? '""');
+          if (typeof voice === "string") setNarrationVoice(voice);
+        } catch {
+          /* keep default voice */
+        }
+        try {
+          const rate = JSON.parse(stored.narrationRate ?? "1");
+          if (typeof rate === "number" && rate >= 0.5 && rate <= 2) setNarrationRate(rate);
+        } catch {
+          /* keep default rate */
+        }
+        try {
+          const continuous = JSON.parse(stored.narrationContinuous ?? "true");
+          if (typeof continuous === "boolean") setNarrationContinuous(continuous);
+        } catch {
+          /* keep default */
+        }
         settingsReady.current = true;
       } catch {
         settingsReady.current = true;
@@ -376,6 +402,39 @@ export default function App() {
     },
     [scheduleSave],
   );
+
+  // ---- narration (read aloud) ----
+  const narration = useNarration({
+    docId: current?.doc.docId ?? -1,
+    page,
+    pageCount: current?.doc.pageCount ?? 0,
+    getText: (target) => {
+      const book = currentRef.current;
+      if (!book) return Promise.reject(new Error("no book open"));
+      return cachedPageText(book.doc.docId, target).then((t) => t.chars);
+    },
+    onAdvancePage: changePage,
+  });
+
+  // Hydrate narration settings once persisted settings are loaded.
+  useEffect(() => {
+    if (!ready) return;
+    if (narrationVoice) narration.setVoiceURI(narrationVoice);
+    narration.setRate(narrationRate);
+    narration.setContinuous(narrationContinuous);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ready]);
+
+  // Persist narration choices as they change.
+  useEffect(() => {
+    if (narration.voiceURI) persist("narrationVoice", narration.voiceURI);
+  }, [narration.voiceURI, persist]);
+  useEffect(() => {
+    persist("narrationRate", narration.rate);
+  }, [narration.rate, persist]);
+  useEffect(() => {
+    persist("narrationContinuous", narration.continuous);
+  }, [narration.continuous, persist]);
 
   /** Jump to a page (and fractional position) from sidebar/search actions.
    *  Jumps are recorded so Back can return to where you were reading. */
@@ -695,6 +754,8 @@ export default function App() {
           sidebarOpen={sidebarTab !== null}
           onToggleSidebar={() => setSidebarTab((t) => (t === null ? "outline" : null))}
           onSearch={() => setSearch((s) => ({ ...s, open: true }))}
+          onNarration={() => setNarrationOpen((open) => !open)}
+          narrationActive={narration.speaking}
           onAddBookmark={() => void addBookmarkNow()}
           onBack={goBack}
           onForward={goForward}
@@ -754,6 +815,13 @@ export default function App() {
                 searching={search.searching}
               />
             )}
+            {narrationOpen && (
+              <NarrationPanel
+                narration={narration}
+                currentPage={page}
+                onClose={() => setNarrationOpen(false)}
+              />
+            )}
             <Reader
               doc={current.doc}
               dims={dims}
@@ -768,6 +836,7 @@ export default function App() {
               highlights={highlights}
               searchHits={search.open ? search.results : []}
               activeHitKey={activeHit}
+              spokenRange={narration.spokenRange}
               onAddHighlight={(p, s2, e2, text, color) => void addHighlight(p, s2, e2, text, color)}
             />
           </div>

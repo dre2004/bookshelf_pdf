@@ -8,6 +8,7 @@ import {
   type ReactNode,
 } from "react";
 import { cachedPageText, pageImageUrl } from "./api";
+import type { SpokenRange } from "./narration";
 import { rangeBoxes, type OverlayBox } from "./textOverlay";
 import { HIGHLIGHT_COLORS, type HighlightColor, type PageTextData } from "./types";
 import type { DocumentInfo, Highlight, PageInfo, ReadMode, SearchMatch, Theme, ZoomMode } from "./types";
@@ -117,6 +118,8 @@ interface PageImageProps {
   highlights: Highlight[];
   searchHits: SearchMatch[];
   activeHitKey: string | null;
+  /** Character range currently being spoken on this page, if any. */
+  spokenRange: { start: number; end: number } | null;
   onAddHighlight: (
     page: number,
     start: number,
@@ -134,6 +137,7 @@ function PageImage({
   highlights,
   searchHits,
   activeHitKey,
+  spokenRange,
   onAddHighlight,
 }: PageImageProps) {
   // Load status is keyed by URL (see the note at the <img> below).
@@ -185,6 +189,11 @@ function PageImage({
     }
     return { all, active };
   }, [text, searchHits, activeHitKey, cssWidth, cssHeight]);
+
+  const spokenBoxes = useMemo(() => {
+    if (!text || !spokenRange) return [] as OverlayBox[];
+    return rangeBoxes(text, spokenRange.start, spokenRange.end, cssWidth, cssHeight);
+  }, [text, spokenRange, cssWidth, cssHeight]);
 
   const handleTextMouseUp = (e: React.MouseEvent) => {
     const selection = window.getSelection();
@@ -253,6 +262,7 @@ function PageImage({
       })}
       <OverlayBoxes boxes={searchBoxes.all} className="search-hit" />
       <OverlayBoxes boxes={searchBoxes.active} className="search-hit active" />
+      <OverlayBoxes boxes={spokenBoxes} className="narration-hit" />
 
       {text && (
         <div className="text-layer" onMouseUp={handleTextMouseUp}>
@@ -347,6 +357,8 @@ export interface ReaderProps {
   highlights: Highlight[];
   searchHits: SearchMatch[];
   activeHitKey: string | null;
+  /** Character range being spoken, with its page (for the highlight). */
+  spokenRange: SpokenRange | null;
   onAddHighlight: (
     page: number,
     start: number,
@@ -370,6 +382,7 @@ export default function Reader({
   highlights,
   searchHits,
   activeHitKey,
+  spokenRange,
   onAddHighlight,
 }: ReaderProps) {
   const [containerRef, viewport] = useElementSize<HTMLDivElement>();
@@ -515,6 +528,9 @@ export default function Reader({
     highlights: highlightsByPage.get(index) ?? [],
     searchHits: hitsByPage.get(index) ?? [],
     activeHitKey,
+    spokenRange: spokenRange?.page === index
+      ? { start: spokenRange.start, end: spokenRange.end }
+      : null,
     onAddHighlight,
   });
 

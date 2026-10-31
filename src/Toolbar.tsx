@@ -19,6 +19,8 @@ interface Props {
   sidebarOpen: boolean;
   onToggleSidebar: () => void;
   onSearch: () => void;
+  onNarration: () => void;
+  narrationActive: boolean;
   onAddBookmark: () => void;
   onBack: () => void;
   onForward: () => void;
@@ -45,6 +47,8 @@ export default function Toolbar({
   sidebarOpen,
   onToggleSidebar,
   onSearch,
+  onNarration,
+  narrationActive,
   onAddBookmark,
   onBack,
   onForward,
@@ -91,6 +95,14 @@ export default function Toolbar({
       <div className="toolbar-group">
         <button className="btn" disabled={disabled} onClick={onSearch} title="Search in document (Ctrl+F)">
           Search
+        </button>
+        <button
+          className={`btn ${narrationActive ? "active" : ""}`}
+          disabled={disabled}
+          onClick={onNarration}
+          title="Narration — read the book aloud"
+        >
+          🔊 Narrate
         </button>
         <button className="btn" disabled={disabled} onClick={onAddBookmark} title="Bookmark this position (Ctrl+B)">
           ⚑ Bookmark
