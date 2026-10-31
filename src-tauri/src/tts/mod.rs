@@ -160,6 +160,67 @@ const HEADING_LINE_MAX_CHARS: usize = 60;
 /// Cap on heading pieces within one chunk — the pause-storm guard.
 const MAX_HEADING_PIECES_PER_CHUNK: usize = 2;
 
+/// The beat played after an em/en dash that sets off a parenthetical
+/// ("end to end — an hour — because..."). Shorter than the 0.4s sentence
+/// gap: a dash is a breath inside a sentence, not a boundary.
+const DASH_PAUSE_MS: u32 = 300;
+
+/// Minimum non-whitespace text on each side of a dash for it to earn a
+/// beat; dashes glued between short fragments stay inline.
+const DASH_SPLIT_MIN_CHARS: usize = 6;
+
+/// Splits a body piece at parenthetical em/en dashes, each becoming a
+/// shorter beat (DASH_PAUSE_MS) on the piece before it. Numeric ranges
+/// ("3–7") and hyphenated compounds (U+002D) never split. The final
+/// sub-piece keeps the pause the body carried (sentence/paragraph).
+fn split_at_dashes(
+    chars: &[char],
+    range: (usize, usize),
+    final_pause: u32,
+) -> Vec<((usize, usize), u32, String)> {
+    let (start, end) = range;
+    let mut cuts: Vec<usize> = Vec::new();
+    let mut last_cut = start;
+    for i in start..end {
+        let c = chars[i];
+        if c != '\u{2014}' && c != '\u{2013}' {
+            continue;
+        }
+        let prev_digit = i > 0 && chars[i - 1].is_ascii_digit();
+        let next_digit = chars.get(i + 1).is_some_and(|c| c.is_ascii_digit());
+        if prev_digit && next_digit {
+            continue;
+        }
+        let before = chars[last_cut..i]
+            .iter()
+            .filter(|c| !c.is_whitespace())
+            .count();
+        let after = chars[i + 1..end]
+            .iter()
+            .filter(|c| !c.is_whitespace())
+            .count();
+        if before >= DASH_SPLIT_MIN_CHARS && after >= DASH_SPLIT_MIN_CHARS {
+            cuts.push(i);
+            last_cut = i;
+        }
+    }
+    if cuts.is_empty() {
+        let text: String = chars[start..end].iter().collect();
+        return vec![(range, final_pause, text)];
+    }
+    let mut pieces = Vec::with_capacity(cuts.len() + 1);
+    let mut piece_start = start;
+    for cut in cuts.iter().copied().chain(std::iter::once(end)) {
+        let text: String = chars[piece_start..cut].iter().collect();
+        pieces.push(((piece_start, cut), DASH_PAUSE_MS, text));
+        piece_start = cut + 1;
+    }
+    if let Some(last) = pieces.last_mut() {
+        last.1 = final_pause;
+    }
+    pieces
+}
+
 pub(crate) fn split_heading_lead(
     chars: &[char],
     range: (usize, usize),
@@ -379,8 +440,11 @@ fn heading_aware_pieces(
         let trimmed = line.trim();
         if !trimmed.is_empty() && is_heading_line(trimmed, outline_titles) {
             if chars[body_start..cursor].iter().any(|c| !c.is_whitespace()) {
-                let body: String = chars[body_start..cursor].iter().collect();
-                pieces.push(((body_start, cursor), PARAGRAPH_PAUSE_MS, body));
+                pieces.extend(split_at_dashes(
+                    chars,
+                    (body_start, cursor),
+                    PARAGRAPH_PAUSE_MS,
+                ));
             }
             pieces.push(((cursor, next_start), HEADING_PAUSE_MS, trimmed.to_string()));
             heading_count += 1;
@@ -391,8 +455,7 @@ fn heading_aware_pieces(
 
     let mut all = lead_pieces;
     all.append(&mut pieces);
-    let body: String = chars[body_start..end].iter().collect();
-    all.push(((body_start, end), final_pause, body));
+    all.extend(split_at_dashes(chars, (body_start, end), final_pause));
     all
 }
 
@@ -1090,43 +1153,98 @@ mod heading_lead_tests {
         let pieces = pieces(text, &outline);
         assert_eq!(
             pieces.len(),
-            3,
-            "expected kicker + title + body: {pieces:?}"
+            5,
+            "expected kicker + title + dash-split body: {pieces:?}"
         );
         let pauses: Vec<u32> = pieces.iter().map(|(_, p, _)| *p).collect();
         assert_eq!(
             pauses,
-            vec![HEADING_KICKER_PAUSE_MS, HEADING_PAUSE_MS, SENTENCE_PAUSE_MS]
+            vec![
+                HEADING_KICKER_PAUSE_MS,
+                HEADING_PAUSE_MS,
+                DASH_PAUSE_MS,
+                DASH_PAUSE_MS,
+                SENTENCE_PAUSE_MS
+            ]
         );
         assert_eq!(pieces[0].2.trim(), "Chapter 0");
         assert!(pieces[1].2.contains("New Here"));
-        assert!(pieces[2].2.trim_start().starts_with("This book begins"));
+        assert!(pieces[2].2.trim_end().ends_with("lean on facts"));
+        assert!(pieces[4].2.trim_start().starts_with("that deserve"));
+    }
+
+    #[test]
+    fn parenthetical_dashes_get_a_beat() {
+        // The sentence that prompted the feature.
+        let text = "Read Part 0 once, end to end \u{2014} an hour \u{2014} because it concentrates exactly the material that trips the experienced. ";
+        let pieces = pieces(text, &[]);
+        assert_eq!(pieces.len(), 3, "{pieces:?}");
+        let pauses: Vec<u32> = pieces.iter().map(|(_, p, _)| *p).collect();
+        assert_eq!(
+            pauses,
+            vec![DASH_PAUSE_MS, DASH_PAUSE_MS, SENTENCE_PAUSE_MS]
+        );
+        assert!(pieces[0].2.trim_end().ends_with("end to end"));
+        assert_eq!(pieces[1].2.trim(), "an hour");
+        assert!(pieces[2].2.trim_start().starts_with("because it"));
+    }
+
+    #[test]
+    fn numeric_ranges_and_hyphens_do_not_split() {
+        // En dash between digits is a range; a hyphen-minus is a compound.
+        let text = "See pages 3\u{2013}7 for the tables. The read-only buffer held up fine. ";
+        let pieces = pieces(text, &[]);
+        assert_eq!(pieces.len(), 1, "{pieces:?}");
+    }
+
+    #[test]
+    fn short_dash_fragments_stay_inline() {
+        // Trailing fragment too short to stand alone: no cut at all.
+        let text = "It was over \u{2014} soon. ";
+        assert_eq!(pieces(text, &[]).len(), 1);
+        // Middle fragment too short: only the first dash earns a beat.
+        let text = "Everything \u{2014} or so \u{2014} continued as before. ";
+        let pieces = pieces(text, &[]);
+        assert_eq!(pieces.len(), 2, "{pieces:?}");
     }
 
     #[test]
     fn numbered_heading_line_mid_chunk_splits() {
         let text = "It assumes nothing, it moves slowly by this book\u{2019}s standards, and it exists so that\r\nevery reader \u{2014} newcomer or arriving polyglot \u{2014} starts Chapter 1 on the same ground.\r\n0.1 How to read this book\r\nTwo tracks lead through this book; take the one that fits.\r\nNew to C, or new to programming. ";
         let pieces = pieces(text, &[]);
+        // The first body's parenthetical dashes each earn a beat before the
+        // heading line splits off with its full pause.
         assert_eq!(
             pieces.len(),
-            3,
-            "expected body + heading + body: {pieces:?}"
+            5,
+            "expected dash-split body + heading + body: {pieces:?}"
         );
         let pauses: Vec<u32> = pieces.iter().map(|(_, p, _)| *p).collect();
         assert_eq!(
             pauses,
-            vec![PARAGRAPH_PAUSE_MS, HEADING_PAUSE_MS, SENTENCE_PAUSE_MS]
+            vec![
+                DASH_PAUSE_MS,
+                DASH_PAUSE_MS,
+                PARAGRAPH_PAUSE_MS,
+                HEADING_PAUSE_MS,
+                SENTENCE_PAUSE_MS
+            ]
         );
-        assert_eq!(pieces[1].2, "0.1 How to read this book");
-        assert!(pieces[2].2.trim_start().starts_with("Two tracks"));
+        assert_eq!(pieces[3].2, "0.1 How to read this book");
+        assert!(pieces[4].2.trim_start().starts_with("Two tracks"));
     }
 
     #[test]
     fn wrapped_body_lines_never_become_headings() {
         let text = "Read linearly. Finish Part 0, then start Chapter 1\r\nand type in every program it shows \u{2014} the typing is not a ritual, it is the course. The chapters\r\nascend in power, each concept appears before it is used, and every chapter ends with exercises\r\nthat are the other half of its teaching. ";
         let pieces = pieces(text, &[]);
-        assert_eq!(pieces.len(), 1, "body split: {pieces:?}");
-        assert_eq!(pieces[0].1, SENTENCE_PAUSE_MS);
+        // The em dash splits the body with a beat; no heading pauses appear.
+        assert_eq!(pieces.len(), 2, "body split: {pieces:?}");
+        assert_eq!(
+            pieces[0].1, DASH_PAUSE_MS,
+            "first piece should be a dash beat, not a heading: {pieces:?}"
+        );
+        assert_eq!(pieces[1].1, SENTENCE_PAUSE_MS);
     }
 
     #[test]
@@ -1245,23 +1363,58 @@ mod book_trace_tests {
             }
         }
 
-        // Acceptance: the traced page must read its headings with pauses.
-        let first = heading_aware_pieces(&chars, chunks[0], &titles, &breaks);
+        // Acceptance checks are data-driven so the trace can be pointed at
+        // any page of any book: the kicker/title assertions only apply on
+        // pages that actually open with a chapter block.
+        let first_line: String = chars[..chars
+            .iter()
+            .position(|c| *c == '\r' || *c == '\n')
+            .unwrap_or(chars.len())]
+            .iter()
+            .collect();
+        if is_chapter_kicker(first_line.trim_end()) {
+            let first = heading_aware_pieces(&chars, chunks[0], &titles, &breaks);
+            assert!(
+                first.len() >= 3 && first[0].1 == HEADING_KICKER_PAUSE_MS,
+                "chapter kicker not split off: {first:?}"
+            );
+            assert!(
+                first[1].1 == HEADING_PAUSE_MS,
+                "chapter title not split off: {first:?}"
+            );
+        }
+        if text.contains("How to read") {
+            assert!(
+                chunks.iter().any(|&(s, e)| {
+                    heading_aware_pieces(&chars, (s, e), &titles, &breaks)
+                        .iter()
+                        .any(|(_, pause, text)| {
+                            *pause == HEADING_PAUSE_MS && text.contains("How to read")
+                        })
+                }),
+                "0.1 heading line not split off"
+            );
+        }
+        // Parenthetical dashes on the page each earn a beat (the book's
+        // text changes between builds, so this is data-driven, not pinned
+        // to a specific chunk).
+        let dash_candidates = chars
+            .iter()
+            .filter(|c| **c == '\u{2014}' || **c == '\u{2013}')
+            .count() as u32;
+        let beats: u32 = chunks
+            .iter()
+            .map(|&(s, e)| {
+                heading_aware_pieces(&chars, (s, e), &titles, &breaks)
+                    .iter()
+                    .filter(|(_, p, _)| *p == DASH_PAUSE_MS)
+                    .count() as u32
+            })
+            .sum();
+        println!("dash candidates on page: {dash_candidates}, beats scheduled: {beats}");
         assert!(
-            first.len() >= 3
-                && first[0].1 == HEADING_KICKER_PAUSE_MS
-                && first[0].2.trim().starts_with("Chapter 0"),
-            "chapter kicker not split off: {first:?}"
-        );
-        assert!(
-            first[1].1 == HEADING_PAUSE_MS && first[1].2.contains("New Here"),
-            "chapter title not split off: {first:?}"
-        );
-        assert!(
-            heading_aware_pieces(&chars, chunks[1], &titles, &breaks)
-                .iter()
-                .any(|(_, pause, text)| *pause == HEADING_PAUSE_MS && text.contains("How to read")),
-            "0.1 heading line not split off in chunk 1"
+            beats >= dash_candidates / 2,
+            "expected dash beats for roughly every parenthetical dash (candidates {dash_candidates}, beats {beats})"
         );
     }
 }
