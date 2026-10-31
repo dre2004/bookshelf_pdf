@@ -78,7 +78,8 @@ resource automatically.
 
 Push a version tag (`v0.1.0`, `v0.2.0`, …) and GitHub Actions builds every
 platform and attaches the installers to a **draft** GitHub Release — review it
-and publish:
+and publish. macOS builds are universal (one DMG for Intel and Apple Silicon,
+unsigned).
 
 ```bash
 git tag v0.1.0

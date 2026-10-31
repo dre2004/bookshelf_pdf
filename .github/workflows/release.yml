@@ -3,7 +3,7 @@ name: Release
 # Tag-driven release builds. Push a version tag (e.g. v0.1.0) and each
 # platform builds installers attached to a draft GitHub Release:
 #   Windows: MSI + NSIS (x64)
-#   macOS:   DMG (arm64 + x64, unsigned)
+#   macOS:   universal DMG (Intel + Apple Silicon, unsigned)
 #   Linux:   deb, rpm and AppImage (x64, built on 22.04 for glibc compat)
 on:
   push:
@@ -17,11 +17,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        platform:
-          - ubuntu-22.04
-          - windows-latest
-          - macos-latest
-          - macos-13
+        include:
+          - platform: ubuntu-22.04
+            pdfium-target: linux-x64
+          - platform: windows-latest
+            pdfium-target: win32-x64
+          - platform: macos-latest
+            pdfium-target: darwin-universal
+            rust-targets: x86_64-apple-darwin,aarch64-apple-darwin
+            tauri-args: --target universal-apple-darwin
 
     runs-on: ${{ matrix.platform }}
     steps:
@@ -36,6 +40,8 @@ jobs:
         run: npm ci
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-targets }}
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -53,7 +59,7 @@ jobs:
             patchelf
 
       - name: Fetch PDFium for this platform
-        run: node scripts/fetch-pdfium.mjs
+        run: node scripts/fetch-pdfium.mjs ${{ matrix.pdfium-target }}
 
       - name: Build and upload to draft release
         uses: tauri-apps/tauri-action@v0
@@ -66,8 +72,9 @@ jobs:
             Download the asset for your platform from the list below.
 
             - **Windows**: `.msi` or `.exe` (NSIS) installer
-            - **macOS**: `.aarch64.dmg` (Apple Silicon) or `.x64.dmg` (Intel) —
+            - **macOS**: universal `.dmg` (Intel and Apple Silicon) —
               unsigned, so right-click → Open on first launch
             - **Linux**: `.deb`, `.rpm` or `.AppImage`
           releaseDraft: true
           prerelease: false
+          args: ${{ matrix.tauri-args }}
