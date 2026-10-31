@@ -1225,3 +1225,15 @@ body,
 .toolbar-spacer {
   flex: 1;
 }
+
+.speed-stepper {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.speed-value {
+  min-width: 48px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}

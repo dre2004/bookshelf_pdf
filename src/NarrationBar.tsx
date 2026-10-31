@@ -1,5 +1,11 @@
 import type { NarrationController } from "./narration";
 
+/** ±15% per step, clamped to 0.50-2.00x, rounded to 2dp. */
+export function stepped(rate: number, direction: 1 | -1): number {
+  const next = direction === 1 ? rate * 1.15 : rate / 1.15;
+  return Math.min(2, Math.max(0.5, Math.round(next * 100) / 100));
+}
+
 interface Props {
   narration: NarrationController;
   currentPage: number;
@@ -40,16 +46,23 @@ export default function NarrationBar({
       <span className="muted">
         page {(narration.page ?? currentPage) + 1} / {pageCount} · ~{minutesLeft} min left
       </span>
-      <input
-        className="narration-speed"
-        type="range"
-        min={0.5}
-        max={2}
-        step={0.05}
-        value={narration.rate}
-        onChange={(e) => narration.setRate(Number(e.target.value))}
-        title="Narration speed"
-      />
+      <div className="speed-stepper">
+        <button
+          className="btn icon"
+          onClick={() => narration.setRate(stepped(narration.rate, -1))}
+          title="Slower (-15%)"
+        >
+          −
+        </button>
+        <span className="speed-value">{narration.rate.toFixed(2)}×</span>
+        <button
+          className="btn icon"
+          onClick={() => narration.setRate(stepped(narration.rate, 1))}
+          title="Faster (+15%)"
+        >
+          +
+        </button>
+      </div>
       <span className="muted">{narration.rate.toFixed(2)}×</span>
       <button
         className="btn icon"

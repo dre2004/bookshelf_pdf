@@ -7,7 +7,6 @@ import Reader from "./Reader";
 import Library from "./Library";
 import Sidebar, { type SidebarTab } from "./Sidebar";
 import SearchBar from "./SearchBar";
-import NarrationPanel from "./NarrationPanel";
 import SettingsScreen from "./SettingsScreen";
 import NarrationBar from "./NarrationBar";
 import { useNarration } from "./narration";
@@ -110,7 +109,6 @@ export default function App() {
     searching: boolean;
   }>({ open: false, query: "", results: [], active: 0, searching: false });
 
-  const [narrationOpen, setNarrationOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [narrationVoice, setNarrationVoice] = useState("");
   const [narrationRate, setNarrationRate] = useState(1);
@@ -754,7 +752,7 @@ export default function App() {
           sidebarOpen={sidebarTab !== null}
           onToggleSidebar={() => setSidebarTab((t) => (t === null ? "outline" : null))}
           onSearch={() => setSearch((s) => ({ ...s, open: true }))}
-          onNarration={() => setNarrationOpen((open) => !open)}
+          onNarration={() => narration.play(page)}
           narrationActive={narration.speaking}
           onAddBookmark={() => void addBookmarkNow()}
           onBack={goBack}
@@ -811,13 +809,6 @@ export default function App() {
                 onPrev={() => stepSearch(-1)}
                 onClose={() => setSearch((s) => ({ ...s, open: false }))}
                 searching={search.searching}
-              />
-            )}
-            {narrationOpen && (
-              <NarrationPanel
-                narration={narration}
-                currentPage={page}
-                onClose={() => setNarrationOpen(false)}
               />
             )}
             <Reader

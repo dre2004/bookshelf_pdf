@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { ttsPackInstalled, ttsPreviewVoice, ttsVoices } from "./api";
 import type { ReadMode, Theme } from "./types";
+import { stepped } from "./NarrationBar";
 import type { NarrationController } from "./narration";
 
 interface Props {
@@ -116,15 +117,24 @@ export default function SettingsScreen({
         <section className="settings-section">
           <h3>Narration</h3>
           <div className="settings-row">
-            <span>Speed ({narration.rate.toFixed(2)}×)</span>
-            <input
-              type="range"
-              min={0.5}
-              max={2}
-              step={0.05}
-              value={narration.rate}
-              onChange={(e) => narration.setRate(Number(e.target.value))}
-            />
+            <span>Speed</span>
+            <div className="speed-stepper">
+              <button
+                className="btn icon"
+                onClick={() => narration.setRate(stepped(narration.rate, -1))}
+                title="Slower (-15%)"
+              >
+                −
+              </button>
+              <span className="speed-value">{narration.rate.toFixed(2)}×</span>
+              <button
+                className="btn icon"
+                onClick={() => narration.setRate(stepped(narration.rate, 1))}
+                title="Faster (+15%)"
+              >
+                +
+              </button>
+            </div>
           </div>
 
           {!packInstalled && (

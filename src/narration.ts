@@ -123,6 +123,8 @@ export function useNarration({
   const continuousRef = useRef(continuous);
   const stoppedRef = useRef(false);
   const lastBoundaryRef = useRef(0);
+  // Current chunk while narrating, so speed changes can resume in place.
+  const currentChunkRef = useRef<{ page: number; start: number; end: number } | null>(null);
   const speakingPageRef = useRef<number | null>(null);
 
   useEffect(() => {
@@ -424,6 +426,11 @@ export function useNarration({
     }>("tts-event", (event) => {
       const payload = event.payload;
       if (payload.kind === "progress" && payload.page != null) {
+        currentChunkRef.current = {
+          page: payload.page,
+          start: payload.start ?? 0,
+          end: payload.end ?? 0,
+        };
         setSpokenRange({ page: payload.page, start: payload.start ?? 0, end: payload.end ?? 0 });
       } else if (payload.kind === "error") {
         stop();
@@ -482,6 +489,31 @@ export function useNarration({
     setPaused(false);
   }, [speaking, supported]);
 
+  const setRate = useCallback(
+    (nextRate: number) => {
+      setRateState(nextRate);
+      rateRef.current = nextRate;
+      // Apply immediately when narrating: re-speak the current selection
+      // at the new speed. The chunk restart keeps position and highlight.
+      const chunk = currentChunkRef.current;
+      if (chunk && speakingPageRef.current !== null && !stoppedRef.current) {
+        const target = chunk.page;
+        void getText(target)
+          .then((text) =>
+            ttsSpeak({
+              text,
+              page: target,
+              voiceId: voiceURIRef.current,
+              rate: nextRate,
+              docId,
+            }),
+          )
+          .catch(() => stop());
+      }
+    },
+    [docId, getText, stop],
+  );
+
   return {
     supported: supported || piperVoices.length > 0,
     options,
@@ -492,7 +524,7 @@ export function useNarration({
     voiceURI,
     setVoiceURI,
     rate,
-    setRate: setRateState,
+    setRate,
     continuous,
     setContinuous: setContinuousState,
     play,
