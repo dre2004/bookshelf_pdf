@@ -127,9 +127,36 @@ impl PlaybackClock {
     }
 }
 
-/// Silence appended after a chunk (in samples) so narration breathes:
-/// a longer pause after heading-like chunks, a shorter one at paragraph
-/// breaks. Returns zero elsewhere — sentence pauses come from prosody.
+/// Playback pieces for one chunk: normally the chunk itself. When the
+/// chunk begins with heading-like text (outline title, section numbering,
+/// colon-ended or Title-Case lead) it splits into exactly two pieces —
+/// the heading, then the body — with the heading flagged for the long
+/// pause. Nothing else is ever split.
+fn heading_aware_pieces(
+    chars: &[char],
+    chunk: (usize, usize),
+    outline_titles: &[String],
+    paragraph_breaks: &[usize],
+) -> Vec<((usize, usize), bool, bool, String)> {
+    let (start, end) = chunk;
+    let chunk_is_last_word = end >= chars.len();
+    let ends_paragraph = chunk_is_last_word
+        || paragraph_breaks.contains(&end.saturating_sub(1))
+        || paragraph_breaks.contains(&end);
+
+    if let Some((heading, body)) = split_heading_lead(chars, chunk, outline_titles) {
+        let heading_text: String = chars[heading.0..heading.1].iter().collect();
+        let body_text: String = chars[body.0..body.1].iter().collect();
+        return vec![
+            (heading, true, false, heading_text),
+            (body, false, ends_paragraph, body_text),
+        ];
+    }
+
+    let text: String = chars[start..end].iter().collect();
+    vec![(chunk, false, ends_paragraph, text)]
+}
+
 fn gap_samples(
     is_heading: bool,
     ends_paragraph: bool,
@@ -193,6 +220,100 @@ fn is_heading_like(trimmed: &str, outline_titles: &[String]) -> bool {
                 .map(|c| c.is_uppercase())
                 .unwrap_or(false)
         })
+}
+
+/// Splits a heading-like lead off the front of a chunk, returning
+/// (heading_range, body_range) when the chunk begins with a heading.
+pub(crate) fn split_heading_lead(
+    chars: &[char],
+    range: (usize, usize),
+    outline_titles: &[String],
+) -> Option<((usize, usize), (usize, usize))> {
+    let (start, end) = range;
+    if end - start < 3 || end - start > 160 {
+        return None;
+    }
+    let text: String = chars[start..end].iter().collect();
+
+    // 1. An outline title matching the chunk's lead wins outright: split
+    //    right after the title's last matching character.
+    for title in outline_titles {
+        let normalized_title = normalize_for_match(title);
+        if normalized_title.is_empty() {
+            continue;
+        }
+        // Walk char by char; skip whitespace differences (chunk may
+        // wrap the title across lines).
+        let mut ti = title.char_indices().peekable();
+        let mut consumed_to = None;
+        for (offset, c) in text.char_indices() {
+            match ti.peek() {
+                Some(&(toffset, tc)) if c.is_whitespace() && tc.is_whitespace() => {
+                    let _ = toffset;
+                    ti.next();
+                    consumed_to = Some(offset + 1);
+                }
+                Some(&(_, tc)) if c == tc => {
+                    ti.next();
+                    consumed_to = Some(offset + 1);
+                }
+                _ => break,
+            }
+        }
+        if ti.peek().is_none() && consumed_to.unwrap_or(0) < text.chars().count() {
+            let split = start + consumed_to.unwrap_or(0);
+            return Some(((start, split), (split, end)));
+        }
+    }
+
+    // 2. Structural: numbered lead ("0.1 ", "3.2.1 ") up to the first
+    //    sentence terminator or newline.
+    let first_word: String = text
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    // A section number is digits separated by dots ("0.1", "3.2.1"),
+    // optionally with a trailing dot ("0." list style).
+    let number_core = first_word.trim_end_matches('.');
+    let numbered = !number_core.is_empty()
+        && number_core.chars().all(|c| c.is_ascii_digit() || c == '.')
+        && number_core
+            .chars()
+            .last()
+            .map(|c| c.is_ascii_digit())
+            .unwrap_or(false);
+    if !numbered {
+        return None;
+    }
+
+    for (offset, c) in text.char_indices() {
+        if offset == 0 {
+            continue;
+        }
+        let terminator = matches!(c, '!' | '?' | ':' | '\n')
+            || (c == '.' && {
+                let next = text[offset + 1..].chars().next();
+                !matches!(next, Some(n) if n.is_ascii_digit())
+            });
+        if !terminator {
+            continue;
+        }
+        let split = start + offset + 1;
+        if split >= end {
+            return None;
+        }
+        let lead: String = chars[start..split].iter().collect();
+        let lead_trim = lead
+            .trim_end()
+            .trim_end_matches(['.', '!', '?', ':'])
+            .trim_end();
+        if is_heading_like(lead_trim, outline_titles) {
+            return Some(((start, split), (split, end)));
+        }
+        return None;
+    }
+    None
 }
 
 fn normalize_for_match(text: &str) -> String {
@@ -513,42 +634,47 @@ impl TtsEngine {
                     if stop.load(Ordering::Relaxed) {
                         return;
                     }
-                    let chunk_text: String = text.chars().skip(start).take(end - start).collect();
-                    let (samples, sample_rate) =
-                        match model.synthesize(&dir, &chunk_text, &kokoro_voice, rate) {
-                            Ok(audio) => audio,
-                            Err(e) => {
-                                let _ = app.emit("tts-event", TtsEvent::Error { reason: e });
-                                return;
-                            }
-                        };
-                    if samples.is_empty() {
-                        continue;
+                    // A heading glued to body text becomes two pieces:
+                    // the heading (2s pause after), then the body.
+                    let pieces = heading_aware_pieces(
+                        &text_chars,
+                        (start, end),
+                        &outline_titles,
+                        &paragraph_breaks,
+                    );
+                    for (piece, is_heading, ends_paragraph, piece_text) in pieces {
+                        if stop.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        let (samples, piece_rate) =
+                            match model.synthesize(&dir, &piece_text, &kokoro_voice, rate) {
+                                Ok(audio) => audio,
+                                Err(e) => {
+                                    let _ = app.emit("tts-event", TtsEvent::Error { reason: e });
+                                    return;
+                                }
+                            };
+                        if samples.is_empty() {
+                            continue;
+                        }
+                        let sample_rate =
+                            rodio::SampleRate::new(piece_rate).expect("nonzero sample rate");
+                        let mut samples = samples;
+                        samples.extend(gap_samples(
+                            is_heading,
+                            ends_paragraph,
+                            piece == (start, end) && (start, end) == last_chunk,
+                            sample_rate.get(),
+                        ));
+                        player.append(rodio::buffer::SamplesBuffer::new(
+                            rodio::ChannelCount::new(1).expect("nonzero channels"),
+                            sample_rate,
+                            samples.clone(),
+                        ));
+                        // Highlight is scheduled at this piece's projected
+                        // play time; synthesis runs ahead so narration flows.
+                        schedule(samples, sample_rate, page, Some(piece));
                     }
-                    let channels = rodio::ChannelCount::new(1).expect("nonzero channels");
-                    let sample_rate =
-                        rodio::SampleRate::new(sample_rate).expect("nonzero sample rate");
-                    let mut samples = samples;
-                    let chunk_is_heading = {
-                        let chunk: String = text_chars[start..end].iter().collect();
-                        is_heading_like(chunk.trim(), &outline_titles)
-                    };
-                    samples.extend(gap_samples(
-                        chunk_is_heading,
-                        paragraph_breaks.contains(&end.saturating_sub(1))
-                            || paragraph_breaks.contains(&end),
-                        (start, end) == last_chunk,
-                        sample_rate.get(),
-                    ));
-                    player.append(rodio::buffer::SamplesBuffer::new(
-                        channels,
-                        sample_rate,
-                        samples.clone(),
-                    ));
-                    // Highlight is scheduled at this chunk's projected play
-                    // time; synthesis of the next chunk proceeds while the
-                    // audio plays, so narration flows without gaps.
-                    schedule(samples, sample_rate, page, Some((start, end)));
                 }
                 schedule(
                     Vec::new(),
@@ -570,47 +696,52 @@ impl TtsEngine {
                 if stop.load(Ordering::Relaxed) {
                     return;
                 }
-                let chunk_text: String = text.chars().skip(start).take(end - start).collect();
-                let synthesized = {
-                    let mut engine = voice.engine.lock().unwrap();
-                    synthesize_with_config(&mut engine, &voice, &chunk_text, rate)
-                };
-                let (samples, sample_rate) = match synthesized {
-                    Ok(audio) => audio,
-                    Err(e) => {
-                        let _ = app.emit(
-                            "tts-event",
-                            TtsEvent::Error {
-                                reason: e.to_string(),
-                            },
-                        );
+                let pieces = heading_aware_pieces(
+                    &text_chars,
+                    (start, end),
+                    &outline_titles,
+                    &paragraph_breaks,
+                );
+                for (piece, is_heading, ends_paragraph, piece_text) in pieces {
+                    if stop.load(Ordering::Relaxed) {
                         return;
                     }
-                };
-                if samples.is_empty() {
-                    continue;
+                    let synthesized = {
+                        let mut engine = voice.engine.lock().unwrap();
+                        synthesize_with_config(&mut engine, &voice, &piece_text, rate)
+                    };
+                    let (samples, piece_rate) = match synthesized {
+                        Ok(audio) => audio,
+                        Err(e) => {
+                            let _ = app.emit(
+                                "tts-event",
+                                TtsEvent::Error {
+                                    reason: e.to_string(),
+                                },
+                            );
+                            return;
+                        }
+                    };
+                    if samples.is_empty() {
+                        continue;
+                    }
+                    let mut samples: Vec<f32> =
+                        samples.iter().map(|&s| s as f32 / 32768.0).collect();
+                    let sample_rate =
+                        rodio::SampleRate::new(piece_rate).expect("nonzero sample rate");
+                    samples.extend(gap_samples(
+                        is_heading,
+                        ends_paragraph,
+                        piece == (start, end) && (start, end) == last_chunk,
+                        sample_rate.get(),
+                    ));
+                    player.append(rodio::buffer::SamplesBuffer::new(
+                        rodio::ChannelCount::new(1).expect("nonzero channels"),
+                        sample_rate,
+                        samples.clone(),
+                    ));
+                    schedule(samples, sample_rate, page, Some(piece));
                 }
-                // Piper yields i16 PCM; rodio's Sample type is f32.
-                let mut samples: Vec<f32> = samples.iter().map(|&s| s as f32 / 32768.0).collect();
-                let channels = rodio::ChannelCount::new(1).expect("nonzero channels");
-                let sample_rate = rodio::SampleRate::new(sample_rate).expect("nonzero sample rate");
-                let chunk_is_heading = {
-                    let chunk: String = text_chars[start..end].iter().collect();
-                    is_heading_like(chunk.trim(), &outline_titles)
-                };
-                samples.extend(gap_samples(
-                    chunk_is_heading,
-                    paragraph_breaks.contains(&end.saturating_sub(1))
-                        || paragraph_breaks.contains(&end),
-                    (start, end) == last_chunk,
-                    sample_rate.get(),
-                ));
-                player.append(rodio::buffer::SamplesBuffer::new(
-                    channels,
-                    sample_rate,
-                    samples.clone(),
-                ));
-                schedule(samples, sample_rate, page, Some((start, end)));
             }
             schedule(
                 Vec::new(),
@@ -714,6 +845,53 @@ fn load_voice(model: &Path) -> Result<LoadedVoice, String> {
         length_scale: inference["length_scale"].as_f64().unwrap_or(1.0) as f32,
         noise_w: inference["noise_w"].as_f64().unwrap_or(0.8) as f32,
     })
+}
+
+#[cfg(test)]
+mod heading_lead_tests {
+    use super::*;
+
+    fn chars(text: &str) -> Vec<char> {
+        text.chars().collect()
+    }
+
+    #[test]
+    fn numbered_heading_splits_from_body_with_pause() {
+        let text = "0.1 How to read this book. You will read this book carefully.";
+        let pieces = heading_aware_pieces(&chars(text), (0, text.chars().count()), &[], &[]);
+        assert_eq!(pieces.len(), 2, "expected heading + body: {pieces:?}");
+        let (heading_range, is_heading, _, heading_text) = &pieces[0];
+        assert!(is_heading, "heading not flagged: {heading_text:?}");
+        assert!(
+            heading_text.contains("How to read this book"),
+            "heading incomplete: {heading_text:?}"
+        );
+        let _ = heading_range;
+        assert!(
+            pieces[1].3.starts_with(" You"),
+            "body wrong: {:?}",
+            pieces[1].3
+        );
+    }
+
+    #[test]
+    fn outline_title_heading_without_period_splits() {
+        let text = "If You Are New Here you should read chapter one first. It covers the basics.";
+        let outline = vec!["If You Are New Here".to_string()];
+        let pieces = heading_aware_pieces(&chars(text), (0, text.chars().count()), &outline, &[]);
+        assert_eq!(pieces.len(), 2, "expected split: {pieces:?}");
+        assert!(pieces[0].1, "heading not flagged");
+        // The heading ends at the outline title boundary, before "you should".
+        assert!(pieces[0].3.contains("New Here"));
+    }
+
+    #[test]
+    fn plain_body_never_splits() {
+        let text = "The rain fell for days and the river rose over its banks. Fields flooded.";
+        let pieces = heading_aware_pieces(&chars(text), (0, text.chars().count()), &[], &[]);
+        assert_eq!(pieces.len(), 1);
+        assert!(!pieces[0].1, "body flagged as heading");
+    }
 }
 
 #[cfg(test)]

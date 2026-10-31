@@ -6,6 +6,7 @@ import Toolbar from "./Toolbar";
 import Reader from "./Reader";
 import Library from "./Library";
 import Sidebar, { type SidebarTab } from "./Sidebar";
+import Resizer from "./Resizer";
 import SearchBar from "./SearchBar";
 import SettingsScreen from "./SettingsScreen";
 import NarrationBar from "./NarrationBar";
@@ -110,6 +111,7 @@ export default function App() {
   }>({ open: false, query: "", results: [], active: 0, searching: false });
 
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [sidebarWidth, setSidebarWidth] = useState(240);
   const [narrationVoice, setNarrationVoice] = useState("");
   const [narrationRate, setNarrationRate] = useState(1);
   const [narrationContinuous, setNarrationContinuous] = useState(true);
@@ -154,6 +156,12 @@ export default function App() {
           /* keep default rate */
         }
         try {
+          const width = JSON.parse(stored.sidebarWidth ?? "240");
+          if (typeof width === "number" && width >= 180 && width <= 480) setSidebarWidth(width);
+        } catch {
+          /* default width */
+        }
+        try {
           const continuous = JSON.parse(stored.narrationContinuous ?? "true");
           if (typeof continuous === "boolean") setNarrationContinuous(continuous);
         } catch {
@@ -194,6 +202,15 @@ export default function App() {
     if (!settingsReady.current) return;
     void settingsSet(key, JSON.stringify(value)).catch(() => {});
   }, []);
+
+  const resizeSidebar = useCallback(
+    (width: number) => {
+      const clamped = Math.min(480, Math.max(180, Math.round(width)));
+      setSidebarWidth(clamped);
+      persist("sidebarWidth", clamped);
+    },
+    [persist],
+  );
 
   const changeMode = useCallback(
     (m: ReadMode) => {
@@ -778,7 +795,8 @@ export default function App() {
       {view === "reader" && current ? (
         <div className="reader-row">
           {sidebarTab !== null && (
-            <Sidebar
+            <div className="sidebar-wrap" style={{ width: sidebarWidth }}>
+              <Sidebar
               tab={sidebarTab}
               onTabChange={setSidebarTab}
               doc={current.doc}
@@ -792,9 +810,11 @@ export default function App() {
               highlights={highlights}
               onRemoveHighlight={(h) => void removeHighlight(h)}
               onHighlightColorChange={(h, c) => void setHighlightColor(h, c)}
-              onHighlightNoteChange={(h, n) => void setHighlightNote(h, n)}
-            />
+                onHighlightNoteChange={(h, n) => void setHighlightNote(h, n)}
+              />
+            </div>
           )}
+          {sidebarTab !== null && <Resizer onResize={resizeSidebar} />}
           <div className="reader-stack">
             {search.open && (
               <SearchBar
@@ -855,7 +875,6 @@ export default function App() {
           narration={narration}
           currentPage={page}
           pageCount={current.doc.pageCount}
-          onPageChange={changePage}
         />
       )}
 

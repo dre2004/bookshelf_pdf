@@ -1237,3 +1237,32 @@ body,
   text-align: center;
   font-variant-numeric: tabular-nums;
 }
+
+.sidebar-wrap {
+  display: flex;
+  min-width: 0;
+}
+
+.sidebar-wrap > :first-child {
+  flex: 1;
+  min-width: 0;
+}
+
+.sidebar-resizer {
+  flex: none;
+  width: 5px;
+  margin-left: -2px;
+  cursor: col-resize;
+  background: transparent;
+  z-index: 5;
+}
+
+.sidebar-resizer:hover,
+body.resizing .sidebar-resizer {
+  background: #0e6ba8;
+}
+
+body.resizing {
+  cursor: col-resize;
+  user-select: none;
+}

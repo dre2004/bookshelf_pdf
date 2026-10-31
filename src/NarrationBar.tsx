@@ -15,15 +15,9 @@ interface Props {
   narration: NarrationController;
   currentPage: number;
   pageCount: number;
-  onPageChange: (page: number) => void;
 }
 
-export default function NarrationBar({
-  narration,
-  currentPage,
-  pageCount,
-  onPageChange,
-}: Props) {
+export default function NarrationBar({ narration, currentPage, pageCount }: Props) {
   if (!narration.speaking) {
     return null;
   }
@@ -59,6 +53,7 @@ export default function NarrationBar({
         >
           −
         </button>
+        <span className="speed-value">{narration.rate.toFixed(2)}×</span>
         <button
           className="btn icon"
           onClick={() => narration.setRate(stepped(narration.rate, 1))}
@@ -67,20 +62,6 @@ export default function NarrationBar({
           +
         </button>
       </div>
-      <button
-        className="btn icon"
-        onClick={() => onPageChange((narration.page ?? currentPage) - 1)}
-        title="Previous page"
-      >
-        ‹
-      </button>
-      <button
-        className="btn icon"
-        onClick={() => onPageChange((narration.page ?? currentPage) + 1)}
-        title="Next page"
-      >
-        ›
-      </button>
     </div>
   );
 }

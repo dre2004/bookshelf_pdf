@@ -25,24 +25,6 @@ fn push_chunk(chars: &[char], chunks: &mut Vec<(usize, usize)>, start: usize, en
 pub fn split_for_narration(text: &str, paragraph_breaks: &[usize]) -> Vec<(usize, usize)> {
     let chars: Vec<char> = text.chars().collect();
     let sentences = split_sentences(&chars);
-
-    // Headings and list items usually carry no sentence terminator, so a
-    // heading rides glued to the first body sentence. Paragraph breaks
-    // (from page geometry) split any sentence that spans them, giving
-    // headings their own chunk.
-    let mut split_sentences_out: Vec<(usize, usize)> = Vec::with_capacity(sentences.len());
-    for (start, end) in sentences {
-        let mut piece_start = start;
-        for &brk in paragraph_breaks {
-            if brk > piece_start && brk + 1 < end {
-                push_chunk(&chars, &mut split_sentences_out, piece_start, brk + 1);
-                piece_start = brk + 1;
-            }
-        }
-        push_chunk(&chars, &mut split_sentences_out, piece_start, end);
-    }
-
-    let sentences = split_sentences_out;
     let mut chunks = Vec::new();
 
     let mut index = 0;
@@ -259,21 +241,6 @@ mod tests {
         assert!(
             later.trim_start().starts_with("Third"),
             "paragraph break ignored: {later:?}"
-        );
-    }
-
-    #[test]
-    fn paragraph_break_splits_heading_without_period_from_body() {
-        // Real-world shape: heading has no terminator; geometry says the
-        // paragraph ends after "book" (char index of the newline).
-        let text = "0.1 How to read this book\nYou will read this book. It helps.";
-        let chars: Vec<char> = text.chars().collect();
-        let brk = chars.iter().position(|&c| c == '\n').unwrap();
-        let chunks = split_for_narration(text, &[brk]);
-        let first: String = chars[chunks[0].0..chunks[0].1].iter().collect();
-        assert!(
-            first.contains("How to read this book") && !first.contains("You will"),
-            "heading not separated: {first:?}"
         );
     }
 
