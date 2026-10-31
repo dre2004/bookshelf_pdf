@@ -146,13 +146,27 @@ fn is_chapter_kicker(line: &str) -> bool {
     ) && !words[1].is_empty()
 }
 
+/// How far into a chunk the heading-lead rules scan. Heading leads sit at
+/// the start of a chunk; the chunker's groups run up to ~400 chars, so the
+/// scan must be bounded by its own window — a whole-chunk length cap
+/// silently disabled heading detection on every real book.
+const LEAD_WINDOW_CHARS: usize = 160;
+
+/// A standalone heading line inside a chunk: an outline title, or a
+/// section-number lead with a capitalized title after it and no sentence
+/// punctuation. Wrapped body lines never match these rules.
+const HEADING_LINE_MAX_CHARS: usize = 60;
+
+/// Cap on heading pieces within one chunk — the pause-storm guard.
+const MAX_HEADING_PIECES_PER_CHUNK: usize = 2;
+
 pub(crate) fn split_heading_lead(
     chars: &[char],
     range: (usize, usize),
     outline_titles: &[String],
 ) -> Option<HeadingLead> {
     let (start, end) = range;
-    if end - start < 3 || end - start > 200 {
+    if end - start < 3 {
         return None;
     }
     let text: String = chars[start..end].iter().collect();
@@ -210,7 +224,7 @@ pub(crate) fn split_heading_lead(
         }
         let mut ti = title.chars().peekable();
         let mut consumed_to = None;
-        for (idx, c) in text.chars().enumerate() {
+        for (idx, c) in text.chars().enumerate().take(LEAD_WINDOW_CHARS) {
             match ti.peek() {
                 Some(&tc) if c.is_whitespace() && tc.is_whitespace() => {
                     ti.next();
@@ -249,7 +263,7 @@ pub(crate) fn split_heading_lead(
     if !numbered {
         return None;
     }
-    for (idx, c) in text.chars().enumerate() {
+    for (idx, c) in text.chars().enumerate().take(LEAD_WINDOW_CHARS) {
         if idx == 0 {
             continue;
         }
@@ -280,10 +294,47 @@ pub(crate) fn split_heading_lead(
     None
 }
 
-/// Playback pieces for one chunk: normally the chunk itself. When the chunk
-/// begins with a heading lead, the heading piece(s) come first with their
-/// own pauses, then the body with the standard inter-chunk gap. Nothing
-/// else is ever split.
+/// Whether a standalone line is a heading: an outline title, or a
+/// section-number lead ("0.1 How to read this book"). Body lines that
+/// merely start with a decimal ("12.5 percent of cases") don't match:
+/// the word after the number must be capitalized and the line must carry
+/// no sentence punctuation beyond the number itself.
+fn is_heading_line(trimmed: &str, outline_titles: &[String]) -> bool {
+    if trimmed.is_empty() || trimmed.chars().count() > HEADING_LINE_MAX_CHARS {
+        return false;
+    }
+    if outline_titles
+        .iter()
+        .any(|t| normalize_for_match(t) == normalize_for_match(trimmed))
+    {
+        return true;
+    }
+    let Some(first) = trimmed.split_whitespace().next() else {
+        return false;
+    };
+    let number = first.trim_end_matches('.');
+    let numbered = !number.is_empty()
+        && number.chars().next().is_some_and(|c| c.is_ascii_digit())
+        && number.chars().last().is_some_and(|c| c.is_ascii_digit())
+        && number.chars().all(|c| c.is_ascii_digit() || c == '.');
+    if !numbered {
+        return false;
+    }
+    let after_number = trimmed[first.len()..].trim_start();
+    let starts_title = after_number
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_uppercase());
+    starts_title
+        && !after_number.contains('.')
+        && !after_number.contains('!')
+        && !after_number.contains('?')
+}
+
+/// Playback pieces for one chunk: a heading lead at the chunk start, and
+/// standalone heading lines anywhere after it, become their own pieces
+/// carrying the heading pause; body text between them carries the
+/// sentence/paragraph pause. Nothing else is ever split.
 fn heading_aware_pieces(
     chars: &[char],
     chunk: (usize, usize),
@@ -296,27 +347,53 @@ fn heading_aware_pieces(
     // page's final piece, so "runs to end of text" is not a paragraph.
     let ends_paragraph =
         paragraph_breaks.contains(&end.saturating_sub(1)) || paragraph_breaks.contains(&end);
-
-    if let Some(lead) = split_heading_lead(chars, chunk, outline_titles) {
-        let mut pieces: Vec<((usize, usize), u32, String)> = lead.pieces;
-        let last_heading_end = pieces.last().map(|(r, _, _)| r.1).unwrap_or(start);
-        let body: String = chars[last_heading_end..end].iter().collect();
-        let body_pause = if ends_paragraph {
-            PARAGRAPH_PAUSE_MS
-        } else {
-            SENTENCE_PAUSE_MS
-        };
-        pieces.push(((last_heading_end, end), body_pause, body));
-        return pieces;
-    }
-
-    let text: String = chars[start..end].iter().collect();
-    let pause = if ends_paragraph {
+    let final_pause = if ends_paragraph {
         PARAGRAPH_PAUSE_MS
     } else {
         SENTENCE_PAUSE_MS
     };
-    vec![(chunk, pause, text)]
+
+    let lead_pieces = split_heading_lead(chars, chunk, outline_titles)
+        .map(|lead| lead.pieces)
+        .unwrap_or_default();
+    let mut heading_count = lead_pieces.len();
+    let mut body_start = lead_pieces.last().map(|(r, _, _)| r.1).unwrap_or(start);
+    let mut pieces: Vec<((usize, usize), u32, String)> = Vec::new();
+
+    // Walk the remaining lines; a standalone heading line closes the body
+    // piece before it and becomes its own piece. Piece ranges include the
+    // line break so the next piece starts clean.
+    let mut cursor = body_start;
+    while cursor < end && heading_count < MAX_HEADING_PIECES_PER_CHUNK {
+        let line_end = chars[cursor..end]
+            .iter()
+            .position(|c| *c == '\n' || *c == '\r')
+            .map(|k| cursor + k)
+            .unwrap_or(end);
+        let next_start = chars[line_end..end]
+            .iter()
+            .position(|c| *c != '\n' && *c != '\r')
+            .map(|k| line_end + k)
+            .unwrap_or(end);
+        let line: String = chars[cursor..line_end].iter().collect();
+        let trimmed = line.trim();
+        if !trimmed.is_empty() && is_heading_line(trimmed, outline_titles) {
+            if chars[body_start..cursor].iter().any(|c| !c.is_whitespace()) {
+                let body: String = chars[body_start..cursor].iter().collect();
+                pieces.push(((body_start, cursor), PARAGRAPH_PAUSE_MS, body));
+            }
+            pieces.push(((cursor, next_start), HEADING_PAUSE_MS, trimmed.to_string()));
+            heading_count += 1;
+            body_start = next_start;
+        }
+        cursor = next_start;
+    }
+
+    let mut all = lead_pieces;
+    all.append(&mut pieces);
+    let body: String = chars[body_start..end].iter().collect();
+    all.push(((body_start, end), final_pause, body));
+    all
 }
 
 const HEADING_PAUSE_MS: u32 = 2000;
@@ -349,8 +426,20 @@ fn is_heading_like(trimmed: &str, outline_titles: &[String]) -> bool {
         .next()
         .map(|c| c.is_ascii_digit())
         .unwrap_or(false);
-    if starts_numbered || trimmed.ends_with(':') {
+    if trimmed.ends_with(':') {
         return true;
+    }
+    if starts_numbered {
+        // A section-number lead is a heading only when a capitalized
+        // title follows ("0.1 How to read this book"); lowercase prose
+        // after the number ("12.5 percent of cases") is a sentence that
+        // happens to start with a decimal.
+        let number_len = trimmed.split_whitespace().next().map(str::len).unwrap_or(0);
+        let after_number = trimmed[number_len..].trim_start();
+        return after_number
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_uppercase());
     }
     // Title Case: every word starts uppercase (headings, not sentences).
     words > 1
@@ -984,6 +1073,70 @@ mod heading_lead_tests {
         assert_eq!(pieces.len(), 1);
         assert_eq!(pieces[0].1, SENTENCE_PAUSE_MS);
     }
+
+    // The four tests below use the exact chunk shapes the real pipeline
+    // produced for the opening page of the C book (traced through
+    // page_text → geometry breaks → chunker): a >300-char chapter-opener
+    // chunk, a mid-chunk section heading, and wrapped body lines.
+
+    #[test]
+    fn long_chunk_with_chapter_opener_still_splits() {
+        let text = "Chapter 0\r\nIf You\u{2019}re New Here\r\nThis book begins with programs, and it begins quickly. That is the right way to learn C and\r\nthe wrong way to be surprised by it: the first chapter\u{2019}s loops lean on facts \u{2014} about expressions,\r\ndeclarations, and truth \u{2014} that deserve a floor under them before the running starts. Part 0 is\r\nthat floor. ";
+        assert!(
+            text.chars().count() > 200,
+            "test must exercise a long chunk"
+        );
+        let outline = ["If You\u{2019}re New Here"];
+        let pieces = pieces(text, &outline);
+        assert_eq!(
+            pieces.len(),
+            3,
+            "expected kicker + title + body: {pieces:?}"
+        );
+        let pauses: Vec<u32> = pieces.iter().map(|(_, p, _)| *p).collect();
+        assert_eq!(
+            pauses,
+            vec![HEADING_KICKER_PAUSE_MS, HEADING_PAUSE_MS, SENTENCE_PAUSE_MS]
+        );
+        assert_eq!(pieces[0].2.trim(), "Chapter 0");
+        assert!(pieces[1].2.contains("New Here"));
+        assert!(pieces[2].2.trim_start().starts_with("This book begins"));
+    }
+
+    #[test]
+    fn numbered_heading_line_mid_chunk_splits() {
+        let text = "It assumes nothing, it moves slowly by this book\u{2019}s standards, and it exists so that\r\nevery reader \u{2014} newcomer or arriving polyglot \u{2014} starts Chapter 1 on the same ground.\r\n0.1 How to read this book\r\nTwo tracks lead through this book; take the one that fits.\r\nNew to C, or new to programming. ";
+        let pieces = pieces(text, &[]);
+        assert_eq!(
+            pieces.len(),
+            3,
+            "expected body + heading + body: {pieces:?}"
+        );
+        let pauses: Vec<u32> = pieces.iter().map(|(_, p, _)| *p).collect();
+        assert_eq!(
+            pauses,
+            vec![PARAGRAPH_PAUSE_MS, HEADING_PAUSE_MS, SENTENCE_PAUSE_MS]
+        );
+        assert_eq!(pieces[1].2, "0.1 How to read this book");
+        assert!(pieces[2].2.trim_start().starts_with("Two tracks"));
+    }
+
+    #[test]
+    fn wrapped_body_lines_never_become_headings() {
+        let text = "Read linearly. Finish Part 0, then start Chapter 1\r\nand type in every program it shows \u{2014} the typing is not a ritual, it is the course. The chapters\r\nascend in power, each concept appears before it is used, and every chapter ends with exercises\r\nthat are the other half of its teaching. ";
+        let pieces = pieces(text, &[]);
+        assert_eq!(pieces.len(), 1, "body split: {pieces:?}");
+        assert_eq!(pieces[0].1, SENTENCE_PAUSE_MS);
+    }
+
+    #[test]
+    fn decimal_lead_line_is_not_a_heading() {
+        // A body line starting with a decimal: the follower is lowercase
+        // prose, not a capitalized section title.
+        let text = "12.5 percent of cases\r\nwere recorded elsewhere in the study. ";
+        let pieces = pieces(text, &[]);
+        assert_eq!(pieces.len(), 1, "decimal line split off: {pieces:?}");
+    }
 }
 
 #[cfg(test)]
@@ -1022,5 +1175,93 @@ mod pause_tests {
         ));
         assert!(is_heading_like("0.1 How to read this book", &outline));
         assert!(is_heading_like("Part 3:", &outline));
+    }
+}
+
+/// Diagnostic that runs the exact narration pipeline — page text,
+/// geometry paragraph breaks, outline titles, sentence chunking, heading
+/// split — against a real book and prints what the narrator would play.
+/// Opt-in: set BOOKSHELF_TRACE_BOOK (path to a PDF) and optionally
+/// BOOKSHELF_TRACE_PAGE (0-based, default 10). CI never sets them.
+#[cfg(test)]
+mod book_trace_tests {
+    use super::*;
+
+    fn escape(text: &str) -> String {
+        text.chars()
+            .flat_map(|c| match c {
+                '\r' => "\r".chars().collect::<Vec<_>>(),
+                '\n' => "\n".chars().collect::<Vec<_>>(),
+                '\t' => "\t".chars().collect::<Vec<_>>(),
+                other => vec![other],
+            })
+            .collect()
+    }
+
+    #[test]
+    fn trace_real_book_page() {
+        let Ok(book) = std::env::var("BOOKSHELF_TRACE_BOOK") else {
+            return;
+        };
+        let page: i32 = std::env::var("BOOKSHELF_TRACE_PAGE")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(10);
+        let library = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("resources/pdfium/pdfium.dll");
+        let engine = crate::pdfium_engine::Engine::with_library_path(&library)
+            .expect("bind pdfium (run npm run fetch:pdfium)");
+        let info = engine.open_document(&book, None).expect("open book");
+        let data = engine.page_text(info.doc_id, page).expect("read page text");
+        let text = data.chars;
+        let breaks = engine
+            .paragraph_breaks(info.doc_id, page, text.chars().count())
+            .unwrap_or_default();
+        let titles = engine.outline_titles_for_page(info.doc_id, page);
+
+        println!("== page {page} ({} chars) ==", text.chars().count());
+        println!(
+            "first 200 chars: {:?}",
+            escape(&text.chars().take(200).collect::<String>())
+        );
+        println!("outline titles: {titles:?}");
+        println!("paragraph breaks: {breaks:?}");
+
+        let chars: Vec<char> = text.chars().collect();
+        let chunks = split_for_narration(&text, &breaks);
+        println!("== {} chunks ===", chunks.len());
+        for (i, (start, end)) in chunks.iter().copied().take(5).enumerate() {
+            println!(
+                "-- chunk {i} [{start}..{end}] raw: {:?}",
+                escape(&chars[start..end].iter().collect::<String>())
+            );
+            for ((ps, pe), pause, ptext) in
+                heading_aware_pieces(&chars, (start, end), &titles, &breaks)
+            {
+                println!(
+                    "   piece [{ps}..{pe}] pause={pause}ms text={:?}",
+                    escape(&ptext)
+                );
+            }
+        }
+
+        // Acceptance: the traced page must read its headings with pauses.
+        let first = heading_aware_pieces(&chars, chunks[0], &titles, &breaks);
+        assert!(
+            first.len() >= 3
+                && first[0].1 == HEADING_KICKER_PAUSE_MS
+                && first[0].2.trim().starts_with("Chapter 0"),
+            "chapter kicker not split off: {first:?}"
+        );
+        assert!(
+            first[1].1 == HEADING_PAUSE_MS && first[1].2.contains("New Here"),
+            "chapter title not split off: {first:?}"
+        );
+        assert!(
+            heading_aware_pieces(&chars, chunks[1], &titles, &breaks)
+                .iter()
+                .any(|(_, pause, text)| *pause == HEADING_PAUSE_MS && text.contains("How to read")),
+            "0.1 heading line not split off in chunk 1"
+        );
     }
 }

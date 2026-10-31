@@ -3,7 +3,7 @@
 
 use std::{
     collections::HashMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU32, Ordering},
@@ -169,8 +169,13 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(app: &tauri::AppHandle) -> Result<Self, String> {
-        let library_path = Self::resolve_library_path(app)?;
-        let bindings = Pdfium::bind_to_library(&library_path)
+        Self::with_library_path(&Self::resolve_library_path(app)?)
+    }
+
+    /// Engine bound to an explicit PDFium library path — the testable core
+    /// of `new`, which differs only in how the library is located.
+    pub fn with_library_path(library_path: &Path) -> Result<Self, String> {
+        let bindings = Pdfium::bind_to_library(library_path)
             .map_err(|e| format!("failed to load PDFium from {}: {e}", library_path.display()))?;
         let pdfium: &'static Pdfium = Box::leak(Box::new(Pdfium::new(bindings)));
         Ok(Self {
