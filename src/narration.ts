@@ -355,6 +355,7 @@ export function useNarration({
               page: target,
               voiceId: selection,
               rate: rateRef.current,
+              docId,
             }),
           )
           .catch(() => stop());

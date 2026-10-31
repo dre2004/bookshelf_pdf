@@ -130,28 +130,37 @@ impl PlaybackClock {
 /// Silence appended after a chunk (in samples) so narration breathes:
 /// a longer pause after heading-like chunks, a shorter one at paragraph
 /// breaks. Returns zero elsewhere — sentence pauses come from prosody.
-fn gap_samples(text: &[char], range: (usize, usize), is_last: bool, sample_rate: u32) -> Vec<f32> {
+fn gap_samples(
+    is_heading: bool,
+    ends_paragraph: bool,
+    is_last: bool,
+    sample_rate: u32,
+) -> Vec<f32> {
     if is_last {
         return Vec::new();
     }
-    let (start, end) = range;
-    let chunk: String = text[start.min(text.len())..end.min(text.len())]
-        .iter()
-        .collect();
-    let trimmed = chunk.trim();
-    if is_heading_like(trimmed) {
+    if is_heading {
         return vec![0.0; sample_rate as usize * 65 / 100]; // 650 ms
     }
-    if chunk.ends_with('\n') || chunk.ends_with('\r') {
+    if ends_paragraph {
         return vec![0.0; sample_rate as usize * 40 / 100]; // 400 ms
     }
     Vec::new()
 }
 
-/// Heading heuristics on the chunk's own text: short, few words, no
-/// sentence punctuation (a trailing colon is allowed), optionally
-/// introduced by section numbering.
-fn is_heading_like(trimmed: &str) -> bool {
+/// Heading detection, in order of confidence:
+/// 1. The chunk matches a PDF outline title (the sidebar's own TOC) —
+///    exact after normalizing case/whitespace/typographic punctuation.
+/// 2. Structural cues: short, no sentence-ending punctuation, and either
+///    section-numbered, colon-ended, or every word capitalized.
+fn is_heading_like(trimmed: &str, outline_titles: &[String]) -> bool {
+    let normalized = normalize_for_match(trimmed);
+    if outline_titles
+        .iter()
+        .any(|title| normalize_for_match(title) == normalized)
+    {
+        return true;
+    }
     let words = trimmed.split_whitespace().count();
     if words == 0 || words > 10 || trimmed.chars().count() > 70 {
         return false;
@@ -164,7 +173,38 @@ fn is_heading_like(trimmed: &str) -> bool {
         .next()
         .map(|c| c.is_ascii_digit())
         .unwrap_or(false);
-    starts_numbered || trimmed.ends_with(':') || words <= 5
+    if starts_numbered || trimmed.ends_with(':') {
+        return true;
+    }
+    // Title Case: every word starts uppercase (headings, not sentences).
+    words > 1
+        && trimmed.split_whitespace().all(|word| {
+            word.chars()
+                .next()
+                .map(|c| c.is_uppercase())
+                .unwrap_or(false)
+        })
+}
+
+fn normalize_for_match(text: &str) -> String {
+    let curly_apostrophe = char::from_u32(0x2019).unwrap();
+    let curly_open = char::from_u32(0x2018).unwrap();
+    let curly_dquote_a = char::from_u32(0x201C).unwrap();
+    let curly_dquote_b = char::from_u32(0x201D).unwrap();
+    let en_dash = char::from_u32(0x2013).unwrap();
+    let em_dash = char::from_u32(0x2014).unwrap();
+    text.chars()
+        .map(|c| match c {
+            c if c == curly_apostrophe || c == curly_open => '\'',
+            c if c == curly_dquote_a || c == curly_dquote_b => '"',
+            c if c == en_dash || c == em_dash => '-',
+            other => other,
+        })
+        .collect::<String>()
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 impl TtsEngine {
@@ -336,7 +376,15 @@ impl TtsEngine {
     /// Speaks `text` (a whole page) chunk by chunk on a worker thread,
     /// emitting progress events as each chunk starts playing. Returns once
     /// the worker is launched; playback continues in the background.
-    pub fn speak(&self, text: &str, page: i32, voice_id: &str, rate: f32) -> Result<(), String> {
+    pub fn speak(
+        &self,
+        text: &str,
+        page: i32,
+        voice_id: &str,
+        rate: f32,
+        paragraph_breaks: Vec<usize>,
+        outline_titles: Vec<String>,
+    ) -> Result<(), String> {
         self.stop();
 
         let text = text.to_string();
@@ -417,8 +465,8 @@ impl TtsEngine {
         };
 
         let rate = rate.clamp(0.5, 2.0);
-        let chunks = split_for_narration(&text);
         let text_chars: Vec<char> = text.chars().collect();
+        let chunks = split_for_narration(&text, &paragraph_breaks);
         let last_chunk = chunks.last().copied().unwrap_or((0, 0));
 
         if let Some(kokoro_voice) = voice_id.strip_prefix("kokoro:").map(str::to_string) {
@@ -444,9 +492,14 @@ impl TtsEngine {
                     let sample_rate =
                         rodio::SampleRate::new(sample_rate).expect("nonzero sample rate");
                     let mut samples = samples;
+                    let chunk_is_heading = {
+                        let chunk: String = text_chars[start..end].iter().collect();
+                        is_heading_like(chunk.trim(), &outline_titles)
+                    };
                     samples.extend(gap_samples(
-                        &text_chars,
-                        (start, end),
+                        chunk_is_heading,
+                        paragraph_breaks.contains(&end.saturating_sub(1))
+                            || paragraph_breaks.contains(&end),
                         (start, end) == last_chunk,
                         sample_rate.get(),
                     ));
@@ -504,9 +557,14 @@ impl TtsEngine {
                 let mut samples: Vec<f32> = samples.iter().map(|&s| s as f32 / 32768.0).collect();
                 let channels = rodio::ChannelCount::new(1).expect("nonzero channels");
                 let sample_rate = rodio::SampleRate::new(sample_rate).expect("nonzero sample rate");
+                let chunk_is_heading = {
+                    let chunk: String = text_chars[start..end].iter().collect();
+                    is_heading_like(chunk.trim(), &outline_titles)
+                };
                 samples.extend(gap_samples(
-                    &text_chars,
-                    (start, end),
+                    chunk_is_heading,
+                    paragraph_breaks.contains(&end.saturating_sub(1))
+                        || paragraph_breaks.contains(&end),
                     (start, end) == last_chunk,
                     sample_rate.get(),
                 ));
@@ -736,40 +794,35 @@ mod tests {
 mod pause_tests {
     use super::*;
 
-    fn chars(text: &str) -> Vec<char> {
-        text.chars().collect()
-    }
-
     #[test]
     fn heading_chunks_get_a_long_pause() {
-        let text = "0.1 How to read this book
-You will read this book.";
-        let chunks = split_for_narration(text);
-        let heading = chunks[0];
-        let gap = gap_samples(&chars(text), heading, false, 24_000);
+        let gap = gap_samples(true, false, false, 24_000);
         assert_eq!(gap.len(), 24_000 * 65 / 100);
-
-        let plain = chunks[1];
-        let none = gap_samples(&chars(text), plain, false, 24_000);
-        assert!(
-            none.is_empty(),
-            "body sentence should not get a heading pause"
-        );
+        let none = gap_samples(false, false, false, 24_000);
+        assert!(none.is_empty());
     }
 
     #[test]
-    fn last_chunk_gets_no_pause() {
-        let text = "Chapter 9";
-        let chunks = split_for_narration(text);
-        let gap = gap_samples(&chars(text), chunks[0], true, 24_000);
-        assert!(gap.is_empty());
+    fn paragraph_and_last_chunk_pauses() {
+        let paragraph = gap_samples(false, true, false, 24_000);
+        assert_eq!(paragraph.len(), 24_000 * 40 / 100);
+        let last = gap_samples(true, true, true, 24_000);
+        assert!(last.is_empty());
     }
 
     #[test]
-    fn sentence_with_period_is_not_a_heading() {
-        assert!(!is_heading_like("This is a full sentence."));
-        assert!(is_heading_like("If You're New Here"));
-        assert!(is_heading_like("0.1 How to read this book"));
-        assert!(is_heading_like("Part 3:"));
+    fn heading_detection_prefers_outline_titles() {
+        let outline = vec!["Getting Started".to_string()];
+        assert!(is_heading_like("getting started", &outline));
+        assert!(!is_heading_like("This is a full sentence.", &outline));
+        // Title Case alone is a structural heading cue.
+        assert!(is_heading_like("If You're New Here", &outline));
+        assert!(!is_heading_like("just some words here", &outline));
+        assert!(is_heading_like(
+            "If You're New Here",
+            &["If You're New Here".to_string()]
+        ));
+        assert!(is_heading_like("0.1 How to read this book", &outline));
+        assert!(is_heading_like("Part 3:", &outline));
     }
 }

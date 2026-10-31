@@ -217,12 +217,26 @@ pub fn tts_voices(engine: tauri::State<'_, Arc<TtsEngine>>) -> Result<Vec<TtsVoi
 #[tauri::command]
 pub fn tts_speak(
     engine: tauri::State<'_, Arc<TtsEngine>>,
+    pdfium: tauri::State<'_, Arc<crate::pdfium_engine::Engine>>,
     text: String,
     page: i32,
     voice_id: String,
     rate: f64,
+    doc_id: Option<u32>,
 ) -> Result<(), String> {
-    engine.speak(&text, page, &voice_id, rate as f32)
+    // Paragraph boundaries come from page geometry when the caller says
+    // which document it is reading; otherwise sentence-only chunking.
+    let (breaks, outline_titles) = doc_id
+        .map(|id| {
+            (
+                pdfium
+                    .paragraph_breaks(id, page, text.chars().count())
+                    .unwrap_or_default(),
+                pdfium.outline_titles_for_page(id, page),
+            )
+        })
+        .unwrap_or_default();
+    engine.speak(&text, page, &voice_id, rate as f32, breaks, outline_titles)
 }
 
 #[tauri::command]

@@ -376,6 +376,108 @@ impl Engine {
         Ok(matches)
     }
 
+    /// Outline titles whose destination is `page` — the document's own
+    /// heading list for that page, used for narration heading detection.
+    pub fn outline_titles_for_page(&self, doc_id: u32, page: PdfPageIndex) -> Vec<String> {
+        let Ok(docs) = self.docs.try_lock() else {
+            return Vec::new();
+        };
+        let Some(doc) = docs.get(&doc_id) else {
+            return Vec::new();
+        };
+        let bookmarks = doc.bookmarks();
+        let mut titles = Vec::new();
+        let mut bookmark = bookmarks.iter().next();
+        while let Some(node) = bookmark {
+            if destination_page(&node) == page
+                && let Some(title) = node.title()
+            {
+                titles.push(title);
+            }
+            collect_child_titles(&node, page, &mut titles);
+            bookmark = node.next_sibling();
+        }
+        titles
+    }
+
+    /// Char indexes where paragraphs end on a page, computed from the
+    /// text layer's character boxes: characters are grouped into visual
+    /// lines, and line ends whose vertical gap to the next line clearly
+    /// exceeds the page's median line pitch are paragraph boundaries.
+    /// `char_count` must match the page's text length (the frontend and
+    /// engine must agree on the text); returns None when they don't or the
+    /// page can't be read — callers fall back to sentence-only chunking.
+    pub fn paragraph_breaks(
+        &self,
+        doc_id: u32,
+        page_index: PdfPageIndex,
+        char_count: usize,
+    ) -> Option<Vec<usize>> {
+        if char_count == 0 {
+            return Some(Vec::new());
+        }
+        let docs = self.docs.lock().unwrap();
+        let doc = docs.get(&doc_id)?;
+        let pages = doc.pages();
+        let page = if page_index >= 0 && page_index < pages.len() {
+            pages.get(page_index).ok()?
+        } else {
+            return None;
+        };
+        let text = page.text().ok()?;
+        if text.len() as usize != char_count {
+            return None;
+        }
+
+        // Char index -> top of its box (PDF points, y grows upward);
+        // chars without a box inherit the last seen top.
+        let mut indexed_tops: Vec<(usize, f32)> = Vec::with_capacity(char_count);
+        for (index, ch) in (0..).zip(text.chars().iter()) {
+            let top = ch
+                .loose_bounds()
+                .ok()
+                .map(|rect| rect.top().value)
+                .or_else(|| indexed_tops.last().map(|(_, top)| *top));
+            if let Some(top) = top {
+                indexed_tops.push((index, top));
+            }
+        }
+        if indexed_tops.is_empty() {
+            return Some(Vec::new());
+        }
+
+        // Group into lines: a new line starts when the top moves by more
+        // than a small fraction of the page height.
+        let mut lines: Vec<(usize, f32)> = Vec::new();
+        let mut line_start = indexed_tops[0];
+        for &(index, top) in &indexed_tops {
+            if (line_start.1 - top).abs() > 1.5 {
+                lines.push(line_start);
+                line_start = (index, top);
+            }
+        }
+        lines.push(line_start);
+        if lines.len() < 3 {
+            return Some(Vec::new());
+        }
+
+        let mut pitches: Vec<f32> = lines.windows(2).map(|w| (w[0].1 - w[1].1).abs()).collect();
+        pitches.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let median = pitches[pitches.len() / 2];
+
+        let mut breaks = Vec::new();
+        for window in lines.windows(2) {
+            let gap = (window[0].1 - window[1].1).abs();
+            if gap > median * 1.6 {
+                let next_start = window[1].0;
+                if next_start > 0 {
+                    breaks.push(next_start - 1);
+                }
+            }
+        }
+        Some(breaks)
+    }
+
     /// The document's outline (table of contents) as a page-indexed tree.
     pub fn outline(&self, doc_id: u32) -> Result<Vec<OutlineNode>, ApiError> {
         let docs = self.docs.lock().unwrap();
@@ -538,6 +640,26 @@ impl RenderCache {
                 true
             }
         });
+    }
+}
+
+fn destination_page(bookmark: &PdfBookmark<'_>) -> PdfPageIndex {
+    bookmark
+        .destination()
+        .and_then(|dest| dest.page_index().ok())
+        .unwrap_or(-1)
+}
+
+fn collect_child_titles(bookmark: &PdfBookmark<'_>, page: PdfPageIndex, titles: &mut Vec<String>) {
+    let mut child = bookmark.first_child();
+    while let Some(node) = child {
+        if destination_page(&node) == page
+            && let Some(title) = node.title()
+        {
+            titles.push(title);
+        }
+        collect_child_titles(&node, page, titles);
+        child = node.next_sibling();
     }
 }
 

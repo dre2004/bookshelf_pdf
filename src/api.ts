@@ -117,6 +117,7 @@ export async function ttsSpeak(args: {
   page: number;
   voiceId: string;
   rate: number;
+  docId?: number;
 }): Promise<void> {
   return invoke("tts_speak", args);
 }
