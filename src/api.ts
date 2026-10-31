@@ -108,6 +108,14 @@ export async function ttsVoices(): Promise<TtsVoice[]> {
   return invoke("tts_voices");
 }
 
+export async function ttsPackInstalled(): Promise<boolean> {
+  return invoke("tts_pack_installed");
+}
+
+export async function ttsPreviewVoice(voice: string, speed: number): Promise<void> {
+  return invoke("tts_preview_voice", { voice, speed });
+}
+
 export async function ttsInstallKokoro(): Promise<void> {
   return invoke("tts_install_kokoro");
 }

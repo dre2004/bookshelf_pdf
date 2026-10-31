@@ -119,6 +119,8 @@ pub fn run() {
             commands::settings_set,
             commands::get_startup_file,
             commands::tts_voices,
+            commands::tts_pack_installed,
+            commands::tts_preview_voice,
             commands::tts_speak,
             commands::tts_pause,
             commands::tts_resume,

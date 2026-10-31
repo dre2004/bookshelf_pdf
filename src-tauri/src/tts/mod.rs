@@ -265,41 +265,66 @@ impl TtsEngine {
         Ok(dir)
     }
 
-    /// Lists installed voice pairs and the Kokoro catalog (installed or
-    /// downloadable), across all voice locations.
+    /// The narration voice list: the full Kokoro English catalog (voices
+    /// download on demand) plus system voices. Piper is retired from the
+    /// catalog per user decision — its engine code remains dormant.
     pub fn list_voices(&self) -> Vec<TtsVoiceInfo> {
-        let mut voices = Vec::new();
-        for dir in self.voices_dirs() {
-            let Ok(entries) = std::fs::read_dir(&dir) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let Some(stem) = file_stem_of_model(&path) else {
-                    continue;
-                };
-                if voices.iter().any(|voice: &TtsVoiceInfo| voice.id == *stem) {
-                    continue;
-                }
-                voices.push(voice_info(&stem, &path));
-            }
-        }
-        if let Some(dir) = kokoro::kokoro_dirs(&self.app).first() {
-            let _ = dir; // catalog is static; presence of any pack dir gates it
-            for (id, name, gender, accent) in kokoro::KOKORO_VOICE_SPECS {
-                if voices.iter().any(|voice| voice.id == *id) {
-                    continue;
-                }
-                voices.push(TtsVoiceInfo {
-                    id: id.to_string(),
-                    label: format!("{name} — English ({accent}, {gender})"),
-                    lang: "en-US".into(),
-                    engine: "kokoro".into(),
-                });
-            }
-        }
-        voices.sort_by(|a, b| a.id.cmp(&b.id));
+        let mut voices: Vec<TtsVoiceInfo> = kokoro::KOKORO_VOICE_SPECS
+            .iter()
+            .map(|(id, name, gender, accent)| TtsVoiceInfo {
+                id: id.to_string(),
+                label: format!("{name} ({accent}, {gender})"),
+                lang: "en-US".into(),
+                engine: "kokoro".into(),
+            })
+            .collect();
+        voices.sort_by(|a, b| a.label.cmp(&b.label));
         voices
+    }
+
+    /// Whether the Kokoro engine pack (model + tokenizer) is present in any
+    /// known location or installable location.
+    pub fn kokoro_pack_installed(&self) -> bool {
+        kokoro::kokoro_dirs(&self.app)
+            .iter()
+            .any(|dir| dir.join("model.onnx").is_file())
+    }
+
+    /// Where the Kokoro pack lives (existing location, else the install
+    /// target in app data).
+    pub fn kokoro_dir(&self) -> Result<PathBuf, String> {
+        if let Some(dir) = kokoro::kokoro_dirs(&self.app).into_iter().next() {
+            return Ok(dir);
+        }
+        self.install_kokoro_dir()
+    }
+
+    fn install_kokoro_dir(&self) -> Result<PathBuf, String> {
+        use tauri::Manager;
+        Ok(self
+            .app
+            .path()
+            .app_data_dir()
+            .map_err(|e| format!("app data dir: {e}"))?
+            .join("kokoro"))
+    }
+
+    /// Plays the settings-screen sample sentence in the given voice,
+    /// downloading the voice file (and the pack, if missing) first.
+    pub fn preview_voice(
+        &self,
+        app: &tauri::AppHandle,
+        voice: &str,
+        speed: f32,
+    ) -> Result<(), String> {
+        let dir = self.kokoro_dir()?;
+        if !dir.join("model.onnx").is_file() {
+            kokoro::download_kokoro_pack(app, &dir)?;
+        }
+        kokoro::download_voice(app, &dir, voice)?;
+        // A fresh voice file must not be hidden by a cached model handle.
+        self.kokoro.lock().unwrap().take();
+        kokoro::play_voice_sample(&dir, voice, speed)
     }
 
     fn voice(&self, id: &str) -> Result<Arc<LoadedVoice>, String> {
@@ -690,117 +715,6 @@ fn load_voice(model: &Path) -> Result<LoadedVoice, String> {
         length_scale: inference["length_scale"].as_f64().unwrap_or(1.0) as f32,
         noise_w: inference["noise_w"].as_f64().unwrap_or(0.8) as f32,
     })
-}
-
-/// Model files only: a `.onnx` whose `.onnx.json` config sits beside it
-/// (piper-plus drops optimized copies without configs — ignore those).
-fn file_stem_of_model(path: &Path) -> Option<String> {
-    if path.extension().and_then(|e| e.to_str()) != Some("onnx") {
-        return None;
-    }
-    let name = path.file_name()?.to_str()?;
-    if !path.with_file_name(format!("{name}.json")).is_file() {
-        return None;
-    }
-    Some(name.strip_suffix(".onnx")?.to_string())
-}
-
-/// Friendly metadata for a voice file stem like `es_AR-daniela-high`.
-fn voice_info(id: &str, model_path: &Path) -> TtsVoiceInfo {
-    let json_path = model_path.with_file_name(format!("{id}.onnx.json"));
-    let mut lang = id.split('-').next().unwrap_or("??").to_string();
-    if let Some(espeak) = std::fs::read_to_string(&json_path)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .and_then(|config| config["espeak"]["voice"].as_str().map(str::to_string))
-    {
-        lang = espeak.replace('-', "_");
-    }
-    let parts: Vec<&str> = id.split('-').collect();
-    let label = if parts.len() >= 2 {
-        format!(
-            "{} — {}{}",
-            capitalize(parts[1]),
-            language_name(&lang),
-            parts
-                .last()
-                .filter(|q| !q.is_empty())
-                .map(|q| format!(" ({q})"))
-                .unwrap_or_default()
-        )
-    } else {
-        id.to_string()
-    };
-    TtsVoiceInfo {
-        id: id.to_string(),
-        label,
-        lang,
-        engine: "piper".into(),
-    }
-}
-
-fn capitalize(word: &str) -> String {
-    let mut chars = word.chars();
-    match chars.next() {
-        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-        None => String::new(),
-    }
-}
-
-fn language_name(locale: &str) -> String {
-    match locale.split('_').next().unwrap_or(locale) {
-        "en" => "English".into(),
-        "es" => "Spanish".into(),
-        "pt" => "Portuguese".into(),
-        "fr" => "French".into(),
-        "de" => "German".into(),
-        "it" => "Italian".into(),
-        "sv" => "Swedish".into(),
-        other => other.to_string(),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Real-model smoke test across every installed voice; skipped when no
-    /// voices are installed (e.g. CI).
-    #[test]
-    fn synthesize_with_installed_voices() {
-        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let voices_dir = manifest_dir.join("../engine/voices");
-        let Ok(entries) = std::fs::read_dir(&voices_dir) else {
-            eprintln!("skipping: no voices directory");
-            return;
-        };
-        let models: Vec<PathBuf> = entries
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| file_stem_of_model(p).is_some())
-            .collect();
-        if models.is_empty() {
-            eprintln!("skipping: no voice models installed");
-            return;
-        }
-        for model in models {
-            let voice = load_voice(&model)
-                .unwrap_or_else(|e| panic!("voice load failed for {}: {e}", model.display()));
-            let text = if voice_info(&file_stem_of_model(&model).unwrap(), &model)
-                .lang
-                .starts_with("es")
-            {
-                "Hola mundo."
-            } else {
-                "Hello world."
-            };
-            let (audio, sample_rate) =
-                synthesize_with_config(&mut voice.engine.lock().unwrap(), &voice, text, 1.0)
-                    .unwrap_or_else(|e| panic!("synthesis failed for {}: {e}", model.display()));
-            assert!(sample_rate > 0, "{}: bad sample rate", model.display());
-            assert!(!audio.is_empty(), "{}: no audio produced", model.display());
-        }
-    }
 }
 
 #[cfg(test)]

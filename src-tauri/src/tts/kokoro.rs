@@ -358,14 +358,7 @@ pub fn download_kokoro_pack(app: &tauri::AppHandle, dir: &Path) -> Result<(), St
             format!("{HF_BASE}/tokenizer.json"),
             dir.join("tokenizer.json"),
         ),
-    ]
-    .into_iter()
-    .chain(KOKORO_VOICE_SPECS.iter().map(|(id, ..)| {
-        (
-            format!("{HF_BASE}/voices/{id}.bin"),
-            dir.join("voices").join(format!("{id}.bin")),
-        )
-    })) {
+    ] {
         if path.is_file() {
             continue;
         }
@@ -410,6 +403,101 @@ pub fn download_kokoro_pack(app: &tauri::AppHandle, dir: &Path) -> Result<(), St
         emit(Event::Progress { downloaded });
     }
     emit(Event::Done);
+    Ok(())
+}
+
+/// Downloads one voice's style file on demand (~0.5 MB). Emits the same
+/// `kokoro-download` events so the UI can reflect progress.
+pub fn download_voice(app: &tauri::AppHandle, dir: &Path, voice: &str) -> Result<(), String> {
+    if !KOKORO_VOICE_SPECS.iter().any(|(id, ..)| *id == voice) {
+        return Err(format!("unknown voice '{voice}'"));
+    }
+    let path = dir.join("voices").join(format!("{voice}.bin"));
+    if path.is_file() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(dir.join("voices")).map_err(|e| format!("voices dir: {e}"))?;
+
+    #[derive(Serialize, Clone)]
+    #[serde(rename_all = "camelCase", tag = "kind")]
+    enum Event {
+        VoiceStarted { voice: String },
+        VoiceDone { voice: String },
+        Failed { reason: String },
+    }
+    let emit = |event: Event| {
+        let _ = app.emit("kokoro-download", event);
+    };
+    emit(Event::VoiceStarted {
+        voice: voice.to_string(),
+    });
+
+    let url = format!("{HF_BASE}/voices/{voice}.bin");
+    let agent = ureq::Agent::new_with_config(
+        ureq::config::Config::builder()
+            .timeout_global(Some(std::time::Duration::from_secs(120)))
+            .build(),
+    );
+    let expected = head_content_length(&url);
+    let mut downloaded = 0u64;
+    let mut last_reported = 0u64;
+    let mut report = |_bytes: u64| {};
+    match download_file(
+        &agent,
+        &url,
+        &path,
+        expected,
+        &mut downloaded,
+        &mut last_reported,
+        &mut report,
+    ) {
+        Ok(()) => {
+            emit(Event::VoiceDone {
+                voice: voice.to_string(),
+            });
+            Ok(())
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(path.with_extension("part"));
+            let reason = format!("downloading voice '{voice}': {e}");
+            emit(Event::Failed {
+                reason: reason.clone(),
+            });
+            Err(reason)
+        }
+    }
+}
+
+/// The sentence spoken when sampling a voice from settings.
+pub const SAMPLE_SENTENCE: &str = "This is a sample of how this voice reads your books.";
+
+/// Synthesizes the sample sentence in the given voice and plays it. Used by
+/// the settings screen's per-voice preview button.
+pub fn play_voice_sample(dir: &Path, voice: &str, speed: f32) -> Result<(), String> {
+    let model = KokoroModel::load(dir)?;
+    let (samples, sample_rate) = model.synthesize(dir, SAMPLE_SENTENCE, voice, speed)?;
+    if samples.is_empty() {
+        return Err("voice produced no audio".into());
+    }
+    // Sample playback is fire-and-forget on its own audio player; the
+    // narration engine is untouched.
+    std::thread::spawn(move || {
+        let Ok(_env) = piper_plus::ort_env::environment() else {
+            return;
+        };
+        let Ok(sink) = rodio::DeviceSinkBuilder::open_default_sink() else {
+            return;
+        };
+        let player = rodio::Player::connect_new(sink.mixer());
+        let (channels, rate) = (
+            rodio::ChannelCount::new(1),
+            rodio::SampleRate::new(sample_rate),
+        );
+        if let (Some(channels), Some(rate)) = (channels, rate) {
+            player.append(rodio::buffer::SamplesBuffer::new(channels, rate, samples));
+            player.sleep_until_end();
+        }
+    });
     Ok(())
 }
 

@@ -8,6 +8,8 @@ import Library from "./Library";
 import Sidebar, { type SidebarTab } from "./Sidebar";
 import SearchBar from "./SearchBar";
 import NarrationPanel from "./NarrationPanel";
+import SettingsScreen from "./SettingsScreen";
+import NarrationBar from "./NarrationBar";
 import { useNarration } from "./narration";
 import {
   bookProgressSave,
@@ -85,7 +87,7 @@ export default function App() {
   const [page, setPage] = useState(0);
   const [resume, setResume] = useState<{ page: number; offset: number } | null>(null);
 
-  const [mode, setMode] = useState<ReadMode>("paged");
+  const [mode, setMode] = useState<ReadMode>("scroll");
   const [zoom, setZoom] = useState<ZoomMode>({ kind: "fitWidth" });
   const [theme, setTheme] = useState<Theme>("day");
   const [spread, setSpread] = useState(false);
@@ -109,6 +111,7 @@ export default function App() {
   }>({ open: false, query: "", results: [], active: 0, searching: false });
 
   const [narrationOpen, setNarrationOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [narrationVoice, setNarrationVoice] = useState("");
   const [narrationRate, setNarrationRate] = useState(1);
   const [narrationContinuous, setNarrationContinuous] = useState(true);
@@ -131,7 +134,7 @@ export default function App() {
       try {
         const stored = await settingsAll();
         const hydrated = settingsFromStorage(stored, {
-          mode: "paged",
+          mode: "scroll",
           theme: "day",
           zoom: { kind: "fitWidth" },
           spread: false,
@@ -212,13 +215,6 @@ export default function App() {
     (z: ZoomMode) => {
       setZoom(z);
       persist("zoom", z);
-    },
-    [persist],
-  );
-  const changeSpread = useCallback(
-    (s: boolean) => {
-      setSpread(s);
-      persist("spread", s);
     },
     [persist],
   );
@@ -749,14 +745,11 @@ export default function App() {
           pageCount={current?.doc.pageCount ?? 0}
           page={page}
           onPageChange={changePage}
-          mode={mode}
-          onModeChange={changeMode}
           zoom={zoom}
           onZoomChange={changeZoom}
-          theme={theme}
-          onThemeChange={changeTheme}
           onOpen={pickFile}
           onLibrary={goLibrary}
+          onSettings={() => setSettingsOpen(true)}
           disabled={!current}
           sidebarOpen={sidebarTab !== null}
           onToggleSidebar={() => setSidebarTab((t) => (t === null ? "outline" : null))}
@@ -768,8 +761,6 @@ export default function App() {
           onForward={goForward}
           canBack={history.length > 0}
           canForward={future.length > 0}
-          spread={spread}
-          onSpreadChange={changeSpread}
         />
       ) : (
         <header className="toolbar library-bar">
@@ -831,12 +822,12 @@ export default function App() {
             )}
             <Reader
               doc={current.doc}
+              mode={mode}
               dims={dims}
               page={page}
               onPageChange={changePage}
               onProgress={handleProgress}
               resume={resume}
-              mode={mode}
               zoom={zoom}
               theme={theme}
               spread={spread}
@@ -854,6 +845,26 @@ export default function App() {
           onOpenBook={(book) => void openPath(book.path)}
           onOpenFile={pickFile}
           onRemoveBook={(book) => void removeBook(book)}
+        />
+      )}
+
+      {settingsOpen && (
+        <SettingsScreen
+          mode={mode}
+          onClose={() => setSettingsOpen(false)}
+          onModeChange={changeMode}
+          theme={theme}
+          onThemeChange={changeTheme}
+          narration={narration}
+        />
+      )}
+
+      {view === "reader" && current && (
+        <NarrationBar
+          narration={narration}
+          currentPage={page}
+          pageCount={current.doc.pageCount}
+          onPageChange={changePage}
         />
       )}
 

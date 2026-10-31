@@ -214,6 +214,24 @@ pub fn tts_voices(engine: tauri::State<'_, Arc<TtsEngine>>) -> Result<Vec<TtsVoi
     Ok(engine.list_voices())
 }
 
+/// Whether the Kokoro engine pack (model + tokenizer) is installed.
+#[tauri::command]
+pub fn tts_pack_installed(engine: tauri::State<'_, Arc<TtsEngine>>) -> Result<bool, String> {
+    Ok(engine.kokoro_pack_installed())
+}
+
+/// Speaks the sample sentence in a voice for the settings screen,
+/// downloading whatever is missing first.
+#[tauri::command]
+pub fn tts_preview_voice(
+    engine: tauri::State<'_, Arc<TtsEngine>>,
+    app: tauri::AppHandle,
+    voice: String,
+    speed: f64,
+) -> Result<(), String> {
+    engine.preview_voice(&app, &voice, speed as f32)
+}
+
 #[tauri::command]
 pub fn tts_speak(
     engine: tauri::State<'_, Arc<TtsEngine>>,
