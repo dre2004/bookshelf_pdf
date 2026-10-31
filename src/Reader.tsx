@@ -136,10 +136,7 @@ function PageImage({
   activeHitKey,
   onAddHighlight,
 }: PageImageProps) {
-  // Status is keyed by URL: a cached image can fire `load` before React
-  // commits, so a plain reset-on-url-change state machine races and can
-  // leave the spinner stuck. Stale events for an old URL are ignored, and
-  // the ref check below catches images that finished before this mounted.
+  // Load status is keyed by URL (see the note at the <img> below).
   const [status, setStatus] = useState<{
     url: string;
     state: "loading" | "loaded" | "failed";
@@ -232,11 +229,13 @@ function PageImage({
           <p className="muted">Try zooming or reopening the document.</p>
         </div>
       )}
+      {/* Load status is keyed by URL: events for a previous URL can never
+          corrupt the current one, so cached images that fire `load` at any
+          point relative to commits are handled by onLoad alone. Do NOT add a
+          ref callback here — setState from an inline ref re-attaches it every
+          render and loops (that blanked 0.2.0). */}
       <img
         key={url}
-        ref={(el) => {
-          if (el?.complete && el.naturalWidth > 0) setStatus({ url, state: "loaded" });
-        }}
         src={url}
         width={Math.round(cssWidth)}
         height={Math.round(cssHeight)}

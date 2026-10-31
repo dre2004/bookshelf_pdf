@@ -944,3 +944,29 @@ body,
 .splash.theme-night .splash-card {
   color: #c9cbd1;
 }
+
+/* ---------- crash screen ---------- */
+
+.crash-screen {
+  height: 100%;
+  overflow: auto;
+  padding: 40px;
+  background: #26272b;
+  color: #f3d6d8;
+}
+
+.crash-screen h2 {
+  margin-top: 0;
+}
+
+.crash-message {
+  color: #ff8a8a;
+  white-space: pre-wrap;
+}
+
+.crash-stack {
+  font-size: 11px;
+  white-space: pre-wrap;
+  max-height: 40vh;
+  overflow: auto;
+}
