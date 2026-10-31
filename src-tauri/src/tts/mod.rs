@@ -139,14 +139,24 @@ fn gap_samples(
     if is_last {
         return Vec::new();
     }
-    if is_heading {
-        return vec![0.0; sample_rate as usize * 65 / 100]; // 650 ms
-    }
-    if ends_paragraph {
-        return vec![0.0; sample_rate as usize * 40 / 100]; // 400 ms
-    }
-    Vec::new()
+    let milliseconds = if is_heading {
+        // Professional audiobook standard: 2.0-2.5 s after a section
+        // heading (narratorsroadmap.com standards for silence).
+        HEADING_PAUSE_MS
+    } else if ends_paragraph {
+        // ~0.75-1.0 s standard between paragraphs.
+        PARAGRAPH_PAUSE_MS
+    } else {
+        // ~0.5 s between sentences; the engine's own prosody handles
+        // pauses inside a multi-sentence selection.
+        SENTENCE_PAUSE_MS
+    };
+    vec![0.0; sample_rate as usize * milliseconds as usize / 1000]
 }
+
+const HEADING_PAUSE_MS: u32 = 2200;
+const PARAGRAPH_PAUSE_MS: u32 = 800;
+const SENTENCE_PAUSE_MS: u32 = 400;
 
 /// Heading detection, in order of confidence:
 /// 1. The chunk matches a PDF outline title (the sidebar's own TOC) —
@@ -464,7 +474,10 @@ impl TtsEngine {
             }
         };
 
-        let rate = rate.clamp(0.5, 2.0);
+        // Panel speed is calibrated: 1.0x plays at 0.95 of raw engine
+        // speed per user tuning; the slider stays honest about ratios.
+        let rate = rate.clamp(0.5, 2.0) * SPEED_CALIBRATION;
+        const SPEED_CALIBRATION: f32 = 0.95;
         let text_chars: Vec<char> = text.chars().collect();
         let chunks = split_for_narration(&text, &paragraph_breaks);
         let last_chunk = chunks.last().copied().unwrap_or((0, 0));
@@ -795,19 +808,22 @@ mod pause_tests {
     use super::*;
 
     #[test]
-    fn heading_chunks_get_a_long_pause() {
-        let gap = gap_samples(true, false, false, 24_000);
-        assert_eq!(gap.len(), 24_000 * 65 / 100);
-        let none = gap_samples(false, false, false, 24_000);
-        assert!(none.is_empty());
-    }
-
-    #[test]
-    fn paragraph_and_last_chunk_pauses() {
-        let paragraph = gap_samples(false, true, false, 24_000);
-        assert_eq!(paragraph.len(), 24_000 * 40 / 100);
-        let last = gap_samples(true, true, true, 24_000);
-        assert!(last.is_empty());
+    fn pause_durations_match_narration_standards() {
+        // 2.2 s after headings, 0.8 s between paragraphs, 0.4 s between
+        // sentence groups; never a trailing pause on the final chunk.
+        assert_eq!(
+            gap_samples(true, false, false, 24_000).len(),
+            24_000 * 2200 / 1000
+        );
+        assert_eq!(
+            gap_samples(false, true, false, 24_000).len(),
+            24_000 * 800 / 1000
+        );
+        assert_eq!(
+            gap_samples(false, false, false, 24_000).len(),
+            24_000 * 400 / 1000
+        );
+        assert!(gap_samples(true, true, true, 24_000).is_empty());
     }
 
     #[test]
