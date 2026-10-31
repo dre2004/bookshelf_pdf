@@ -1,5 +1,16 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { ApiError, BookState, BookSummary, DocumentInfo, PageInfo } from "./types";
+import type {
+  ApiError,
+  Bookmark,
+  BookState,
+  BookSummary,
+  DocumentInfo,
+  Highlight,
+  OutlineNode,
+  PageTextData,
+  PageInfo,
+  SearchMatch,
+} from "./types";
 
 export async function openDocument(path: string, password?: string): Promise<DocumentInfo> {
   return invoke<DocumentInfo>("open_document", { path, password: password ?? null });
@@ -71,4 +82,97 @@ export async function settingsAll(): Promise<Record<string, string>> {
 
 export async function settingsSet(key: string, value: string): Promise<void> {
   return invoke("settings_set", { key, value });
+}
+
+// ---- text, search, outline ----
+
+export async function getPageText(docId: number, page: number): Promise<PageTextData> {
+  return invoke<PageTextData>("get_page_text", { docId, page });
+}
+
+export async function searchDocument(
+  docId: number,
+  query: string,
+  caseSensitive: boolean,
+): Promise<SearchMatch[]> {
+  return invoke<SearchMatch[]>("search_document", { docId, query, caseSensitive });
+}
+
+export async function getOutline(docId: number): Promise<OutlineNode[]> {
+  return invoke<OutlineNode[]>("get_outline", { docId });
+}
+
+// ---- bookmarks ----
+
+export async function bookmarksAdd(
+  bookId: number,
+  page: number,
+  offset: number,
+  title: string,
+): Promise<Bookmark> {
+  return invoke<Bookmark>("bookmarks_add", { bookId, page, offset, title });
+}
+
+export async function bookmarksRemove(bookmarkId: number): Promise<void> {
+  return invoke("bookmarks_remove", { bookmarkId });
+}
+
+export async function bookmarksList(bookId: number): Promise<Bookmark[]> {
+  return invoke<Bookmark[]>("bookmarks_list", { bookId });
+}
+
+// ---- highlights ----
+
+export async function highlightsAdd(entry: {
+  bookId: number;
+  page: number;
+  startChar: number;
+  endChar: number;
+  text: string;
+  color: string;
+  note: string;
+}): Promise<Highlight> {
+  return invoke<Highlight>("highlights_add", { entry });
+}
+
+export async function highlightsUpdate(
+  highlightId: number,
+  color?: string,
+  note?: string,
+): Promise<void> {
+  return invoke("highlights_update", {
+    highlightId,
+    color: color ?? null,
+    note: note ?? null,
+  });
+}
+
+export async function highlightsRemove(highlightId: number): Promise<void> {
+  return invoke("highlights_remove", { highlightId });
+}
+
+export async function highlightsList(bookId: number): Promise<Highlight[]> {
+  return invoke<Highlight[]>("highlights_list", { bookId });
+}
+
+// ---- text data cache (shared by text layer, search and highlight overlays) ----
+
+const textCache = new Map<string, Promise<PageTextData>>();
+const TEXT_CACHE_MAX = 80;
+
+export function cachedPageText(docId: number, page: number): Promise<PageTextData> {
+  const key = `${docId}:${page}`;
+  let entry = textCache.get(key);
+  if (!entry) {
+    entry = getPageText(docId, page).catch((e) => {
+      textCache.delete(key);
+      throw e;
+    });
+    textCache.set(key, entry);
+    if (textCache.size > TEXT_CACHE_MAX) {
+      const oldest = textCache.keys().next().value;
+      if (oldest !== undefined) textCache.delete(oldest);
+    }
+  }
+  return entry;
 }

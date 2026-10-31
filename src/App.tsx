@@ -3,20 +3,43 @@ import { ask, open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import Toolbar from "./Toolbar";
 import Reader from "./Reader";
 import Library from "./Library";
+import Sidebar, { type SidebarTab } from "./Sidebar";
+import SearchBar from "./SearchBar";
 import {
   bookProgressSave,
   bookRegister,
   bookState,
+  bookmarksAdd,
+  bookmarksList,
+  bookmarksRemove,
   closeDocument,
   getPageDims,
+  getOutline,
+  highlightsAdd,
+  highlightsList,
+  highlightsRemove,
+  highlightsUpdate,
   libraryList,
   libraryRemove,
   openDocument,
+  searchDocument,
   settingsAll,
   settingsSet,
   toApiError,
 } from "./api";
-import type { BookSummary, DocumentInfo, PageInfo, ReadMode, Theme, ZoomMode } from "./types";
+import type {
+  BookSummary,
+  Bookmark,
+  DocumentInfo,
+  Highlight,
+  HighlightColor,
+  OutlineNode,
+  PageInfo,
+  ReadMode,
+  SearchMatch,
+  Theme,
+  ZoomMode,
+} from "./types";
 import { settingsFromStorage } from "./settings";
 import "./App.css";
 
@@ -31,6 +54,7 @@ interface CurrentBook {
 
 const DIM_BATCH = 100;
 const SAVE_DEBOUNCE_MS = 700;
+const SEARCH_DEBOUNCE_MS = 250;
 
 function describeError(e: unknown): string {
   const api = toApiError(e);
@@ -39,6 +63,10 @@ function describeError(e: unknown): string {
     return api.reason ? `${label}: ${api.reason}` : label;
   }
   return String(e);
+}
+
+function hitKey(hit: SearchMatch): string {
+  return `${hit.page}:${hit.start}:${hit.end}`;
 }
 
 export default function App() {
@@ -54,7 +82,21 @@ export default function App() {
   const [mode, setMode] = useState<ReadMode>("paged");
   const [zoom, setZoom] = useState<ZoomMode>({ kind: "fitWidth" });
   const [theme, setTheme] = useState<Theme>("day");
+  const [spread, setSpread] = useState(false);
   const settingsReady = useRef(false);
+
+  const [sidebarTab, setSidebarTab] = useState<SidebarTab | null>(null);
+  const [outline, setOutline] = useState<OutlineNode[]>([]);
+  const [bookmarks, setBookmarks] = useState<Bookmark[]>([]);
+  const [highlights, setHighlights] = useState<Highlight[]>([]);
+
+  const [search, setSearch] = useState<{
+    open: boolean;
+    query: string;
+    results: SearchMatch[];
+    active: number;
+    searching: boolean;
+  }>({ open: false, query: "", results: [], active: 0, searching: false });
 
   const [error, setError] = useState<string | null>(null);
   const [passwordFor, setPasswordFor] = useState<{ path: string; incorrect: boolean } | null>(null);
@@ -63,6 +105,8 @@ export default function App() {
   const currentRef = useRef<CurrentBook | null>(null);
   const saveTimer = useRef<number | null>(null);
   const lastProgress = useRef<{ bookId: number; page: number; offset: number } | null>(null);
+  const searchTimer = useRef<number | null>(null);
+  const searchSeq = useRef(0);
 
   // ---- boot: hydrate persisted settings and the library ----
   useEffect(() => {
@@ -73,10 +117,12 @@ export default function App() {
           mode: "paged",
           theme: "day",
           zoom: { kind: "fitWidth" },
+          spread: false,
         });
         setMode(hydrated.mode);
         setTheme(hydrated.theme);
         setZoom(hydrated.zoom);
+        setSpread(hydrated.spread);
         settingsReady.current = true;
       } catch {
         settingsReady.current = true;
@@ -117,6 +163,13 @@ export default function App() {
     },
     [persist],
   );
+  const changeSpread = useCallback(
+    (s: boolean) => {
+      setSpread(s);
+      persist("spread", s);
+    },
+    [persist],
+  );
 
   const refreshLibrary = useCallback(async () => {
     try {
@@ -149,7 +202,6 @@ export default function App() {
     [flushProgress],
   );
 
-  // Flush any pending progress when the app is hidden or closed.
   useEffect(() => {
     const flush = () => flushProgress();
     window.addEventListener("visibilitychange", flush);
@@ -202,8 +254,25 @@ export default function App() {
         setPasswordFor(null);
         setPassword("");
         setView("reader");
+        setOutline([]);
+        setBookmarks([]);
+        setHighlights([]);
+        setSearch((s) => ({ ...s, open: false, query: "", results: [], active: 0 }));
+
         if (previous) void closeDocument(previous.doc.docId).catch(() => {});
         void refreshLibrary();
+
+        if (bookId >= 0) {
+          getOutline(doc.docId)
+            .then(setOutline)
+            .catch(() => {});
+          bookmarksList(bookId)
+            .then(setBookmarks)
+            .catch(() => {});
+          highlightsList(bookId)
+            .then(setHighlights)
+            .catch(() => {});
+        }
       } catch (e) {
         const api = toApiError(e);
         if (api && (api.code === "password_required" || api.code === "password_incorrect")) {
@@ -229,6 +298,7 @@ export default function App() {
   const goLibrary = useCallback(() => {
     flushProgress();
     setView("library");
+    setSearch((s) => ({ ...s, open: false }));
     void refreshLibrary();
   }, [flushProgress, refreshLibrary]);
 
@@ -270,6 +340,155 @@ export default function App() {
     [scheduleSave],
   );
 
+  /** Jump to a page (and fractional position) from sidebar/search actions. */
+  const jumpTo = useCallback(
+    (target: number, offset = 0) => {
+      changePage(target);
+      if (mode === "scroll" && offset > 0) {
+        // The reader applies offsets only on document restore; approximate a
+        // within-page jump by scrolling after the page settles.
+        window.setTimeout(() => {
+          const container = document.querySelector<HTMLElement>(".reader.scroll-mode");
+          const pages = container?.querySelectorAll<HTMLElement>(".lazy-page");
+          const el = pages?.[target];
+          if (container && el) {
+            container.scrollTop = el.offsetTop - 12 + offset * el.offsetHeight;
+          }
+        }, 60);
+      }
+    },
+    [changePage, mode],
+  );
+
+  // ---- bookmarks ----
+  const addBookmarkNow = useCallback(async () => {
+    const book = currentRef.current;
+    if (!book || book.bookId < 0) return;
+    const progress = lastProgress.current;
+    const targetPage = page;
+    const offset = progress && progress.page === page ? progress.offset : 0;
+    try {
+      await bookmarksAdd(book.bookId, targetPage, offset, `Page ${targetPage + 1}`);
+      setBookmarks(await bookmarksList(book.bookId));
+      setSidebarTab("bookmarks");
+    } catch (e) {
+      setError(describeError(e));
+    }
+  }, [page]);
+
+  const removeBookmark = useCallback(
+    async (bookmark: Bookmark) => {
+      const book = currentRef.current;
+      if (!book) return;
+      try {
+        await bookmarksRemove(bookmark.id);
+        setBookmarks(await bookmarksList(book.bookId));
+      } catch (e) {
+        setError(describeError(e));
+      }
+    },
+    [],
+  );
+
+  // ---- highlights ----
+  const addHighlight = useCallback(
+    async (hlPage: number, start: number, end: number, text: string, color: HighlightColor) => {
+      const book = currentRef.current;
+      if (!book || book.bookId < 0) return;
+      try {
+        await highlightsAdd({
+          bookId: book.bookId,
+          page: hlPage,
+          startChar: start,
+          endChar: end,
+          text,
+          color,
+          note: "",
+        });
+        setHighlights(await highlightsList(book.bookId));
+      } catch (e) {
+        setError(describeError(e));
+      }
+    },
+    [],
+  );
+
+  const removeHighlight = useCallback(async (highlight: Highlight) => {
+    const book = currentRef.current;
+    if (!book) return;
+    try {
+      await highlightsRemove(highlight.id);
+      setHighlights(await highlightsList(book.bookId));
+    } catch (e) {
+      setError(describeError(e));
+    }
+  }, []);
+
+  const setHighlightColor = useCallback(
+    async (highlight: Highlight, color: string) => {
+      const book = currentRef.current;
+      if (!book) return;
+      try {
+        await highlightsUpdate(highlight.id, color);
+        setHighlights(await highlightsList(book.bookId));
+      } catch (e) {
+        setError(describeError(e));
+      }
+    },
+    [],
+  );
+
+  const setHighlightNote = useCallback(
+    async (highlight: Highlight, note: string) => {
+      const book = currentRef.current;
+      if (!book) return;
+      try {
+        await highlightsUpdate(highlight.id, undefined, note);
+        setHighlights(await highlightsList(book.bookId));
+      } catch (e) {
+        setError(describeError(e));
+      }
+    },
+    [],
+  );
+
+  // ---- search ----
+  const runSearch = useCallback((query: string) => {
+    const book = currentRef.current;
+    if (searchTimer.current !== null) window.clearTimeout(searchTimer.current);
+    if (!book || !query) {
+      setSearch((s) => ({ ...s, results: [], active: 0, searching: false }));
+      return;
+    }
+    setSearch((s) => ({ ...s, searching: true }));
+    const seq = ++searchSeq.current;
+    searchTimer.current = window.setTimeout(() => {
+      searchDocument(book.doc.docId, query, false)
+        .then((results) => {
+          if (searchSeq.current !== seq) return;
+          setSearch((s) => ({ ...s, results, active: 0, searching: false }));
+          if (results.length > 0) jumpTo(results[0].page);
+        })
+        .catch(() => {
+          if (searchSeq.current === seq) {
+            setSearch((s) => ({ ...s, results: [], active: 0, searching: false }));
+          }
+        });
+    }, SEARCH_DEBOUNCE_MS);
+  }, [jumpTo]);
+
+  const stepSearch = useCallback(
+    (direction: 1 | -1) => {
+      setSearch((s) => {
+        if (s.results.length === 0) return s;
+        const next = (s.active + direction + s.results.length) % s.results.length;
+        jumpTo(s.results[next].page);
+        return { ...s, active: next };
+      });
+    },
+    [jumpTo],
+  );
+
   // Fetch remaining page dimensions in the background for long documents.
   useEffect(() => {
     if (!current) return;
@@ -295,22 +514,35 @@ export default function App() {
     };
   }, [current]);
 
-  // Keyboard navigation (reader view only)
+  // Keyboard shortcuts (reader view only)
   useEffect(() => {
     if (!current || passwordFor || view !== "reader") return;
     const handler = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement;
-      if (target.tagName === "INPUT" || target.tagName === "TEXTAREA") return;
+      const typing = target.tagName === "INPUT" || target.tagName === "TEXTAREA";
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "f") {
+        e.preventDefault();
+        setSearch((s) => ({ ...s, open: true }));
+        return;
+      }
+      if (typing) return;
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "b") {
+        e.preventDefault();
+        void addBookmarkNow();
+        return;
+      }
       const last = current.doc.pageCount - 1;
+      const step = mode === "paged" && spread ? 2 : 1;
       switch (e.key) {
         case "Escape":
-          goLibrary();
+          if (search.open) setSearch((s) => ({ ...s, open: false }));
+          else goLibrary();
           break;
         case "PageDown":
         case "ArrowRight":
         case " ":
           setPage((p) => {
-            const next = Math.min(last, p + 1);
+            const next = Math.min(last, p + (mode === "paged" ? step : 1));
             if (next !== p && mode === "paged") scheduleSave(current.bookId, next, 0);
             return next;
           });
@@ -319,7 +551,7 @@ export default function App() {
         case "PageUp":
         case "ArrowLeft":
           setPage((p) => {
-            const next = Math.max(0, p - 1);
+            const next = Math.max(0, p - (mode === "paged" ? step : 1));
             if (next !== p && mode === "paged") scheduleSave(current.bookId, next, 0);
             return next;
           });
@@ -356,11 +588,28 @@ export default function App() {
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [current, passwordFor, view, mode, zoom, changeZoom, goLibrary, pickFile, scheduleSave]);
+  }, [
+    current,
+    passwordFor,
+    view,
+    mode,
+    zoom,
+    spread,
+    search.open,
+    goLibrary,
+    pickFile,
+    scheduleSave,
+    changeZoom,
+    addBookmarkNow,
+  ]);
 
   if (!ready) {
     return <div className="boot-screen" />;
   }
+
+  const activeHit = search.open && search.results.length > 0
+    ? hitKey(search.results[search.active])
+    : null;
 
   return (
     <div className="app">
@@ -379,6 +628,12 @@ export default function App() {
           onOpen={pickFile}
           onLibrary={goLibrary}
           disabled={!current}
+          sidebarOpen={sidebarTab !== null}
+          onToggleSidebar={() => setSidebarTab((t) => (t === null ? "outline" : null))}
+          onSearch={() => setSearch((s) => ({ ...s, open: true }))}
+          onAddBookmark={() => void addBookmarkNow()}
+          spread={spread}
+          onSpreadChange={changeSpread}
         />
       ) : (
         <header className="toolbar library-bar">
@@ -396,17 +651,59 @@ export default function App() {
       )}
 
       {view === "reader" && current ? (
-        <Reader
-          doc={current.doc}
-          dims={dims}
-          page={page}
-          onPageChange={changePage}
-          onProgress={handleProgress}
-          resume={resume}
-          mode={mode}
-          zoom={zoom}
-          theme={theme}
-        />
+        <div className="reader-row">
+          {sidebarTab !== null && (
+            <Sidebar
+              tab={sidebarTab}
+              onTabChange={setSidebarTab}
+              doc={current.doc}
+              dims={dims}
+              page={page}
+              onJumpPage={jumpTo}
+              outline={outline}
+              bookmarks={bookmarks}
+              onAddBookmark={() => void addBookmarkNow()}
+              onRemoveBookmark={(b) => void removeBookmark(b)}
+              highlights={highlights}
+              onRemoveHighlight={(h) => void removeHighlight(h)}
+              onHighlightColorChange={(h, c) => void setHighlightColor(h, c)}
+              onHighlightNoteChange={(h, n) => void setHighlightNote(h, n)}
+            />
+          )}
+          <div className="reader-stack">
+            {search.open && (
+              <SearchBar
+                query={search.query}
+                onQueryChange={(query) => {
+                  setSearch((s) => ({ ...s, query }));
+                  runSearch(query);
+                }}
+                resultCount={search.results.length}
+                activeIndex={search.active}
+                onNext={() => stepSearch(1)}
+                onPrev={() => stepSearch(-1)}
+                onClose={() => setSearch((s) => ({ ...s, open: false }))}
+                searching={search.searching}
+              />
+            )}
+            <Reader
+              doc={current.doc}
+              dims={dims}
+              page={page}
+              onPageChange={changePage}
+              onProgress={handleProgress}
+              resume={resume}
+              mode={mode}
+              zoom={zoom}
+              theme={theme}
+              spread={spread}
+              highlights={highlights}
+              searchHits={search.open ? search.results : []}
+              activeHitKey={activeHit}
+              onAddHighlight={(p, s2, e2, text, color) => void addHighlight(p, s2, e2, text, color)}
+            />
+          </div>
+        </div>
       ) : (
         <Library
           books={library}

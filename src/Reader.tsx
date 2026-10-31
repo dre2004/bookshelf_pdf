@@ -1,6 +1,16 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { pageImageUrl } from "./api";
-import type { DocumentInfo, PageInfo, ReadMode, Theme, ZoomMode } from "./types";
+import {
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type ReactNode,
+} from "react";
+import { cachedPageText, pageImageUrl } from "./api";
+import { rangeBoxes, type OverlayBox } from "./textOverlay";
+import { HIGHLIGHT_COLORS, type HighlightColor, type PageTextData } from "./types";
+import type { DocumentInfo, Highlight, PageInfo, ReadMode, SearchMatch, Theme, ZoomMode } from "./types";
 
 const PAD = 32;
 const A4: PageInfo = { width: 595, height: 842 };
@@ -31,14 +41,101 @@ function useElementSize<T extends HTMLElement>() {
   return [ref, size] as const;
 }
 
+/** Invisible, selectable copy of the page text aligned with the rendered image. */
+function TextLayer({
+  text,
+  cssWidth,
+  cssHeight,
+}: {
+  text: PageTextData;
+  cssWidth: number;
+  cssHeight: number;
+}) {
+  const spans = useMemo(() => {
+    const sx = cssWidth / text.width;
+    const sy = cssHeight / text.height;
+    const out: ReactNode[] = [];
+    for (let i = 0; i < text.chars.length; i++) {
+      const w = text.boxes[i * 4 + 2] ?? 0;
+      const h = text.boxes[i * 4 + 3] ?? 0;
+      if (w <= 0 || h <= 0) continue;
+      const x = (text.boxes[i * 4] ?? 0) * sx;
+      const y = (text.height - ((text.boxes[i * 4 + 1] ?? 0) + h)) * sy;
+      const style: CSSProperties = {
+        left: `${x}px`,
+        top: `${y}px`,
+        width: `${w * sx}px`,
+        height: `${h * sy}px`,
+        fontSize: `${h * sy}px`,
+        lineHeight: `${h * sy}px`,
+      };
+      out.push(
+        <span key={i} data-i={i} style={style}>
+          {text.chars[i] === " " ? "\u00a0" : text.chars[i]}
+        </span>,
+      );
+    }
+    return out;
+  }, [text, cssWidth, cssHeight]);
+
+  return <>{spans}</>;
+}
+
+function OverlayBoxes({ boxes, className }: { boxes: OverlayBox[]; className: string }) {
+  return (
+    <div className={`overlay ${className}`} aria-hidden="true">
+      {boxes.map((box, i) => (
+        <div
+          key={i}
+          className="overlay-box"
+          style={{
+            left: `${box.left}px`,
+            top: `${box.top}px`,
+            width: `${box.width}px`,
+            height: `${box.height}px`,
+          }}
+        />
+      ))}
+    </div>
+  );
+}
+
+interface SelectionMenuState {
+  x: number;
+  y: number;
+  page: number;
+  start: number;
+  end: number;
+  text: string;
+}
+
 interface PageImageProps {
   docId: number;
   index: number;
   cssWidth: number;
   cssHeight: number;
+  highlights: Highlight[];
+  searchHits: SearchMatch[];
+  activeHitKey: string | null;
+  onAddHighlight: (
+    page: number,
+    start: number,
+    end: number,
+    text: string,
+    color: HighlightColor,
+  ) => void;
 }
 
-function PageImage({ docId, index, cssWidth, cssHeight }: PageImageProps) {
+function PageImage({
+  docId,
+  index,
+  cssWidth,
+  cssHeight,
+  highlights,
+  searchHits,
+  activeHitKey,
+  onAddHighlight,
+}: PageImageProps) {
   // Status is keyed by URL: a cached image can fire `load` before React
   // commits, so a plain reset-on-url-change state machine races and can
   // leave the spinner stuck. Stale events for an old URL are ignored, and
@@ -49,6 +146,82 @@ function PageImage({ docId, index, cssWidth, cssHeight }: PageImageProps) {
   } | null>(null);
   const url = pageImageUrl(docId, index, renderWidth(cssWidth));
   const state = status?.url === url ? status.state : "loading";
+
+  const [text, setText] = useState<PageTextData | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    cachedPageText(docId, index)
+      .then((data) => {
+        if (!cancelled) setText(data);
+      })
+      .catch(() => {
+        /* page stays without a text layer; image still renders */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [docId, index]);
+
+  const [menu, setMenu] = useState<SelectionMenuState | null>(null);
+
+  const highlightBoxes = useMemo(() => {
+    if (!text) return new Map<string, OverlayBox[]>();
+    const byColor = new Map<string, OverlayBox[]>();
+    for (const hl of highlights) {
+      const boxes = rangeBoxes(text, hl.startChar, hl.endChar, cssWidth, cssHeight);
+      byColor.set(
+        `${hl.id}`,
+        boxes,
+      );
+    }
+    return byColor;
+  }, [text, highlights, cssWidth, cssHeight]);
+
+  const searchBoxes = useMemo(() => {
+    if (!text) return { all: [] as OverlayBox[], active: [] as OverlayBox[] };
+    const all: OverlayBox[] = [];
+    const active: OverlayBox[] = [];
+    for (const hit of searchHits) {
+      const boxes = rangeBoxes(text, hit.start, hit.end, cssWidth, cssHeight);
+      all.push(...boxes);
+      if (activeHitKey === `${hit.page}:${hit.start}:${hit.end}`) active.push(...boxes);
+    }
+    return { all, active };
+  }, [text, searchHits, activeHitKey, cssWidth, cssHeight]);
+
+  const handleTextMouseUp = (e: React.MouseEvent) => {
+    const selection = window.getSelection();
+    if (!selection || selection.isCollapsed || !text) {
+      setMenu(null);
+      return;
+    }
+    const anchor = selection.anchorNode?.parentElement?.closest("[data-i]");
+    const focus = selection.focusNode?.parentElement?.closest("[data-i]");
+    const anchorIndex = anchor?.getAttribute("data-i");
+    const focusIndex = focus?.getAttribute("data-i");
+    if (anchorIndex == null || focusIndex == null) {
+      setMenu(null);
+      return;
+    }
+    const a = Number(anchorIndex);
+    const f = Number(focusIndex);
+    if (a === f) {
+      setMenu(null);
+      return;
+    }
+    const start = Math.min(a, f);
+    const end = Math.max(a, f) + 1;
+    const frame = (e.currentTarget as HTMLElement).closest(".page-frame") as HTMLElement;
+    const rect = frame.getBoundingClientRect();
+    setMenu({
+      x: e.clientX - rect.left,
+      y: e.clientY - rect.top - 44,
+      page: index,
+      start,
+      end,
+      text: selection.toString(),
+    });
+  };
 
   return (
     <div className="page-frame" style={{ width: cssWidth, height: cssHeight }}>
@@ -74,6 +247,45 @@ function PageImage({ docId, index, cssWidth, cssHeight }: PageImageProps) {
         onLoad={() => setStatus({ url, state: "loaded" })}
         onError={() => setStatus({ url, state: "failed" })}
       />
+
+      {[...highlightBoxes.entries()].map(([hlId, boxes]) => {
+        const color = highlights.find((h) => `${h.id}` === hlId)?.color ?? "yellow";
+        return <OverlayBoxes key={hlId} boxes={boxes} className={`hl hl-${color}`} />;
+      })}
+      <OverlayBoxes boxes={searchBoxes.all} className="search-hit" />
+      <OverlayBoxes boxes={searchBoxes.active} className="search-hit active" />
+
+      {text && (
+        <div className="text-layer" onMouseUp={handleTextMouseUp}>
+          <TextLayer text={text} cssWidth={cssWidth} cssHeight={cssHeight} />
+        </div>
+      )}
+
+      {menu && (
+        <div className="selection-menu" style={{ left: menu.x, top: menu.y }} onMouseDown={(e) => e.preventDefault()}>
+          {HIGHLIGHT_COLORS.map((color) => (
+            <button
+              key={color}
+              className={`swatch swatch-${color}`}
+              title={`Highlight ${color}`}
+              onClick={() => {
+                onAddHighlight(menu.page, menu.start, menu.end, menu.text, color);
+                window.getSelection()?.removeAllRanges();
+                setMenu(null);
+              }}
+            />
+          ))}
+          <button
+            className="btn small"
+            onClick={() => {
+              void navigator.clipboard.writeText(menu.text);
+              setMenu(null);
+            }}
+          >
+            Copy
+          </button>
+        </div>
+      )}
     </div>
   );
 }
@@ -119,7 +331,7 @@ function LazyPage({ container, registerEl, index, ...image }: LazyPageProps) {
   );
 }
 
-interface ReaderProps {
+export interface ReaderProps {
   doc: DocumentInfo;
   dims: PageInfo[];
   page: number;
@@ -131,6 +343,18 @@ interface ReaderProps {
   mode: ReadMode;
   zoom: ZoomMode;
   theme: Theme;
+  /** Two-page spread in paged mode. */
+  spread: boolean;
+  highlights: Highlight[];
+  searchHits: SearchMatch[];
+  activeHitKey: string | null;
+  onAddHighlight: (
+    page: number,
+    start: number,
+    end: number,
+    text: string,
+    color: HighlightColor,
+  ) => void;
 }
 
 export default function Reader({
@@ -143,6 +367,11 @@ export default function Reader({
   mode,
   zoom,
   theme,
+  spread,
+  highlights,
+  searchHits,
+  activeHitKey,
+  onAddHighlight,
 }: ReaderProps) {
   const [containerRef, viewport] = useElementSize<HTMLDivElement>();
   const [containerEl, setContainerEl] = useState<HTMLElement | null>(null);
@@ -151,11 +380,33 @@ export default function Reader({
 
   const fitDims = mode === "paged" ? dimsOf(dims, page) : dimsOf(dims, 0);
 
+  const hitsByPage = useMemo(() => {
+    const map = new Map<number, SearchMatch[]>();
+    for (const hit of searchHits) {
+      const list = map.get(hit.page);
+      if (list) list.push(hit);
+      else map.set(hit.page, [hit]);
+    }
+    return map;
+  }, [searchHits]);
+
+  const highlightsByPage = useMemo(() => {
+    const map = new Map<number, Highlight[]>();
+    for (const hl of highlights) {
+      const list = map.get(hl.page);
+      if (list) list.push(hl);
+      else map.set(hl.page, [hl]);
+    }
+    return map;
+  }, [highlights]);
+
   const scale = useMemo(() => {
     if (!viewport.width || !viewport.height) return 1;
-    const availW = Math.max(80, viewport.width - PAD * 2);
+    const columns = mode === "paged" && spread ? 2 : 1;
+    const gap = columns === 2 ? 16 : 0;
+    const availW = Math.max(80, viewport.width - PAD * 2 - gap);
     const availH = Math.max(80, viewport.height - PAD * 2);
-    const fitWidthScale = availW / fitDims.width;
+    const fitWidthScale = availW / (fitDims.width * columns);
     switch (zoom.kind) {
       case "fitWidth":
         return fitWidthScale;
@@ -164,7 +415,7 @@ export default function Reader({
       case "percent":
         return (zoom.value / 100) * fitWidthScale;
     }
-  }, [viewport, zoom, fitDims.width, fitDims.height]);
+  }, [viewport, zoom, fitDims.width, fitDims.height, mode, spread]);
 
   const registerEl = useRef((index: number, el: HTMLDivElement | null) => {
     if (el) pageEls.current.set(index, el);
@@ -248,38 +499,46 @@ export default function Reader({
   // turns are instant; scroll mode already prefetches via IntersectionObserver.
   useEffect(() => {
     if (mode !== "paged") return;
-    for (const neighbor of [page + 1, page + 2, page - 1]) {
+    const neighbors = spread ? [page + 2, page + 3, page - 2, page + 1] : [page + 1, page + 2, page - 1];
+    for (const neighbor of neighbors) {
       if (neighbor < 0 || neighbor >= doc.pageCount) continue;
       const d = dimsOf(dims, neighbor);
       const img = new Image();
       img.src = pageImageUrl(doc.docId, neighbor, renderWidth(d.width * scale));
     }
-  }, [page, mode, doc.docId, doc.pageCount, scale, dims]);
+  }, [page, mode, spread, doc.docId, doc.pageCount, scale, dims]);
+
+  const pageImageProps = (index: number) => ({
+    docId: doc.docId,
+    index,
+    cssWidth: dimsOf(dims, index).width * scale,
+    cssHeight: dimsOf(dims, index).height * scale,
+    highlights: highlightsByPage.get(index) ?? [],
+    searchHits: hitsByPage.get(index) ?? [],
+    activeHitKey,
+    onAddHighlight,
+  });
 
   if (mode === "paged") {
-    const d = dimsOf(dims, page);
+    const secondPage = spread && page + 1 < doc.pageCount ? page + 1 : null;
     return (
       <div className={`reader theme-${theme}`} ref={containerRef}>
         <div className="paged-stage">
-          <PageImage
-            docId={doc.docId}
-            index={page}
-            cssWidth={d.width * scale}
-            cssHeight={d.height * scale}
-          />
+          <PageImage {...pageImageProps(page)} />
+          {secondPage !== null && <PageImage {...pageImageProps(secondPage)} />}
           {page > 0 && (
             <button
               className="nav-btn prev"
-              onClick={() => onPageChange(page - 1)}
+              onClick={() => onPageChange(page - (spread ? 2 : 1))}
               aria-label="Previous page"
             >
               ‹
             </button>
           )}
-          {page < doc.pageCount - 1 && (
+          {(secondPage !== null || page < doc.pageCount - 1) && (
             <button
               className="nav-btn next"
-              onClick={() => onPageChange(page + 1)}
+              onClick={() => onPageChange(page + (spread ? 2 : 1))}
               aria-label="Next page"
             >
               ›
@@ -300,20 +559,9 @@ export default function Reader({
       onScroll={handleScroll}
     >
       <div className="scroll-pages">
-        {Array.from({ length: doc.pageCount }, (_, i) => {
-          const d = dimsOf(dims, i);
-          return (
-            <LazyPage
-              key={i}
-              index={i}
-              docId={doc.docId}
-              cssWidth={d.width * scale}
-              cssHeight={d.height * scale}
-              container={containerEl}
-              registerEl={registerEl}
-            />
-          );
-        })}
+        {Array.from({ length: doc.pageCount }, (_, i) => (
+          <LazyPage key={i} {...pageImageProps(i)} container={containerEl} registerEl={registerEl} />
+        ))}
       </div>
     </div>
   );

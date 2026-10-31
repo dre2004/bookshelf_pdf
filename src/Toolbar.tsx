@@ -16,6 +16,12 @@ interface Props {
   onOpen: () => void;
   onLibrary: () => void;
   disabled: boolean;
+  sidebarOpen: boolean;
+  onToggleSidebar: () => void;
+  onSearch: () => void;
+  onAddBookmark: () => void;
+  spread: boolean;
+  onSpreadChange: (spread: boolean) => void;
 }
 
 export default function Toolbar({
@@ -32,6 +38,12 @@ export default function Toolbar({
   onOpen,
   onLibrary,
   disabled,
+  sidebarOpen,
+  onToggleSidebar,
+  onSearch,
+  onAddBookmark,
+  spread,
+  onSpreadChange,
 }: Props) {
   const [pageInput, setPageInput] = useState(String(page + 1));
 
@@ -51,6 +63,14 @@ export default function Toolbar({
   return (
     <header className="toolbar">
       <div className="toolbar-group">
+        <button
+          className={`btn icon wide ${sidebarOpen ? "active" : ""}`}
+          disabled={disabled}
+          onClick={onToggleSidebar}
+          title="Toggle sidebar (contents, pages, bookmarks, notes)"
+        >
+          ☰ Sidebar
+        </button>
         <button className="btn" onClick={onLibrary} title="Back to library (Esc)">
           ‹ Library
         </button>
@@ -58,6 +78,15 @@ export default function Toolbar({
           Open
         </button>
         {fileName && <span className="file-name" title={fileName}>{fileName}</span>}
+      </div>
+
+      <div className="toolbar-group">
+        <button className="btn" disabled={disabled} onClick={onSearch} title="Search in document (Ctrl+F)">
+          Search
+        </button>
+        <button className="btn" disabled={disabled} onClick={onAddBookmark} title="Bookmark this position (Ctrl+B)">
+          ⚑ Bookmark
+        </button>
       </div>
 
       <div className="toolbar-group">
@@ -117,6 +146,16 @@ export default function Toolbar({
         >
           Scroll
         </button>
+        {mode === "paged" && (
+          <button
+            className={`btn ${spread ? "active" : ""}`}
+            disabled={disabled}
+            onClick={() => onSpreadChange(!spread)}
+            title="Two-page spread"
+          >
+            ⧉
+          </button>
+        )}
       </div>
 
       <div className="toolbar-group">

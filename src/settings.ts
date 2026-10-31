@@ -4,6 +4,7 @@ export interface ReaderSettings {
   mode: ReadMode;
   theme: Theme;
   zoom: ZoomMode;
+  spread: boolean;
 }
 
 export function readModeFrom(v: unknown): ReadMode | null {
@@ -12,6 +13,10 @@ export function readModeFrom(v: unknown): ReadMode | null {
 
 export function themeFrom(v: unknown): Theme | null {
   return v === "day" || v === "sepia" || v === "night" ? v : null;
+}
+
+export function spreadFrom(v: unknown): boolean | null {
+  return typeof v === "boolean" ? v : null;
 }
 
 export function zoomFrom(v: unknown): ZoomMode | null {
@@ -44,5 +49,6 @@ export function settingsFromStorage(
     mode: parse(stored.readMode, readModeFrom, defaults.mode),
     theme: parse(stored.theme, themeFrom, defaults.theme),
     zoom: parse(stored.zoom, zoomFrom, defaults.zoom),
+    spread: parse(stored.spread, spreadFrom, defaults.spread),
   };
 }

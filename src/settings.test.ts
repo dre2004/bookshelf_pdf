@@ -5,6 +5,7 @@ const DEFAULTS = {
   mode: "paged" as const,
   theme: "day" as const,
   zoom: { kind: "fitWidth" } as const,
+  spread: false,
 };
 
 describe("settingsFromStorage", () => {
@@ -19,18 +20,24 @@ describe("settingsFromStorage", () => {
           readMode: '"scroll"',
           theme: '"night"',
           zoom: '{"kind":"percent","value":150}',
+          spread: "true",
         },
         DEFAULTS,
       ),
-    ).toEqual({ mode: "scroll", theme: "night", zoom: { kind: "percent", value: 150 } });
+    ).toEqual({
+      mode: "scroll",
+      theme: "night",
+      zoom: { kind: "percent", value: 150 },
+      spread: true,
+    });
   });
 
   it("falls back per-key on invalid values", () => {
     const result = settingsFromStorage(
-      { readMode: '"audiobook"', theme: '"sepia"', zoom: "not json" },
+      { readMode: '"audiobook"', theme: '"sepia"', zoom: "not json", spread: '"yes"' },
       DEFAULTS,
     );
-    expect(result).toEqual({ mode: "paged", theme: "sepia", zoom: { kind: "fitWidth" } });
+    expect(result).toEqual({ mode: "paged", theme: "sepia", zoom: { kind: "fitWidth" }, spread: false });
   });
 
   it("rejects out-of-range zoom percentages", () => {
