@@ -26,13 +26,13 @@ TypeScript frontend.
   in a sidebar
 - **Narration** (🔊 in the toolbar): read books aloud with the words
   highlighted as they're spoken and auto-advance across pages
-  - **On-device voices** run fully offline in native code (Piper/ONNX +
-    pure-Rust G2P — no Python, no services, no network). Any classic Piper
-    voice works; `npm run fetch:voices` installs a default set (Daniela
-    es-AR plus English voices), or copy any `.onnx` + `.onnx.json` pair
-    into `engine/voices/` (dev) or the app's `voices` data directory.
-    Daniela is the default when installed. Supported languages: English,
-    Spanish, French, Portuguese, Swedish.
+  - **On-device voices** are neural voices (Piper/ONNX) computed entirely
+    on your machine — narration works offline. The Narrate panel offers a
+    one-click download of the default voice set (Daniela es-AR plus
+    English voices); any classic Piper voice can be added by dropping its
+    `.onnx` + `.onnx.json` pair into the app's `voices` data directory
+    (`engine/voices/` in dev). Daniela is the default when installed.
+    Supported languages: English, Spanish, French, Portuguese, Swedish.
   - **System voices** (the OS speech engine) remain available in the same
     list where the web view supports them.
   - Voice, speed and auto-advance preferences persist.

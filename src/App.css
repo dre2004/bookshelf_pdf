@@ -1065,3 +1065,14 @@ body,
   background: rgba(70, 150, 255, 0.38);
   outline: 2px solid rgba(70, 150, 255, 0.85);
 }
+
+.voice-download {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.narration-hint {
+  font-size: 11px;
+  margin: 0;
+}

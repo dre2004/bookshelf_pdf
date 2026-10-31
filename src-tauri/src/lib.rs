@@ -122,7 +122,8 @@ pub fn run() {
             commands::tts_speak,
             commands::tts_pause,
             commands::tts_resume,
-            commands::tts_stop
+            commands::tts_stop,
+            commands::tts_install_default_voices
         ])
         .register_asynchronous_uri_scheme_protocol("pdfimg", |ctx, request, responder| {
             let engine = ctx.app_handle().state::<Arc<Engine>>().inner().clone();

@@ -122,6 +122,11 @@ export async function ttsStop(): Promise<void> {
   return invoke("tts_stop");
 }
 
+/** Downloads the default on-device voice set; progress via `voice-download` events. */
+export async function ttsInstallDefaultVoices(): Promise<void> {
+  return invoke("tts_install_default_voices");
+}
+
 export async function searchDocument(
   docId: number,
   query: string,

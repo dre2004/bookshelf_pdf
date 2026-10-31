@@ -27,6 +27,36 @@ export default function NarrationPanel({ narration, currentPage, onClose }: Prop
         </p>
       ) : (
         <>
+          {onDevice.length === 0 && (
+            <div className="voice-download">
+              <button
+                className="btn primary"
+                onClick={narration.download.start}
+                disabled={narration.download.active}
+              >
+                {narration.download.active
+                  ? narration.download.knownTotal
+                    ? `Downloading voices… ${Math.round(narration.download.progress * 100)}%`
+                    : `Downloading voices… ${narration.download.downloadedMb.toFixed(0)} MB`
+                  : "⬇ Download on-device voices (~240 MB)"}
+              </button>
+              {narration.download.active && (
+                <div className="progress-track">
+                  <div
+                    className="progress-fill"
+                    style={{ width: `${narration.download.progress * 100}%` }}
+                  />
+                </div>
+              )}
+              {narration.download.error && (
+                <p className="muted narration-unsupported">{narration.download.error}</p>
+              )}
+              <p className="muted narration-hint">
+                Offline neural voices (Daniela + English) downloaded once into your app data —
+                then narration works entirely on your machine.
+              </p>
+            </div>
+          )}
           <label className="narration-field">
             Voice
             <select

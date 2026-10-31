@@ -10,6 +10,7 @@
 //! EOS suffix (`^`, `_`, `$` tokens in the map).
 
 mod chunker;
+pub mod voice_downloads;
 
 use std::{
     collections::HashMap,
@@ -71,7 +72,6 @@ struct LoadedVoice {
 
 pub struct TtsEngine {
     app: tauri::AppHandle,
-    voices_dir: PathBuf,
     loaded: Mutex<HashMap<String, Arc<LoadedVoice>>>,
     playback: Mutex<PlaybackControl>,
     device: Mutex<Option<rodio::MixerDeviceSink>>,
@@ -83,11 +83,13 @@ struct PlaybackControl {
 }
 
 impl TtsEngine {
+    pub fn app_handle(&self) -> &tauri::AppHandle {
+        &self.app
+    }
+
     pub fn new(app: tauri::AppHandle) -> Self {
-        let voices_dir = Self::resolve_voices_dir(&app);
         Self {
             app,
-            voices_dir,
             loaded: Mutex::new(HashMap::new()),
             playback: Mutex::new(PlaybackControl {
                 stop: Arc::new(AtomicBool::new(false)),
@@ -97,33 +99,52 @@ impl TtsEngine {
         }
     }
 
-    fn resolve_voices_dir(app: &tauri::AppHandle) -> PathBuf {
+    /// Voice lookup locations, resolved per call: the user's app-data
+    /// directory (where downloads install) plus the repo's engine/voices
+    /// for dev checkouts. The download happens after startup, so caching
+    /// one dir at construction would hide freshly installed voices.
+    fn voices_dirs(&self) -> Vec<PathBuf> {
         let mut candidates = Vec::new();
-        if let Ok(data) = app.path().app_data_dir() {
+        if let Ok(data) = self.app.path().app_data_dir() {
             candidates.push(data.join("voices"));
         }
         if let Ok(cwd) = std::env::current_dir() {
             candidates.push(cwd.join("engine").join("voices"));
             candidates.push(cwd.join("..").join("engine").join("voices"));
         }
-        candidates
-            .into_iter()
-            .find(|dir| dir.is_dir())
-            .unwrap_or_else(|| PathBuf::from("engine/voices"))
+        candidates.into_iter().filter(|dir| dir.is_dir()).collect()
     }
 
-    /// Lists installed voice pairs in the voices directory.
+    /// Where downloads install to: the per-user voices directory, created
+    /// on demand (distinct from the read-only lookup candidates).
+    pub fn install_dir(&self) -> Result<PathBuf, String> {
+        let dir = self
+            .app
+            .path()
+            .app_data_dir()
+            .map_err(|e| format!("cannot resolve app data dir: {e}"))?
+            .join("voices");
+        std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create voices dir: {e}"))?;
+        Ok(dir)
+    }
+
+    /// Lists installed voice pairs across all voice locations.
     pub fn list_voices(&self) -> Vec<TtsVoiceInfo> {
-        let Ok(entries) = std::fs::read_dir(&self.voices_dir) else {
-            return Vec::new();
-        };
         let mut voices = Vec::new();
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Some(id) = file_stem_of_model(&path) else {
+        for dir in self.voices_dirs() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
                 continue;
             };
-            voices.push(voice_info(&id, &path));
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Some(id) = file_stem_of_model(&path) else {
+                    continue;
+                };
+                if voices.iter().any(|voice: &TtsVoiceInfo| voice.id == id) {
+                    continue;
+                }
+                voices.push(voice_info(&id, &path));
+            }
         }
         voices.sort_by(|a, b| a.id.cmp(&b.id));
         voices
@@ -133,10 +154,14 @@ impl TtsEngine {
         if let Some(voice) = self.loaded.lock().unwrap().get(id) {
             return Ok(voice.clone());
         }
-        let model = self.voices_dir.join(format!("{id}.onnx"));
-        if !model.is_file() {
+        let Some(model) = self
+            .voices_dirs()
+            .iter()
+            .map(|dir| dir.join(format!("{id}.onnx")))
+            .find(|model| model.is_file())
+        else {
             return Err(format!("voice '{id}' is not installed"));
-        }
+        };
         let voice = Arc::new(load_voice(&model)?);
         self.loaded
             .lock()

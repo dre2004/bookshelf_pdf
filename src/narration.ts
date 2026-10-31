@@ -1,6 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { ttsPause, ttsResume, ttsSpeak, ttsStop, ttsVoices } from "./api";
+import {
+  ttsInstallDefaultVoices,
+  ttsPause,
+  ttsResume,
+  ttsSpeak,
+  ttsStop,
+  ttsVoices,
+} from "./api";
 
 /** The page text fed to the engine is exactly `PageTextData.chars`, so
  *  progress events' char ranges map straight onto the page's character
@@ -61,6 +68,15 @@ export interface NarrationController {
   pause: () => void;
   resume: () => void;
   stop: () => void;
+  /** States of the default-voice download offered when none are installed. */
+  download: {
+    active: boolean;
+    progress: number; // 0..1 when the total size is known
+    knownTotal: boolean;
+    downloadedMb: number;
+    error: string | null;
+    start: () => void;
+  };
 }
 
 const PIPER_PREFIX = "piper:";
@@ -167,11 +183,9 @@ export function useNarration({
 
   // On-device voices come from the Rust engine; arriving last, they get the
   // final say over any automatic default (Daniela wins when installed).
-  useEffect(() => {
-    let cancelled = false;
+  const refreshPiperVoices = useCallback(() => {
     ttsVoices()
       .then((voices) => {
-        if (cancelled) return;
         setPiperVoices(voices);
         setVoiceURIState((current) => {
           if (current && !autoPicked.current) return current;
@@ -181,11 +195,63 @@ export function useNarration({
         });
       })
       .catch(() => {});
-    return () => {
-      cancelled = true;
-    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [docId, defaultVoiceURI]);
+  }, [defaultVoiceURI]);
+
+  useEffect(() => {
+    refreshPiperVoices();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [docId, refreshPiperVoices]);
+
+  // ---- default-voice download (offered when no on-device voices exist) ----
+  const [downloadActive, setDownloadActive] = useState(false);
+  const [downloadProgress, setDownloadProgress] = useState(0);
+  const [downloadError, setDownloadError] = useState<string | null>(null);
+  const [downloadKnownTotal, setDownloadKnownTotal] = useState(false);
+  const [downloadedMb, setDownloadedMb] = useState(0);
+
+  useEffect(() => {
+    const unlisten = listen<{
+      kind: "started" | "progress" | "voiceDone" | "done" | "failed";
+      totalBytes?: number;
+      downloadedBytes?: number;
+      reason?: string;
+    }>("voice-download", (event) => {
+      const payload = event.payload;
+      if (payload.kind === "started") {
+        setDownloadActive(true);
+        setDownloadError(null);
+        setDownloadProgress(0);
+        setDownloadedMb(0);
+        setDownloadKnownTotal((payload.totalBytes ?? 0) > 0);
+      } else if (payload.kind === "progress") {
+        const downloaded = payload.downloadedBytes ?? 0;
+        setDownloadedMb(downloaded / (1024 * 1024));
+        const total = payload.totalBytes;
+        if (total) setDownloadProgress(Math.min(1, downloaded / total));
+      } else if (payload.kind === "done") {
+        setDownloadActive(false);
+        setDownloadProgress(1);
+        refreshPiperVoices();
+      } else if (payload.kind === "failed") {
+        setDownloadActive(false);
+        setDownloadError(payload.reason ?? "download failed");
+      }
+    });
+    return () => {
+      void unlisten.then((fn) => fn());
+    };
+  }, [refreshPiperVoices]);
+
+  const startDownload = useCallback(() => {
+    setDownloadError(null);
+    setDownloadActive(true);
+    setDownloadProgress(0);
+    ttsInstallDefaultVoices().catch((e) => {
+      setDownloadActive(false);
+      setDownloadError(String(e));
+    });
+  }, []);
 
   const setVoiceURI = useCallback((uri: string) => {
     autoPicked.current = false;
@@ -367,6 +433,14 @@ export function useNarration({
     pause,
     resume,
     stop,
+    download: {
+      active: downloadActive,
+      progress: downloadProgress,
+      knownTotal: downloadKnownTotal,
+      downloadedMb,
+      error: downloadError,
+      start: startDownload,
+    },
   };
 }
 

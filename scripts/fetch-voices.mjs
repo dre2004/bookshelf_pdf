@@ -12,7 +12,7 @@ import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { pipeline } from "node:stream/promises";
 
-const DEFAULT_VOICES = ["es_AR/daniela/high", "en_US/amy/high", "en_GB/alba/medium"];
+const DEFAULT_VOICES = ["es_AR/daniela/high", "en_US/amy/medium", "en_GB/alba/medium"];
 const BASE = "https://huggingface.co/rhasspy/piper-voices/resolve/main";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const outDir = resolve(root, "engine/voices");
@@ -22,14 +22,15 @@ const voices = specs.length > 0 ? specs : DEFAULT_VOICES;
 mkdirSync(outDir, { recursive: true });
 
 for (const spec of voices) {
-  const [lang, name, quality] = spec.split("/");
+  const [locale, name, quality] = spec.split("/");
+  const language = locale.split("/")[0].split("_")[0];
   if (!lang || !name || !quality) {
     console.error(`skipping malformed spec "${spec}" (want lang/name/quality)`);
     continue;
   }
   const stem = `${lang}-${name}-${quality}`;
   for (const ext of ["onnx", "onnx.json"]) {
-    const url = `${BASE}/${lang}/${name}/${quality}/${stem}.${ext}`;
+    const url = `${BASE}/${language}/${locale}/${name}/${quality}/${stem}.${ext}`;
     const dest = resolve(outDir, `${stem}.${ext}`);
     console.log(`fetching ${stem}.${ext}`);
     const response = await fetch(url);
