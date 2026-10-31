@@ -27,12 +27,8 @@ use serde::Serialize;
 use serde_json::Value;
 use tauri::{Emitter, Manager};
 
-use chunker::split_for_tts;
+use chunker::split_for_narration;
 use kokoro::KokoroModel;
-
-/// Character-count ceiling per synthesis call; keeps first-audio latency
-/// low and matches how the models were trained (sentence-ish units).
-const MAX_CHUNK_CHARS: usize = 220;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -129,6 +125,46 @@ impl PlaybackClock {
             self.paused_total += began.elapsed();
         }
     }
+}
+
+/// Silence appended after a chunk (in samples) so narration breathes:
+/// a longer pause after heading-like chunks, a shorter one at paragraph
+/// breaks. Returns zero elsewhere — sentence pauses come from prosody.
+fn gap_samples(text: &[char], range: (usize, usize), is_last: bool, sample_rate: u32) -> Vec<f32> {
+    if is_last {
+        return Vec::new();
+    }
+    let (start, end) = range;
+    let chunk: String = text[start.min(text.len())..end.min(text.len())]
+        .iter()
+        .collect();
+    let trimmed = chunk.trim();
+    if is_heading_like(trimmed) {
+        return vec![0.0; sample_rate as usize * 65 / 100]; // 650 ms
+    }
+    if chunk.ends_with('\n') || chunk.ends_with('\r') {
+        return vec![0.0; sample_rate as usize * 40 / 100]; // 400 ms
+    }
+    Vec::new()
+}
+
+/// Heading heuristics on the chunk's own text: short, few words, no
+/// sentence punctuation (a trailing colon is allowed), optionally
+/// introduced by section numbering.
+fn is_heading_like(trimmed: &str) -> bool {
+    let words = trimmed.split_whitespace().count();
+    if words == 0 || words > 10 || trimmed.chars().count() > 70 {
+        return false;
+    }
+    if trimmed.ends_with('.') || trimmed.ends_with('!') || trimmed.ends_with('?') {
+        return false;
+    }
+    let starts_numbered = trimmed
+        .chars()
+        .next()
+        .map(|c| c.is_ascii_digit())
+        .unwrap_or(false);
+    starts_numbered || trimmed.ends_with(':') || words <= 5
 }
 
 impl TtsEngine {
@@ -381,7 +417,9 @@ impl TtsEngine {
         };
 
         let rate = rate.clamp(0.5, 2.0);
-        let chunks = split_for_tts(&text, MAX_CHUNK_CHARS);
+        let chunks = split_for_narration(&text);
+        let text_chars: Vec<char> = text.chars().collect();
+        let last_chunk = chunks.last().copied().unwrap_or((0, 0));
 
         if let Some(kokoro_voice) = voice_id.strip_prefix("kokoro:").map(str::to_string) {
             let (dir, model) = self.kokoro_model()?;
@@ -405,6 +443,13 @@ impl TtsEngine {
                     let channels = rodio::ChannelCount::new(1).expect("nonzero channels");
                     let sample_rate =
                         rodio::SampleRate::new(sample_rate).expect("nonzero sample rate");
+                    let mut samples = samples;
+                    samples.extend(gap_samples(
+                        &text_chars,
+                        (start, end),
+                        (start, end) == last_chunk,
+                        sample_rate.get(),
+                    ));
                     player.append(rodio::buffer::SamplesBuffer::new(
                         channels,
                         sample_rate,
@@ -456,9 +501,15 @@ impl TtsEngine {
                     continue;
                 }
                 // Piper yields i16 PCM; rodio's Sample type is f32.
-                let samples: Vec<f32> = samples.iter().map(|&s| s as f32 / 32768.0).collect();
+                let mut samples: Vec<f32> = samples.iter().map(|&s| s as f32 / 32768.0).collect();
                 let channels = rodio::ChannelCount::new(1).expect("nonzero channels");
                 let sample_rate = rodio::SampleRate::new(sample_rate).expect("nonzero sample rate");
+                samples.extend(gap_samples(
+                    &text_chars,
+                    (start, end),
+                    (start, end) == last_chunk,
+                    sample_rate.get(),
+                ));
                 player.append(rodio::buffer::SamplesBuffer::new(
                     channels,
                     sample_rate,
@@ -678,5 +729,47 @@ mod tests {
             assert!(sample_rate > 0, "{}: bad sample rate", model.display());
             assert!(!audio.is_empty(), "{}: no audio produced", model.display());
         }
+    }
+}
+
+#[cfg(test)]
+mod pause_tests {
+    use super::*;
+
+    fn chars(text: &str) -> Vec<char> {
+        text.chars().collect()
+    }
+
+    #[test]
+    fn heading_chunks_get_a_long_pause() {
+        let text = "0.1 How to read this book
+You will read this book.";
+        let chunks = split_for_narration(text);
+        let heading = chunks[0];
+        let gap = gap_samples(&chars(text), heading, false, 24_000);
+        assert_eq!(gap.len(), 24_000 * 65 / 100);
+
+        let plain = chunks[1];
+        let none = gap_samples(&chars(text), plain, false, 24_000);
+        assert!(
+            none.is_empty(),
+            "body sentence should not get a heading pause"
+        );
+    }
+
+    #[test]
+    fn last_chunk_gets_no_pause() {
+        let text = "Chapter 9";
+        let chunks = split_for_narration(text);
+        let gap = gap_samples(&chars(text), chunks[0], true, 24_000);
+        assert!(gap.is_empty());
+    }
+
+    #[test]
+    fn sentence_with_period_is_not_a_heading() {
+        assert!(!is_heading_like("This is a full sentence."));
+        assert!(is_heading_like("If You're New Here"));
+        assert!(is_heading_like("0.1 How to read this book"));
+        assert!(is_heading_like("Part 3:"));
     }
 }
