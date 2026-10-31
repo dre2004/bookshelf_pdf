@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "bookshelf_pdf",
+  "productName": "Bookshelf PDF",
   "version": "0.2.0",
   "identifier": "com.bookshelfpdf.app",
   "build": {
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "bookshelf_pdf",
+        "title": "Bookshelf PDF",
         "width": 1280,
         "height": 880,
         "minWidth": 720,

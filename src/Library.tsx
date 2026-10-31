@@ -44,7 +44,7 @@ export default function Library({ books, onOpenBook, onOpenFile, onRemoveBook }:
   return (
     <main className="library">
       <header className="library-header">
-        <h1>bookshelf_pdf</h1>
+        <h1>Bookshelf PDF</h1>
         <button className="btn primary" onClick={onOpenFile}>
           Open PDF
         </button>

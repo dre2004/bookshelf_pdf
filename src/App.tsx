@@ -662,7 +662,7 @@ export default function App() {
         />
       ) : (
         <header className="toolbar library-bar">
-          <span className="library-bar-title">bookshelf_pdf</span>
+          <span className="library-bar-title">Bookshelf PDF</span>
         </header>
       )}
 
