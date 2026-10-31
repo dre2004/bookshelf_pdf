@@ -115,7 +115,7 @@ git push origin v0.1.0
 
 ## License
 
-Copyright © 2026 Andres.
+Copyright © 2026 dre2004.
 
 This project is licensed under the
 [GNU AGPL-3.0-or-later](https://www.gnu.org/licenses/agpl-3.0.en.html) — the
