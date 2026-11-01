@@ -146,7 +146,11 @@ export default function App() {
         setSpread(hydrated.spread);
         try {
           const voice = JSON.parse(stored.narrationVoice ?? '""');
-          if (typeof voice === "string") setNarrationVoice(voice);
+          // The Piper engine is gone; a stale piper: selection falls back
+          // to the automatic default pick (and re-persists).
+          if (typeof voice === "string" && !voice.startsWith("piper:")) {
+            setNarrationVoice(voice);
+          }
         } catch {
           /* keep default voice */
         }
