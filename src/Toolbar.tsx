@@ -92,7 +92,7 @@ export default function Toolbar({
             className="btn"
             disabled={disabled}
             onClick={onNarrationSetup}
-            title="Narration needs a one-time download (~87 MB) — set it up now"
+            title="Narration needs a one-time download (~92 MB) — set it up now"
           >
             🔊 Set up narration
           </button>

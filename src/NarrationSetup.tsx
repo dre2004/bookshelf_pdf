@@ -34,8 +34,8 @@ export default function NarrationSetup({ narration, onDismiss }: Props) {
       <>
         <p className="setup-copy">
           Read-aloud narration runs entirely on your machine — nothing is
-          sent anywhere. It needs a one-time download: the speech engine
-          (about 87 MB) plus nine voices (about 5 MB).
+          sent anywhere. It needs a one-time download of about 92 MB in
+          total: the speech engine (87 MB) plus nine voices (5 MB).
         </p>
         <div className="setup-actions">
           {onDismiss && (

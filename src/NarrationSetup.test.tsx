@@ -69,6 +69,7 @@ describe("NarrationSetup", () => {
     render(
       <NarrationSetup narration={controller("idle", { start })} onDismiss={onDismiss} />,
     );
+    expect(screen.getByText(/92 MB in total/)).toBeTruthy();
     expect(screen.getByText(/87 MB/)).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: /Download and set up/ }));
     expect(start).toHaveBeenCalled();
