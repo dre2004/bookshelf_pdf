@@ -10,6 +10,7 @@
 //! EOS suffix (`^`, `_`, `$` tokens in the map).
 
 mod chunker;
+pub mod homograph;
 pub mod kokoro;
 pub mod voice_downloads;
 
@@ -1416,5 +1417,26 @@ mod book_trace_tests {
             beats >= dash_candidates / 2,
             "expected dash beats for roughly every parenthetical dash (candidates {dash_candidates}, beats {beats})"
         );
+
+        // Homograph audit: every ambiguous word on the page and what the
+        // disambiguation table decides for it (None = dictionary default).
+        println!("== homograph audit ==");
+        let tokens: Vec<&str> = text.split_whitespace().collect();
+        for (index, token) in tokens.iter().enumerate() {
+            let cleaned: String = token
+                .trim_matches(|c: char| !c.is_alphanumeric() && c != '\'')
+                .to_ascii_lowercase();
+            if homograph::ENTRIES.iter().any(|e| e.word == cleaned) {
+                let decision = match homograph::resolve(&tokens, index) {
+                    Some(homograph::Pronunciation::Respell(r)) => format!("respell {r:?}"),
+                    Some(homograph::Pronunciation::Phonemes(p)) => format!("phonemes {p:?}"),
+                    None => "default".to_string(),
+                };
+                println!(
+                    "  {token:>14} <- {:?}: {decision}",
+                    tokens[index.saturating_sub(1)]
+                );
+            }
+        }
     }
 }

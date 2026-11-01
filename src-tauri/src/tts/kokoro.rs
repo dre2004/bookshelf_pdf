@@ -65,25 +65,6 @@ fn trim_silence(samples: &mut Vec<f32>, sample_rate: u32) {
     samples.drain(..start);
 }
 
-/// Substitutes homographs with a homophone when the preceding word makes
-/// the intent unambiguous. Heuristic, applied after typographic
-/// normalization; extend as mispronunciations are reported.
-fn homograph_substitute(prev: Option<&str>, word: &str) -> Option<&'static str> {
-    if !word.eq_ignore_ascii_case("read") {
-        return None;
-    }
-    // "to read", "how to read", "will/can/should read", ... = present
-    // tense (rhymes with "reed"). Bare "read" stays the dictionary's
-    // default (past tense).
-    const PRESENT_AFTER: &[&str] = &[
-        "to", "will", "can", "could", "should", "would", "must", "may", "might", "let's", "lets",
-        "want", "wants", "wanted", "going", "about", "how", "get", "help", "helps", "love",
-        "loves", "like", "likes", "liked",
-    ];
-    let prev = prev?.to_ascii_lowercase();
-    PRESENT_AFTER.contains(&prev.as_str()).then_some("reed")
-}
-
 /// Maps smart quotes/apostrophes/dashes to their ASCII equivalents for
 /// G2P; unknown characters are dropped by the tokenizer anyway.
 fn normalize_typographic(text: &str) -> String {
@@ -213,17 +194,34 @@ impl KokoroModel {
         // fallback spell words letter by letter ("you<U+2019>re" is heard
         // as "y-o-u-r-e").
         let text = normalize_typographic(text);
-        let mut words = Vec::new();
-        let mut prev: Option<&str> = None;
-        for word in text.split_whitespace() {
+        let tokens: Vec<&str> = text.split_whitespace().collect();
+        let mut words = Vec::with_capacity(tokens.len());
+        for (index, word) in tokens.iter().copied().enumerate() {
             use piper_plus_g2p::Phonemizer as _;
-            let spoken = homograph_substitute(prev, word).unwrap_or(word);
-            let (tokens, _) = self
-                .phonemizer
-                .phonemize_with_prosody(spoken)
-                .map_err(|e| format!("phonemize: {e}"))?;
-            words.push(tokens.concat());
-            prev = Some(word);
+            match crate::tts::homograph::resolve(&tokens, index) {
+                // Context resolved the word to a homophone the dictionary
+                // knows ("read" -> "reed").
+                Some(crate::tts::homograph::Pronunciation::Respell(spoken)) => {
+                    let (tokens, _) = self
+                        .phonemizer
+                        .phonemize_with_prosody(spoken)
+                        .map_err(|e| format!("phonemize: {e}"))?;
+                    words.push(tokens.concat());
+                }
+                // Context picked an exact pronunciation the dictionary
+                // doesn't spell any other way (stress pairs like REcord
+                // vs reCORD).
+                Some(crate::tts::homograph::Pronunciation::Phonemes(phonemes)) => {
+                    words.push(phonemes.to_string());
+                }
+                None => {
+                    let (tokens, _) = self
+                        .phonemizer
+                        .phonemize_with_prosody(word)
+                        .map_err(|e| format!("phonemize: {e}"))?;
+                    words.push(tokens.concat());
+                }
+            }
         }
         let trailing: String = text
             .chars()
@@ -586,14 +584,18 @@ mod g2p_tests {
         assert!(silent.is_empty());
     }
 
+    /// The homograph rules moved to tts::homograph (table-driven, many
+    /// words). This keeps the phonemizer-side fact they depend on: the
+    /// dictionary's bare "read" is the past tense, so a present-tense
+    /// substitution to "reed" audibly matters.
     #[test]
-    fn present_tense_read_substitutes_reed() {
-        assert_eq!(homograph_substitute(Some("to"), "read"), Some("reed"));
-        assert_eq!(homograph_substitute(Some("To"), "Read"), Some("reed"));
-        assert_eq!(homograph_substitute(Some("how"), "read"), Some("reed"));
-        assert_eq!(homograph_substitute(None, "read"), None);
-        assert_eq!(homograph_substitute(Some("have"), "read"), None);
-        assert_eq!(homograph_substitute(Some("to"), "book"), None);
+    fn dictionary_read_is_past_tense_so_substitution_matters() {
+        use piper_plus_g2p::Phonemizer as _;
+        let p = EnglishPhonemizer::new_bundled().expect("phonemizer");
+        let (reed, _) = p.phonemize_with_prosody("reed").expect("g2p");
+        let (read, _) = p.phonemize_with_prosody("read").expect("g2p");
+        assert_eq!(read.concat(), "ɹˈɛd");
+        assert_ne!(reed.concat(), read.concat());
     }
 
     /// The original report: "If You're new here" with a typographic
