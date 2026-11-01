@@ -146,17 +146,24 @@ pub struct KokoroModel {
     /// Whether the style input takes the full (510, 256) embedding or a
     /// 256-dim average — read from the graph instead of assumed.
     style_is_full: bool,
+    /// Supplemental-lexicon resolutions, cached per word (None = the
+    /// lexicon can't help; the dictionary's fallback stands). One entry
+    /// per distinct word ever narrated.
+    lexicon_cache: Mutex<HashMap<String, Option<String>>>,
 }
 
 /// A stretch of words to hand the phonemizer in one piece.
 ///
 /// Words are phonemized as whole runs so the engine hears connected
 /// prosody — per-word phonemization made every word an isolated utterance
-/// ("If - You're - New - Here"). Runs only break where a homograph override
-/// supplies raw phonemes that must not be re-phonemized as text.
+/// ("If - You're - New - Here"). Runs only break where a homograph or
+/// lexicon override supplies raw phonemes that must not be re-phonemized
+/// as text.
 enum G2pRun<'a> {
     Sentence(Vec<&'a str>),
     Phonemes(&'static str),
+    /// A lexicon-derived pronunciation (owned: built at runtime).
+    LexiconPhonemes(String),
 }
 
 /// Joins runs of single-letter tokens ("i t a l i c" -> "italic").
@@ -203,10 +210,19 @@ fn repair_letter_spaced(text: &str) -> Vec<String> {
     words
 }
 
-fn g2p_runs<'a>(tokens: &[&'a str]) -> Vec<G2pRun<'a>> {
+fn g2p_runs<'a>(tokens: &[&'a str], lexicon_overrides: &HashMap<usize, String>) -> Vec<G2pRun<'a>> {
     let mut runs = Vec::new();
     let mut batch: Vec<&str> = Vec::new();
     for (index, token) in tokens.iter().enumerate() {
+        // Lexicon-derived pronunciations win first: the dictionary
+        // letter-spells these words, so no other path can help.
+        if let Some(ipa) = lexicon_overrides.get(&index) {
+            if !batch.is_empty() {
+                runs.push(G2pRun::Sentence(std::mem::take(&mut batch)));
+            }
+            runs.push(G2pRun::LexiconPhonemes(ipa.clone()));
+            continue;
+        }
         match crate::tts::homograph::resolve(tokens, index) {
             // Raw phonemes splice in as-is; flush the pending sentence so
             // the override never passes through the dictionary.
@@ -267,7 +283,37 @@ impl KokoroModel {
                 .map_err(|e| format!("english phonemizer: {e}"))?,
             tokens_input,
             style_is_full,
+            lexicon_cache: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// A lexicon-derived pronunciation for `word`, or None. Only words
+    /// the primary phonemizer would spell letter by letter are worth
+    /// deriving (dictionary words must keep their entries), so the word
+    /// is checked against the phonemizer once and the outcome cached.
+    fn word_lexicon_override(&self, word: &str) -> Option<String> {
+        use piper_plus_g2p::Phonemizer as _;
+        {
+            let cache = self.lexicon_cache.lock().unwrap();
+            if let Some(hit) = cache.get(word) {
+                return hit.clone();
+            }
+        }
+        let resolved = (|| {
+            let (tokens, _) = self.phonemizer.phonemize_with_prosody(word).ok()?;
+            let ipa = tokens.concat();
+            if !crate::tts::lexicon::spells_letter_by_letter(word, &ipa) {
+                // The dictionary knows this word: no override, and no
+                // need to re-check it ever.
+                return None;
+            }
+            crate::tts::lexicon::resolve_with_phonemizer(word, &self.phonemizer)
+        })();
+        self.lexicon_cache
+            .lock()
+            .unwrap()
+            .insert(word.to_string(), resolved.clone());
+        resolved
     }
 
     /// Loads a voice's style embedding. Files are raw float32 (510, 256);
@@ -310,8 +356,16 @@ impl KokoroModel {
         let repaired = repair_letter_spaced(&text);
         let tokens: Vec<&str> = repaired.iter().map(String::as_str).collect();
         use piper_plus_g2p::Phonemizer as _;
+        // Words the dictionary would letter-spell get a lexicon-derived
+        // pronunciation (curated table or suffix rules); everything else
+        // flows through the phonemizer for sentence-level prosody.
+        let lexicon_overrides: HashMap<usize, String> = tokens
+            .iter()
+            .enumerate()
+            .filter_map(|(index, word)| self.word_lexicon_override(word).map(|ipa| (index, ipa)))
+            .collect();
         let mut parts = Vec::new();
-        for run in g2p_runs(&tokens) {
+        for run in g2p_runs(&tokens, &lexicon_overrides) {
             match run {
                 // Words are phonemized as whole sentences so the engine
                 // hears connected prosody — per-word phonemization made
@@ -327,6 +381,8 @@ impl KokoroModel {
                 // A raw-phoneme homograph override splices in as-is; its
                 // IPA must not be re-phonemized as text.
                 G2pRun::Phonemes(phonemes) => parts.push(phonemes.to_string()),
+                // Same, for pronunciations derived at runtime.
+                G2pRun::LexiconPhonemes(ipa) => parts.push(ipa),
             }
         }
         let trailing: String = text

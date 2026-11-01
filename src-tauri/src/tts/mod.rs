@@ -6,6 +6,7 @@
 mod chunker;
 pub mod homograph;
 pub mod kokoro;
+pub mod lexicon;
 
 use std::{
     path::PathBuf,
@@ -1591,7 +1592,14 @@ mod dictionary_audit_tests {
             let ipa = tokens.concat();
             let stresses = ipa.matches('ˈ').count() + ipa.matches('ˌ').count();
             if stresses * 2 >= word.chars().count() {
-                println!("  GAP p{page}: {word} => {ipa}");
+                // What the narration actually does: the lexicon layer
+                // derives or curates a pronunciation for the word.
+                match crate::tts::lexicon::resolve_with_phonemizer(word, &phonemizer) {
+                    Some(fixed) => {
+                        println!("  FIXED p{page}: {word} => {fixed}");
+                    }
+                    None => println!("  GAP p{page}: {word} => {ipa}"),
+                }
             }
         }
     }
