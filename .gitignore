@@ -23,5 +23,10 @@ dist-ssr
 *.sln
 *.sw?
 
-# Piper voice models (run scripts/fetch-voices.mjs or copy .onnx + .onnx.json pairs)
-/engine/voices/*.onnx*
+# Kokoro narration pack (downloaded by the app on first use)
+/engine/kokoro/
+
+# Build artifacts
+src-tauri/target/
+src-tauri/target-probe/
+target/

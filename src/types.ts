@@ -62,6 +62,17 @@ export interface SearchMatch {
   end: number;
 }
 
+/** One clickable link on a page: a TOC entry, cross reference or URI.
+ *  `rect` follows PageTextData's box convention (PDF points, origin at the
+ *  page's bottom-left). */
+export interface PageLink {
+  rect: [number, number, number, number];
+  /** Target page index for in-document links. */
+  destPage: number | null;
+  /** External URI, for links that open one. */
+  uri: string | null;
+}
+
 export interface OutlineNode {
   title: string;
   /** Target page index, -1 when the outline entry has no page. */

@@ -6,8 +6,10 @@ import Toolbar from "./Toolbar";
 import Reader from "./Reader";
 import Library from "./Library";
 import Sidebar, { type SidebarTab } from "./Sidebar";
-import SearchBar from "./SearchBar";
-import NarrationPanel from "./NarrationPanel";
+import Resizer from "./Resizer";
+import SearchPanel from "./SearchPanel";
+import SettingsScreen from "./SettingsScreen";
+import NarrationBar from "./NarrationBar";
 import { useNarration } from "./narration";
 import {
   bookProgressSave,
@@ -61,6 +63,8 @@ interface CurrentBook {
 const DIM_BATCH = 100;
 const SAVE_DEBOUNCE_MS = 700;
 const SEARCH_DEBOUNCE_MS = 250;
+/** Mirrors the backend's per-query cap (search_document). */
+const SEARCH_RESULT_CAP = 2000;
 
 function describeError(e: unknown): string {
   const api = toApiError(e);
@@ -85,7 +89,7 @@ export default function App() {
   const [page, setPage] = useState(0);
   const [resume, setResume] = useState<{ page: number; offset: number } | null>(null);
 
-  const [mode, setMode] = useState<ReadMode>("paged");
+  const [mode, setMode] = useState<ReadMode>("scroll");
   const [zoom, setZoom] = useState<ZoomMode>({ kind: "fitWidth" });
   const [theme, setTheme] = useState<Theme>("day");
   const [spread, setSpread] = useState(false);
@@ -106,12 +110,24 @@ export default function App() {
     results: SearchMatch[];
     active: number;
     searching: boolean;
-  }>({ open: false, query: "", results: [], active: 0, searching: false });
+    caseSensitive: boolean;
+    wholeWords: boolean;
+  }>({
+    open: false,
+    query: "",
+    results: [],
+    active: 0,
+    searching: false,
+    caseSensitive: false,
+    wholeWords: false,
+  });
 
-  const [narrationOpen, setNarrationOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [sidebarWidth, setSidebarWidth] = useState(240);
   const [narrationVoice, setNarrationVoice] = useState("");
   const [narrationRate, setNarrationRate] = useState(1);
   const [narrationContinuous, setNarrationContinuous] = useState(true);
+  const [narrationCodeHandling, setNarrationCodeHandling] = useState<"skip" | "announce">("skip");
 
   const [error, setError] = useState<string | null>(null);
   const [passwordFor, setPasswordFor] = useState<{ path: string; incorrect: boolean } | null>(null);
@@ -131,7 +147,7 @@ export default function App() {
       try {
         const stored = await settingsAll();
         const hydrated = settingsFromStorage(stored, {
-          mode: "paged",
+          mode: "scroll",
           theme: "day",
           zoom: { kind: "fitWidth" },
           spread: false,
@@ -142,7 +158,11 @@ export default function App() {
         setSpread(hydrated.spread);
         try {
           const voice = JSON.parse(stored.narrationVoice ?? '""');
-          if (typeof voice === "string") setNarrationVoice(voice);
+          // The Piper engine is gone; a stale piper: selection falls back
+          // to the automatic default pick (and re-persists).
+          if (typeof voice === "string" && !voice.startsWith("piper:")) {
+            setNarrationVoice(voice);
+          }
         } catch {
           /* keep default voice */
         }
@@ -153,8 +173,20 @@ export default function App() {
           /* keep default rate */
         }
         try {
+          const width = JSON.parse(stored.sidebarWidth ?? "240");
+          if (typeof width === "number" && width >= 180 && width <= 480) setSidebarWidth(width);
+        } catch {
+          /* default width */
+        }
+        try {
           const continuous = JSON.parse(stored.narrationContinuous ?? "true");
           if (typeof continuous === "boolean") setNarrationContinuous(continuous);
+        } catch {
+          /* keep default */
+        }
+        try {
+          const handling = JSON.parse(stored.narrationCodeHandling ?? '"skip"');
+          if (handling === "skip" || handling === "announce") setNarrationCodeHandling(handling);
         } catch {
           /* keep default */
         }
@@ -194,6 +226,15 @@ export default function App() {
     void settingsSet(key, JSON.stringify(value)).catch(() => {});
   }, []);
 
+  const resizeSidebar = useCallback(
+    (width: number) => {
+      const clamped = Math.min(480, Math.max(180, Math.round(width)));
+      setSidebarWidth(clamped);
+      persist("sidebarWidth", clamped);
+    },
+    [persist],
+  );
+
   const changeMode = useCallback(
     (m: ReadMode) => {
       setMode(m);
@@ -212,13 +253,6 @@ export default function App() {
     (z: ZoomMode) => {
       setZoom(z);
       persist("zoom", z);
-    },
-    [persist],
-  );
-  const changeSpread = useCallback(
-    (s: boolean) => {
-      setSpread(s);
-      persist("spread", s);
     },
     [persist],
   );
@@ -273,6 +307,28 @@ export default function App() {
   const openPath = useCallback(
     async (path: string, pwd?: string) => {
       if (currentRef.current?.path === path) {
+        // Re-entering the open book: the Reader remounted with scrollTop 0
+        // when the library opened, so the latest saved position must be
+        // restored again — otherwise the view desyncs from the page state
+        // and same-page chapter clicks die silently.
+        const book = currentRef.current;
+        if (book.bookId >= 0) {
+          try {
+            const state = await bookState(book.bookId);
+            if (state && (state.lastPage > 0 || state.lastOffset > 0)) {
+              const page = Math.min(state.lastPage, book.doc.pageCount - 1);
+              setPage(page);
+              positionRef.current = { page, offset: state.lastOffset };
+              setResume({ page, offset: state.lastOffset });
+            } else {
+              setPage(0);
+              positionRef.current = { page: 0, offset: 0 };
+              setResume(null);
+            }
+          } catch {
+            /* stay on the current page state */
+          }
+        }
         setView("reader");
         return;
       }
@@ -430,6 +486,7 @@ export default function App() {
     if (narrationVoice) narration.setVoiceURI(narrationVoice);
     narration.setRate(narrationRate);
     narration.setContinuous(narrationContinuous);
+    narration.setCodeHandling(narrationCodeHandling);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ready]);
 
@@ -439,19 +496,24 @@ export default function App() {
   }, [narration.voiceURI, persist]);
   useEffect(() => {
     persist("narrationRate", narration.rate);
+  persist("narrationCodeHandling", narration.codeHandling);
   }, [narration.rate, persist]);
   useEffect(() => {
     persist("narrationContinuous", narration.continuous);
   }, [narration.continuous, persist]);
 
   /** Jump to a page (and fractional position) from sidebar/search actions.
-   *  Jumps are recorded so Back can return to where you were reading. */
+   *  Jumps are recorded so Back can return to where you were reading. The
+   *  serial bumps on every jump so the Reader scrolls even when the target
+   *  equals the current page state (which otherwise no-ops in React). */
+  const [jumpSerial, setJumpSerial] = useState(0);
   const jumpTo = useCallback(
     (target: number, offset = 0, opts?: { push?: boolean }) => {
       if (opts?.push !== false) {
         setHistory((h) => [...h.slice(-49), positionRef.current]);
         setFuture([]);
       }
+      setJumpSerial((s) => s + 1);
       changePage(target);
       if (mode === "scroll" && offset > 0) {
         // The reader applies offsets only on document restore; approximate a
@@ -576,29 +638,40 @@ export default function App() {
   );
 
   // ---- search ----
-  const runSearch = useCallback((query: string) => {
-    const book = currentRef.current;
-    if (searchTimer.current !== null) window.clearTimeout(searchTimer.current);
-    if (!book || !query) {
-      setSearch((s) => ({ ...s, results: [], active: 0, searching: false }));
-      return;
+  const runSearch = useCallback(
+    (query: string, caseSensitive: boolean, wholeWords: boolean) => {
+      const book = currentRef.current;
+      if (searchTimer.current !== null) window.clearTimeout(searchTimer.current);
+      if (!book || !query) {
+        setSearch((s) => ({ ...s, results: [], active: 0, searching: false }));
+        return;
+      }
+      setSearch((s) => ({ ...s, searching: true }));
+      const seq = ++searchSeq.current;
+      searchTimer.current = window.setTimeout(() => {
+        searchDocument(book.doc.docId, query, caseSensitive, wholeWords)
+          .then((results) => {
+            if (searchSeq.current !== seq) return;
+            setSearch((s) => ({ ...s, results, active: 0, searching: false }));
+            if (results.length > 0) jumpTo(results[0].page);
+          })
+          .catch(() => {
+            if (searchSeq.current === seq) {
+              setSearch((s) => ({ ...s, results: [], active: 0, searching: false }));
+            }
+          });
+      }, SEARCH_DEBOUNCE_MS);
+    },
+    [jumpTo],
+  );
+
+  // Toggling an option re-runs the search with the new flags.
+  useEffect(() => {
+    if (search.open && search.query) {
+      runSearch(search.query, search.caseSensitive, search.wholeWords);
     }
-    setSearch((s) => ({ ...s, searching: true }));
-    const seq = ++searchSeq.current;
-    searchTimer.current = window.setTimeout(() => {
-      searchDocument(book.doc.docId, query, false)
-        .then((results) => {
-          if (searchSeq.current !== seq) return;
-          setSearch((s) => ({ ...s, results, active: 0, searching: false }));
-          if (results.length > 0) jumpTo(results[0].page);
-        })
-        .catch(() => {
-          if (searchSeq.current === seq) {
-            setSearch((s) => ({ ...s, results: [], active: 0, searching: false }));
-          }
-        });
-    }, SEARCH_DEBOUNCE_MS);
-  }, [jumpTo]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [search.caseSensitive, search.wholeWords, search.open]);
 
   const stepSearch = useCallback(
     (direction: 1 | -1) => {
@@ -611,6 +684,58 @@ export default function App() {
     },
     [jumpTo],
   );
+
+  const selectSearchResult = useCallback(
+    (index: number) => {
+      setSearch((s) => (s.results[index] ? { ...s, active: index } : s));
+      const hit = search.results[index];
+      if (hit) jumpTo(hit.page);
+    },
+    [jumpTo, search.results],
+  );
+
+  // Snippets for the result list: the text around each match, built from
+  // the cached page text (one fetch per page containing hits).
+  const [snippets, setSnippets] = useState<Map<number, [string, string, string]>>(new Map());
+  useEffect(() => {
+    let cancelled = false;
+    const book = currentRef.current;
+    if (!book || search.results.length === 0) {
+      setSnippets(new Map());
+      return;
+    }
+    const byPage = new Map<number, { index: number; hit: SearchMatch }[]>();
+    search.results.forEach((hit, index) => {
+      const list = byPage.get(hit.page);
+      if (list) list.push({ index, hit });
+      else byPage.set(hit.page, [{ index, hit }]);
+    });
+    const build = async () => {
+      const out = new Map<number, [string, string, string]>();
+      for (const [pageIndex, hits] of byPage) {
+        try {
+          const text = await cachedPageText(book.doc.docId, pageIndex);
+          if (cancelled) return;
+          for (const { index, hit } of hits) {
+            const chars = text.chars;
+            const before = chars
+              .slice(Math.max(0, hit.start - 32), hit.start)
+              .replace(/\s+/g, " ");
+            const matched = chars.slice(hit.start, hit.end).replace(/\s+/g, " ");
+            const after = chars.slice(hit.end, hit.end + 32).replace(/\s+/g, " ");
+            out.set(index, [before, matched, after]);
+          }
+        } catch {
+          /* the row renders without a snippet */
+        }
+      }
+      if (!cancelled) setSnippets(out);
+    };
+    void build();
+    return () => {
+      cancelled = true;
+    };
+  }, [search.results]);
 
   // Fetch remaining page dimensions in the background for long documents.
   useEffect(() => {
@@ -749,27 +874,22 @@ export default function App() {
           pageCount={current?.doc.pageCount ?? 0}
           page={page}
           onPageChange={changePage}
-          mode={mode}
-          onModeChange={changeMode}
           zoom={zoom}
           onZoomChange={changeZoom}
-          theme={theme}
-          onThemeChange={changeTheme}
           onOpen={pickFile}
           onLibrary={goLibrary}
+          onSettings={() => setSettingsOpen(true)}
           disabled={!current}
           sidebarOpen={sidebarTab !== null}
           onToggleSidebar={() => setSidebarTab((t) => (t === null ? "outline" : null))}
           onSearch={() => setSearch((s) => ({ ...s, open: true }))}
-          onNarration={() => setNarrationOpen((open) => !open)}
+          onNarration={() => narration.play(page)}
           narrationActive={narration.speaking}
           onAddBookmark={() => void addBookmarkNow()}
           onBack={goBack}
           onForward={goForward}
           canBack={history.length > 0}
           canForward={future.length > 0}
-          spread={spread}
-          onSpreadChange={changeSpread}
         />
       ) : (
         <header className="toolbar library-bar">
@@ -789,7 +909,8 @@ export default function App() {
       {view === "reader" && current ? (
         <div className="reader-row">
           {sidebarTab !== null && (
-            <Sidebar
+            <div className="sidebar-wrap" style={{ width: sidebarWidth }}>
+              <Sidebar
               tab={sidebarTab}
               onTabChange={setSidebarTab}
               doc={current.doc}
@@ -803,40 +924,21 @@ export default function App() {
               highlights={highlights}
               onRemoveHighlight={(h) => void removeHighlight(h)}
               onHighlightColorChange={(h, c) => void setHighlightColor(h, c)}
-              onHighlightNoteChange={(h, n) => void setHighlightNote(h, n)}
-            />
+                onHighlightNoteChange={(h, n) => void setHighlightNote(h, n)}
+              />
+            </div>
           )}
+          {sidebarTab !== null && <Resizer onResize={resizeSidebar} />}
           <div className="reader-stack">
-            {search.open && (
-              <SearchBar
-                query={search.query}
-                onQueryChange={(query) => {
-                  setSearch((s) => ({ ...s, query }));
-                  runSearch(query);
-                }}
-                resultCount={search.results.length}
-                activeIndex={search.active}
-                onNext={() => stepSearch(1)}
-                onPrev={() => stepSearch(-1)}
-                onClose={() => setSearch((s) => ({ ...s, open: false }))}
-                searching={search.searching}
-              />
-            )}
-            {narrationOpen && (
-              <NarrationPanel
-                narration={narration}
-                currentPage={page}
-                onClose={() => setNarrationOpen(false)}
-              />
-            )}
             <Reader
               doc={current.doc}
+              mode={mode}
               dims={dims}
               page={page}
+              jumpSerial={jumpSerial}
               onPageChange={changePage}
               onProgress={handleProgress}
               resume={resume}
-              mode={mode}
               zoom={zoom}
               theme={theme}
               spread={spread}
@@ -845,8 +947,36 @@ export default function App() {
               activeHitKey={activeHit}
               spokenRange={narration.spokenRange}
               onAddHighlight={(p, s2, e2, text, color) => void addHighlight(p, s2, e2, text, color)}
+              onJumpPage={(target) => jumpTo(target)}
+              onJumpToHit={selectSearchResult}
             />
           </div>
+          {search.open && (
+            <aside className="search-dock">
+              <SearchPanel
+                query={search.query}
+                onQueryChange={(query) => {
+                  setSearch((s) => ({ ...s, query }));
+                  runSearch(query, search.caseSensitive, search.wholeWords);
+                }}
+                caseSensitive={search.caseSensitive}
+                wholeWords={search.wholeWords}
+                onToggleCase={() => setSearch((s) => ({ ...s, caseSensitive: !s.caseSensitive }))}
+                onToggleWholeWords={() => setSearch((s) => ({ ...s, wholeWords: !s.wholeWords }))}
+                rows={search.results.map((match, index) => ({
+                  match,
+                  snippet: snippets.get(index) ?? null,
+                }))}
+                activeIndex={search.active}
+                searching={search.searching}
+                truncated={search.results.length >= SEARCH_RESULT_CAP}
+                onSelect={selectSearchResult}
+                onNext={() => stepSearch(1)}
+                onPrev={() => stepSearch(-1)}
+                onClose={() => setSearch((s) => ({ ...s, open: false }))}
+              />
+            </aside>
+          )}
         </div>
       ) : (
         <Library
@@ -854,6 +984,25 @@ export default function App() {
           onOpenBook={(book) => void openPath(book.path)}
           onOpenFile={pickFile}
           onRemoveBook={(book) => void removeBook(book)}
+        />
+      )}
+
+      {settingsOpen && (
+        <SettingsScreen
+          mode={mode}
+          onClose={() => setSettingsOpen(false)}
+          onModeChange={changeMode}
+          theme={theme}
+          onThemeChange={changeTheme}
+          narration={narration}
+        />
+      )}
+
+      {view === "reader" && current && (
+        <NarrationBar
+          narration={narration}
+          currentPage={page}
+          pageCount={current.doc.pageCount}
         />
       )}
 

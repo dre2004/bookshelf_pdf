@@ -1,19 +1,16 @@
 import { useEffect, useState } from "react";
-import type { ReadMode, Theme, ZoomMode } from "./types";
+import type { ZoomMode } from "./types";
 import { stepZoom, zoomLabel } from "./zoom";
 
 interface Props {
   pageCount: number;
   page: number;
   onPageChange: (page: number) => void;
-  mode: ReadMode;
-  onModeChange: (mode: ReadMode) => void;
   zoom: ZoomMode;
   onZoomChange: (zoom: ZoomMode) => void;
-  theme: Theme;
-  onThemeChange: (theme: Theme) => void;
   onOpen: () => void;
   onLibrary: () => void;
+  onSettings: () => void;
   disabled: boolean;
   sidebarOpen: boolean;
   onToggleSidebar: () => void;
@@ -25,22 +22,17 @@ interface Props {
   onForward: () => void;
   canBack: boolean;
   canForward: boolean;
-  spread: boolean;
-  onSpreadChange: (spread: boolean) => void;
 }
 
 export default function Toolbar({
   pageCount,
   page,
   onPageChange,
-  mode,
-  onModeChange,
   zoom,
   onZoomChange,
-  theme,
-  onThemeChange,
   onOpen,
   onLibrary,
+  onSettings,
   disabled,
   sidebarOpen,
   onToggleSidebar,
@@ -52,8 +44,6 @@ export default function Toolbar({
   onForward,
   canBack,
   canForward,
-  spread,
-  onSpreadChange,
 }: Props) {
   const [pageInput, setPageInput] = useState(String(page + 1));
 
@@ -162,46 +152,12 @@ export default function Toolbar({
         </button>
       </div>
 
-      <div className="toolbar-group">
-        <button
-          className={`btn ${mode === "paged" ? "active" : ""}`}
-          disabled={disabled}
-          onClick={() => onModeChange("paged")}
-          title="Paged mode — one page at a time"
-        >
-          Paged
-        </button>
-        <button
-          className={`btn ${mode === "scroll" ? "active" : ""}`}
-          disabled={disabled}
-          onClick={() => onModeChange("scroll")}
-          title="Continuous scrolling mode"
-        >
-          Scroll
-        </button>
-        {mode === "paged" && (
-          <button
-            className={`btn ${spread ? "active" : ""}`}
-            disabled={disabled}
-            onClick={() => onSpreadChange(!spread)}
-            title="Two-page spread"
-          >
-            ⧉
-          </button>
-        )}
-      </div>
 
+      <div className="toolbar-spacer" />
       <div className="toolbar-group">
-        {(["day", "sepia", "night"] as Theme[]).map((t) => (
-          <button
-            key={t}
-            className={`btn theme-${t} ${theme === t ? "active" : ""}`}
-            onClick={() => onThemeChange(t)}
-            title={`${t} theme`}
-          >
-            {t === "day" ? "☀" : t === "sepia" ? "◐" : "☾"}
-          </button>
-        ))}
+        <button className="btn icon" onClick={onSettings} title="Settings">
+          ⚙
+        </button>
       </div>
     </header>
   );

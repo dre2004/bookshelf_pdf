@@ -10,8 +10,7 @@
     "tauri": "tauri",
     "fetch:pdfium": "node scripts/fetch-pdfium.mjs",
     "test": "vitest run",
-    "icon": "node scripts/make-icon.mjs && tauri icon assets/app-icon.png",
-    "fetch:voices": "node scripts/fetch-voices.mjs"
+    "icon": "node scripts/make-icon.mjs && tauri icon assets/app-icon.png"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",

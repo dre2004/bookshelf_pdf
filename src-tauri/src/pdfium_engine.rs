@@ -3,7 +3,7 @@
 
 use std::{
     collections::HashMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU32, Ordering},
@@ -51,6 +51,11 @@ pub struct DocumentInfo {
 pub struct PageTextData {
     pub chars: String,
     pub boxes: Vec<f32>,
+    /// `true` per character set in a fixed-pitch (monospace) font — the
+    /// primary signal for code listings.
+    pub mono: Vec<bool>,
+    /// Char ranges `[start, end)` of detected code blocks.
+    pub code_blocks: Vec<(usize, usize)>,
     pub width: f64,
     pub height: f64,
 }
@@ -61,6 +66,20 @@ pub struct SearchMatch {
     pub page: PdfPageIndex,
     pub start: i64,
     pub end: i64,
+}
+
+/// One clickable link on a page (a table-of-contents entry, cross
+/// reference or external URI). `rect` follows the `PageTextData::boxes`
+/// convention: (x, y, width, height) in PDF points, origin at the page's
+/// bottom-left corner.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PageLink {
+    pub rect: [f32; 4],
+    /// Target page index for in-document links.
+    pub dest_page: Option<PdfPageIndex>,
+    /// External URI, for links that open one.
+    pub uri: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -117,6 +136,15 @@ fn find_matches(haystack: &[char], needle: &[char], case_sensitive: bool) -> Vec
     matches
 }
 
+/// Whether a match at [start, end) sits on word boundaries: any
+/// alphanumeric neighbor keeps it inside a larger word ("read" inside
+/// "reading" or "thread"). Punctuation and whitespace are boundaries.
+fn is_whole_word(normalized: &[char], start: usize, end: usize) -> bool {
+    let before_word = start > 0 && normalized[start - 1].is_alphanumeric();
+    let after_word = end < normalized.len() && normalized[end].is_alphanumeric();
+    !before_word && !after_word
+}
+
 fn outline_node(bookmark: &PdfBookmark<'_>, depth: usize) -> OutlineNode {
     let page = bookmark
         .destination()
@@ -169,8 +197,13 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(app: &tauri::AppHandle) -> Result<Self, String> {
-        let library_path = Self::resolve_library_path(app)?;
-        let bindings = Pdfium::bind_to_library(&library_path)
+        Self::with_library_path(&Self::resolve_library_path(app)?)
+    }
+
+    /// Engine bound to an explicit PDFium library path — the testable core
+    /// of `new`, which differs only in how the library is located.
+    pub fn with_library_path(library_path: &Path) -> Result<Self, String> {
+        let bindings = Pdfium::bind_to_library(library_path)
             .map_err(|e| format!("failed to load PDFium from {}: {e}", library_path.display()))?;
         let pdfium: &'static Pdfium = Box::leak(Box::new(Pdfium::new(bindings)));
         Ok(Self {
@@ -300,8 +333,10 @@ impl Engine {
 
         let mut chars = String::with_capacity(text.len().max(0) as usize);
         let mut boxes = Vec::with_capacity(chars.capacity() * 4);
+        let mut mono = Vec::with_capacity(chars.capacity());
         for ch in text.chars().iter() {
             chars.push(ch.unicode_char().unwrap_or('\u{FFFD}'));
+            mono.push(ch.font_is_fixed_pitch());
             match ch.loose_bounds() {
                 Ok(rect) => {
                     boxes.push(rect.left().value);
@@ -312,13 +347,36 @@ impl Engine {
                 Err(_) => boxes.extend([0.0, 0.0, 0.0, 0.0]),
             }
         }
+        let chars_vec: Vec<char> = chars.chars().collect();
+        let code_blocks = detect_code_blocks(&chars_vec, &mono);
 
         Ok(PageTextData {
             chars,
             boxes,
+            mono,
+            code_blocks,
             width: page.width().value as f64,
             height: page.height().value as f64,
         })
+    }
+
+    /// Clickable links on a page. Links with neither an in-document
+    /// destination nor a URI are dropped — there is nothing to activate.
+    pub fn page_links(
+        &self,
+        doc_id: u32,
+        page_index: PdfPageIndex,
+    ) -> Result<Vec<PageLink>, ApiError> {
+        let docs = self.docs.lock().unwrap();
+        let doc = docs.get(&doc_id).ok_or(ApiError::UnknownDocument)?;
+        let pages = doc.pages();
+        if page_index < 0 || page_index >= pages.len() {
+            return Err(ApiError::UnknownPage);
+        }
+        let page = pages.get(page_index).map_err(|e| ApiError::RenderFailed {
+            reason: pdfium_error_reason(&e),
+        })?;
+        Ok(collect_page_links(&page))
     }
 
     /// Case-(in)sensitive substring search over every page. Matches are
@@ -329,6 +387,7 @@ impl Engine {
         doc_id: u32,
         query: &str,
         case_sensitive: bool,
+        whole_words: bool,
         max_results: usize,
     ) -> Result<Vec<SearchMatch>, ApiError> {
         if query.is_empty() {
@@ -356,6 +415,9 @@ impl Engine {
 
             let (normalized, index_map) = normalize_for_search(&page_chars);
             for (norm_start, norm_end) in find_matches(&normalized, &query, case_sensitive) {
+                if whole_words && !is_whole_word(&normalized, norm_start, norm_end) {
+                    continue;
+                }
                 // Map normalized positions back to real character indices.
                 let start = index_map[norm_start];
                 let end = if norm_end < index_map.len() {
@@ -374,6 +436,87 @@ impl Engine {
             }
         }
         Ok(matches)
+    }
+
+    /// Outline titles whose destination is `page` — the document's own
+    /// heading list for that page, used for narration heading detection.
+    pub fn outline_titles_for_page(&self, doc_id: u32, page: PdfPageIndex) -> Vec<String> {
+        let Ok(docs) = self.docs.try_lock() else {
+            return Vec::new();
+        };
+        let Some(doc) = docs.get(&doc_id) else {
+            return Vec::new();
+        };
+        let bookmarks = doc.bookmarks();
+        let mut titles = Vec::new();
+        let mut bookmark = bookmarks.iter().next();
+        while let Some(node) = bookmark {
+            if destination_page(&node) == page
+                && let Some(title) = node.title()
+            {
+                titles.push(title);
+            }
+            collect_child_titles(&node, page, &mut titles);
+            bookmark = node.next_sibling();
+        }
+        titles
+    }
+
+    /// Char indexes where paragraphs end on a page, computed from the
+    /// text layer's character boxes: characters are grouped into visual
+    /// lines, and line ends whose vertical gap to the next line clearly
+    /// exceeds the page's median line pitch are paragraph boundaries.
+    /// `char_count` must match the page's text length (the frontend and
+    /// engine must agree on the text); returns None when they don't or the
+    /// page can't be read — callers fall back to sentence-only chunking.
+    pub fn paragraph_breaks(
+        &self,
+        doc_id: u32,
+        page_index: PdfPageIndex,
+        char_count: usize,
+    ) -> Option<Vec<usize>> {
+        if char_count == 0 {
+            return Some(Vec::new());
+        }
+        let docs = self.docs.lock().unwrap();
+        let doc = docs.get(&doc_id)?;
+        let pages = doc.pages();
+        let page = if page_index >= 0 && page_index < pages.len() {
+            pages.get(page_index).ok()?
+        } else {
+            return None;
+        };
+        let text = page.text().ok()?;
+        if text.len() as usize != char_count {
+            return None;
+        }
+
+        // Char index -> top of its box (PDF points, y grows upward);
+        // chars without a box inherit the last seen top. Whitespace glyphs
+        // never vote: some PDF generators (LaTeX among them) report spaces
+        // and CR/LF a few points above the letter baseline, and letting
+        // them split "lines" shatters headings into per-word fragments —
+        // which the narrator then spells letter by letter.
+        let mut indexed_tops: Vec<(usize, f32)> = Vec::with_capacity(char_count);
+        for (index, ch) in (0..).zip(text.chars().iter()) {
+            if ch.unicode_char().unwrap_or('\u{FFFD}').is_whitespace() {
+                continue;
+            }
+            let top = ch
+                .loose_bounds()
+                .ok()
+                .map(|rect| rect.top().value)
+                .or_else(|| indexed_tops.last().map(|(_, top)| *top));
+            if let Some(top) = top {
+                indexed_tops.push((index, top));
+            }
+        }
+        if indexed_tops.is_empty() {
+            return Some(Vec::new());
+        }
+
+        let breaks = break_candidates_from_line_tops(&indexed_tops);
+        Some(breaks)
     }
 
     /// The document's outline (table of contents) as a page-indexed tree.
@@ -541,12 +684,245 @@ impl RenderCache {
     }
 }
 
+fn destination_page(bookmark: &PdfBookmark<'_>) -> PdfPageIndex {
+    bookmark
+        .destination()
+        .and_then(|dest| dest.page_index().ok())
+        .unwrap_or(-1)
+}
+
+fn collect_child_titles(bookmark: &PdfBookmark<'_>, page: PdfPageIndex, titles: &mut Vec<String>) {
+    let mut child = bookmark.first_child();
+    while let Some(node) = child {
+        if destination_page(&node) == page
+            && let Some(title) = node.title()
+        {
+            titles.push(title);
+        }
+        collect_child_titles(&node, page, titles);
+        child = node.next_sibling();
+    }
+}
+
+/// Code-block detection: 2+ consecutive lines whose text is predominantly
+/// fixed-pitch form a block. Lines split on PDFium's newline characters;
+/// blank lines between code lines keep the block open. Returns char ranges.
+/// Collects a page's clickable links as engine-independent data. The target
+/// of an in-document link is either the link's own destination or the
+/// destination wrapped in a GoTo action; links with neither a destination
+/// nor a URI are dropped (nothing to activate).
+/// Derives paragraph-break char indices from line tops. `tops` is
+/// `(char_index, box_top)` for the page's visible glyphs, in order. Lines
+/// group within a 1.5pt baseline tolerance; a gap larger than 1.6× the
+/// median line pitch is a paragraph break, reported at the char before the
+/// next line starts. Pages with fewer than three lines have no measurable
+/// pitch and yield no breaks.
+fn break_candidates_from_line_tops(tops: &[(usize, f32)]) -> Vec<usize> {
+    let mut lines: Vec<(usize, f32)> = Vec::new();
+    let mut line_start = tops[0];
+    for &(index, top) in tops {
+        if (line_start.1 - top).abs() > 1.5 {
+            lines.push(line_start);
+            line_start = (index, top);
+        }
+    }
+    lines.push(line_start);
+    if lines.len() < 3 {
+        return Vec::new();
+    }
+
+    let mut pitches: Vec<f32> = lines.windows(2).map(|w| (w[0].1 - w[1].1).abs()).collect();
+    pitches.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = pitches[pitches.len() / 2];
+
+    let mut breaks = Vec::new();
+    for window in lines.windows(2) {
+        let gap = (window[0].1 - window[1].1).abs();
+        if gap > median * 1.6 {
+            let next_start = window[1].0;
+            if next_start > 0 {
+                breaks.push(next_start - 1);
+            }
+        }
+    }
+    breaks
+}
+
+pub fn collect_page_links(page: &PdfPage) -> Vec<PageLink> {
+    let mut links = Vec::new();
+    for link in page.links().iter() {
+        let action = link.action();
+        let dest_page = link
+            .destination()
+            .and_then(|dest| dest.page_index().ok())
+            .or_else(|| {
+                action
+                    .as_ref()
+                    .and_then(|action| action.as_local_destination_action())
+                    .and_then(|action| action.destination().ok())
+                    .and_then(|dest| dest.page_index().ok())
+            });
+        let uri = action
+            .as_ref()
+            .and_then(|action| action.as_uri_action())
+            .and_then(|action| action.uri().ok());
+        if dest_page.is_none() && uri.is_none() {
+            continue;
+        }
+        let Ok(rect) = link.rect() else {
+            continue;
+        };
+        links.push(PageLink {
+            rect: [
+                rect.left().value,
+                rect.bottom().value,
+                rect.width().value,
+                rect.height().value,
+            ],
+            dest_page,
+            uri,
+        });
+    }
+    links
+}
+
+pub fn detect_code_blocks(chars: &[char], mono: &[bool]) -> Vec<(usize, usize)> {
+    #[derive(Default)]
+    struct Line {
+        start: usize,
+        end: usize,
+        mono_count: usize,
+        text_count: usize,
+    }
+    let mut lines: Vec<Line> = Vec::new();
+    let mut current = Line::default();
+    let mut in_line = false;
+    for (i, &c) in chars.iter().enumerate() {
+        if c == '\n' || c == '\r' {
+            if in_line {
+                lines.push(std::mem::take(&mut current));
+                in_line = false;
+            }
+            continue;
+        }
+        if !in_line {
+            current = Line {
+                start: i,
+                ..Default::default()
+            };
+            in_line = true;
+        }
+        current.end = i + 1;
+        if c.is_alphanumeric() {
+            current.text_count += 1;
+            if mono.get(i).copied().unwrap_or(false) {
+                current.mono_count += 1;
+            }
+        }
+    }
+    if in_line {
+        lines.push(current);
+    }
+
+    let is_code_line =
+        |line: &Line| line.text_count >= 4 && line.mono_count * 10 >= line.text_count * 6;
+
+    let mut blocks = Vec::new();
+    let mut open: Option<(usize, usize)> = None;
+    let mut blanks_since_code = 0;
+    for line in &lines {
+        if line.text_count == 0 {
+            if open.is_some() {
+                blanks_since_code += 1;
+            }
+            continue;
+        }
+        if is_code_line(line) {
+            match open.as_mut() {
+                Some((_, end)) => *end = line.end,
+                None => open = Some((line.start, line.end)),
+            }
+            blanks_since_code = 0;
+        } else if let Some((_, end)) = open.as_mut() {
+            if blanks_since_code == 0 && line.text_count < 4 {
+                // A short non-mono fragment right after code (trailing
+                // comment debris) extends the block.
+                *end = line.end;
+            } else {
+                blocks.push(open.take().unwrap());
+            }
+        }
+    }
+    if let Some(block) = open.take() {
+        blocks.push(block);
+    }
+    blocks
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn entry(bytes: u8) -> Arc<Vec<u8>> {
         Arc::new(vec![0u8; bytes as usize])
+    }
+
+    #[test]
+    fn whole_word_boundary_recognizes_punctuation_and_rejects_inner_matches() {
+        //            012345678901234567890123
+        let text: Vec<char> = "read the reading; thread".chars().collect();
+        // "read" at 0..4: start boundary, space follows — a whole word.
+        assert!(is_whole_word(&text, 0, 4));
+        // "read" inside "reading" (9..13): 'i' follows — not a word.
+        assert!(!is_whole_word(&text, 9, 13));
+        // "read" inside "thread" (19..23): 'h' precedes — not a word.
+        assert!(!is_whole_word(&text, 19, 23));
+        // Punctuation is a boundary.
+        let punct: Vec<char> = "(read)".chars().collect();
+        assert!(is_whole_word(&punct, 1, 5));
+    }
+
+    #[test]
+    fn paragraph_breaks_split_only_at_line_pitch_gaps() {
+        // Five body lines at 14pt pitch: every gap is the median, so no
+        // break is emitted.
+        let tops: Vec<(usize, f32)> = (0..5).map(|i| (i * 10, 700.0 - i as f32 * 14.0)).collect();
+        assert!(break_candidates_from_line_tops(&tops).is_empty());
+    }
+
+    #[test]
+    fn paragraph_break_fire_on_gap_larger_than_pitch() {
+        // Three tight lines, then a heading-sized gap before the last one.
+        let tops = vec![
+            (0, 700.0),
+            (10, 686.0),
+            (20, 672.0),
+            (30, 600.0), // 72pt gap
+        ];
+        assert_eq!(break_candidates_from_line_tops(&tops), vec![29]);
+    }
+
+    #[test]
+    fn fewer_than_three_lines_yield_no_breaks() {
+        let tops = vec![(0, 700.0), (10, 600.0)];
+        assert!(break_candidates_from_line_tops(&tops).is_empty());
+    }
+
+    #[test]
+    fn letter_top_jitter_inside_a_line_does_not_split_it() {
+        // Small-caps/old-style figures can sit a hair above the baseline;
+        // 1pt of jitter on visible glyphs must not create phantom lines
+        // (which would collapse the median pitch and break mid-word).
+        let mut tops = Vec::new();
+        let mut index = 0;
+        for line in 0..4 {
+            for glyph in 0..8 {
+                let jitter = if glyph % 2 == 0 { 0.0 } else { 1.0 };
+                tops.push((index, 700.0 - line as f32 * 14.0 + jitter));
+                index += 1;
+            }
+        }
+        assert!(break_candidates_from_line_tops(&tops).is_empty());
     }
 
     #[test]
@@ -641,5 +1017,58 @@ mod tests {
     fn find_matches_handles_empty_needle_and_overflow() {
         assert!(find_matches(&s("abc"), &[], false).is_empty());
         assert!(find_matches(&s("ab"), &s("abc"), false).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod code_block_tests {
+    use super::*;
+
+    fn detect(text: &str, mono_marks: &[usize]) -> Vec<(usize, usize)> {
+        let chars: Vec<char> = text.chars().collect();
+        let mono: Vec<bool> = (0..chars.len()).map(|i| mono_marks.contains(&i)).collect();
+        detect_code_blocks(&chars, &mono)
+    }
+
+    #[test]
+    fn two_mono_lines_form_a_block() {
+        let text = "let x = 1\nlet y = 2\nAnd prose follows.";
+        let start = text.find("let x").unwrap();
+        let prose = text.find("And prose").unwrap();
+        // Both code lines are set in a monospace font.
+        let blocks = detect(text, &(start..prose).collect::<Vec<_>>());
+        assert_eq!(blocks.len(), 1);
+        assert!(text[blocks[0].0..blocks[0].1].contains("let y"));
+    }
+
+    #[test]
+    fn single_mono_line_is_not_a_block() {
+        let text = "return 4\nProse. More prose here.";
+        let start = text.find("return").unwrap();
+        assert!(detect(text, &[start]).is_empty());
+    }
+
+    #[test]
+    fn prose_is_never_a_block() {
+        let text = "Just words on this line.\nAnd this second line too.";
+        assert!(detect(text, &[]).is_empty());
+    }
+
+    #[test]
+    fn blank_line_between_code_keeps_block_open() {
+        let text = "int a = 0;
+
+int b = 1;
+The end.";
+        let first = text.find("int a").unwrap();
+        let second = text.find("int b").unwrap();
+        let mut mono: Vec<usize> = vec![];
+        for (i, _) in text.char_indices() {
+            if (i >= first && i < first + 9) || (i >= second && i < second + 9) {
+                mono.push(i);
+            }
+        }
+        let blocks = detect(text, &mono);
+        assert_eq!(blocks.len(), 1, "split at blank line: {blocks:?}");
     }
 }

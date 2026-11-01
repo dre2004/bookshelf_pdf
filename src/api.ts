@@ -7,6 +7,7 @@ import type {
   DocumentInfo,
   Highlight,
   OutlineNode,
+  PageLink,
   PageTextData,
   PageInfo,
   SearchMatch,
@@ -95,17 +96,44 @@ export async function getPageText(docId: number, page: number): Promise<PageText
   return invoke<PageTextData>("get_page_text", { docId, page });
 }
 
-// ---- on-device narration (Piper) ----
+export async function getPageLinks(docId: number, page: number): Promise<PageLink[]> {
+  return invoke<PageLink[]>("get_page_links", { docId, page });
+}
 
-export async function ttsVoices(): Promise<{ id: string; label: string; lang: string }[]> {
+// ---- on-device narration (Kokoro) ----
+
+export interface TtsVoice {
+  id: string;
+  label: string;
+  lang: string;
+  engine: "kokoro";
+}
+
+export async function ttsVoices(): Promise<TtsVoice[]> {
   return invoke("tts_voices");
 }
+
+export async function ttsPackInstalled(): Promise<boolean> {
+  return invoke("tts_pack_installed");
+}
+
+export async function ttsPreviewVoice(voice: string, speed: number): Promise<void> {
+  return invoke("tts_preview_voice", { voice, speed });
+}
+
+export async function ttsInstallKokoro(): Promise<void> {
+  return invoke("tts_install_kokoro");
+}
+
+export type CodeHandling = "skip" | "announce";
 
 export async function ttsSpeak(args: {
   text: string;
   page: number;
   voiceId: string;
   rate: number;
+  docId?: number;
+  codeHandling?: CodeHandling;
 }): Promise<void> {
   return invoke("tts_speak", args);
 }
@@ -126,8 +154,9 @@ export async function searchDocument(
   docId: number,
   query: string,
   caseSensitive: boolean,
+  wholeWords: boolean,
 ): Promise<SearchMatch[]> {
-  return invoke<SearchMatch[]>("search_document", { docId, query, caseSensitive });
+  return invoke<SearchMatch[]>("search_document", { docId, query, caseSensitive, wholeWords });
 }
 
 export async function getOutline(docId: number): Promise<OutlineNode[]> {

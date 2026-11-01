@@ -1,6 +1,6 @@
 mod commands;
 mod db;
-mod pdfium_engine;
+pub mod pdfium_engine;
 mod tts;
 
 use std::sync::Arc;
@@ -101,6 +101,7 @@ pub fn run() {
             commands::close_document,
             commands::get_page_dims,
             commands::get_page_text,
+            commands::get_page_links,
             commands::search_document,
             commands::get_outline,
             commands::bookmarks_add,
@@ -119,10 +120,13 @@ pub fn run() {
             commands::settings_set,
             commands::get_startup_file,
             commands::tts_voices,
+            commands::tts_pack_installed,
+            commands::tts_preview_voice,
             commands::tts_speak,
             commands::tts_pause,
             commands::tts_resume,
-            commands::tts_stop
+            commands::tts_stop,
+            commands::tts_install_kokoro
         ])
         .register_asynchronous_uri_scheme_protocol("pdfimg", |ctx, request, responder| {
             let engine = ctx.app_handle().state::<Arc<Engine>>().inner().clone();

@@ -30,8 +30,17 @@ rusqlite = { version = "0.41.1", features = ["bundled"] }
 tauri-plugin-window-state = "2.5.0"
 tauri-plugin-single-instance = "2.5.5"
 rodio = "0.23.0"
-piper-plus = { version = "0.5.3", features = ["inference"] }
 piper-plus-g2p = { version = "0.5.3", features = ["bundled-dicts"] }
+ureq = "3.5.0"
+# Features mirror what the Kokoro engine needs: prebuilt ONNX Runtime
+# binaries over HTTPS, copied next to the app binary.
+ort = { version = "=2.0.0-rc.15", default-features = false, features = [
+    "std",
+    "download-binaries",
+    "tls-rustls",
+    "copy-dylibs",
+    "api-24",
+] }
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
