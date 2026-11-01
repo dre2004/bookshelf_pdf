@@ -28,3 +28,8 @@ dist-ssr
 
 # Kokoro pack (run scripts/fetch-voices.mjs or download from the app)
 /engine/kokoro/
+
+# Build artifacts
+src-tauri/target/
+src-tauri/target-probe/
+target/
