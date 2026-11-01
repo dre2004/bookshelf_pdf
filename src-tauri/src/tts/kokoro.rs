@@ -65,14 +65,22 @@ fn trim_silence(samples: &mut Vec<f32>, sample_rate: u32) {
     samples.drain(..start);
 }
 
-/// Maps smart quotes/apostrophes/dashes to their ASCII equivalents for
-/// G2P; unknown characters are dropped by the tokenizer anyway.
+/// Maps typographic variants and PDFium extraction artifacts to their
+/// ASCII equivalents for G2P. The dictionary rejects exotic characters
+/// and falls back to spelling words letter by letter, so this is where
+/// "cross<U+0002>references" (PDFium's placeholder for a glyph missing
+/// from the font's ToUnicode map) and "cross<U+2011>references" (LaTeX's
+/// non-breaking hyphen) become speakable.
 fn normalize_typographic(text: &str) -> String {
     text.chars()
         .map(|c| match c {
-            '\u{2019}' | '\u{2018}' => '\'',
+            '\u{2019}' | '\u{2018}' | '\u{02BC}' => '\'',
             '\u{201C}' | '\u{201D}' => '"',
-            '\u{2013}' | '\u{2014}' => '-',
+            '\u{2013}' | '\u{2014}' | '\u{2011}' | '\u{2010}' | '\u{FE63}' | '\u{FF0D}' => '-',
+            // Control characters (PDFium glyph placeholders): a hyphen is
+            // the harmless stand-in — the only place they've been observed
+            // is compound words. \t \r \n never reach here (word-split).
+            c if c.is_control() => '-',
             other => other,
         })
         .collect()
@@ -606,6 +614,37 @@ mod g2p_tests {
         let curly = format!("you{}re", '\u{2019}');
         let normalized = normalize_typographic(&curly);
         let (a, _) = p.phonemize_with_prosody(&normalized).expect("g2p");
+        let (b, _) = p.phonemize_with_prosody("you're").expect("g2p");
+        assert_eq!(a.concat(), b.concat());
+    }
+
+    /// The reported "c-r-o-s-s-r-e-f-e-r-e-n-c-e-s": the book's hyphen
+    /// glyph extracts from PDFium as control character U+0002, the
+    /// dictionary rejects the word, and it letter-spells. The non-breaking
+    /// hyphen family and the modifier-letter apostrophe fail the same way.
+    #[test]
+    fn pdfium_placeholder_and_hyphen_variants_phonemize_like_ascii() {
+        let p = EnglishPhonemizer::new_bundled().expect("phonemizer");
+        let (ascii, _) = p.phonemize_with_prosody("cross-references").expect("g2p");
+        let ascii = ascii.concat();
+        for variant in [
+            format!("cross{}references", '\u{0002}'),
+            format!("cross{}references", '\u{2011}'),
+            format!("cross{}references", '\u{2010}'),
+            format!("cross{}references", '\u{FF0D}'),
+        ] {
+            let normalized = normalize_typographic(&variant);
+            let (got, _) = p.phonemize_with_prosody(&normalized).expect("g2p");
+            assert_eq!(
+                got.concat(),
+                ascii,
+                "variant {variant:?} should read like a plain hyphen"
+            );
+        }
+        // And the modifier-letter apostrophe reads like a plain one.
+        let (a, _) = p
+            .phonemize_with_prosody(&normalize_typographic(&format!("you{}re", '\u{02BC}')))
+            .expect("g2p");
         let (b, _) = p.phonemize_with_prosody("you're").expect("g2p");
         assert_eq!(a.concat(), b.concat());
     }
