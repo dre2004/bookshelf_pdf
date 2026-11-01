@@ -70,6 +70,10 @@ jobs:
 
       - name: Fetch PDFium for this platform
         run: node scripts/fetch-pdfium.mjs ${{ matrix.pdfium-target }}
+        # Authenticated API calls: the bare-runner IP rate limit (403)
+        # intermittently broke this step on macOS.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and upload to draft release
         uses: tauri-apps/tauri-action@v0
