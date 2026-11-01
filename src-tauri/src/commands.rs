@@ -189,7 +189,7 @@ pub fn get_startup_file() -> Option<String> {
         .find(|arg| arg.to_lowercase().ends_with(".pdf"))
 }
 
-// ---- on-device narration (Piper) ----
+// ---- on-device narration (Kokoro) ----
 
 /// Downloads the Kokoro pack (model + tokenizer + curated voices);
 /// progress arrives as `kokoro-download` events.
@@ -285,18 +285,4 @@ pub fn tts_resume(engine: tauri::State<'_, Arc<TtsEngine>>) {
 #[tauri::command]
 pub fn tts_stop(engine: tauri::State<'_, Arc<TtsEngine>>) {
     engine.stop();
-}
-
-/// Downloads the default on-device voice set into the user's voices
-/// directory; progress arrives as `voice-download` events.
-#[tauri::command]
-pub fn tts_install_default_voices(engine: tauri::State<'_, Arc<TtsEngine>>) -> Result<(), String> {
-    let dir = engine.install_dir()?;
-    let app = engine.app_handle().clone();
-    std::thread::spawn(move || {
-        // Errors are reported via the event stream; the command returns
-        // once the worker is launched.
-        let _ = crate::tts::voice_downloads::download_default_voices(&app, &dir);
-    });
-    Ok(())
 }

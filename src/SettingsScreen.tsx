@@ -1,9 +1,9 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { ttsPackInstalled, ttsPreviewVoice, ttsVoices } from "./api";
+import { ttsPackInstalled, ttsPreviewVoice } from "./api";
 import type { ReadMode, Theme } from "./types";
 import { stepped } from "./NarrationBar";
-import type { NarrationController } from "./narration";
+import { SAMPLE_SENTENCE, speechSupported, type NarrationController } from "./narration";
 
 interface Props {
   onClose: () => void;
@@ -22,22 +22,16 @@ export default function SettingsScreen({
   onThemeChange,
   narration,
 }: Props) {
-  const [voices, setVoices] = useState<{ id: string; label: string }[]>([]);
   const [packInstalled, setPackInstalled] = useState(true);
-  const [sampling, setSampling] = useState<string | null>(null);
+  const [sampling, setSampling] = useState(false);
   const [sampleError, setSampleError] = useState<string | null>(null);
-  const [downloading, setDownloading] = useState(false);
 
   useEffect(() => {
-    void ttsVoices().then(setVoices).catch(() => {});
     void ttsPackInstalled().then(setPackInstalled).catch(() => setPackInstalled(true));
   }, []);
 
   useEffect(() => {
-    const unlisten = listen<{ kind: string; voice?: string }>("kokoro-download", (event) => {
-      if (event.payload.kind === "started" || event.payload.kind === "done") {
-        setDownloading(event.payload.kind === "started");
-      }
+    const unlisten = listen<{ kind: string }>("kokoro-download", (event) => {
       if (event.payload.kind === "done") {
         void ttsPackInstalled().then(setPackInstalled).catch(() => {});
       }
@@ -47,29 +41,35 @@ export default function SettingsScreen({
     };
   }, []);
 
-  const grouped = useMemo(() => {
-    const groups = new Map<string, { id: string; label: string }[]>();
-    for (const voice of voices) {
-      // label format "Name (accent, gender)"
-      const match = voice.label.match(/^(.*) \((.*)\)$/);
-      const group = match ? match[2] : "Voices";
-      if (!groups.has(group)) groups.set(group, []);
-      groups.get(group)!.push(voice);
-    }
-    return [...groups.entries()].sort(([a], [b]) => a.localeCompare(b));
-  }, [voices]);
+  const onDevice = narration.options.filter((option) => option.engine === "kokoro");
+  const system = narration.options.filter((option) => option.engine === "speech");
+  const selection = narration.voiceURI || onDevice[0]?.uri || system[0]?.uri || "";
 
-  const startPackDownload = () => narration.download.startKokoro();
-
-  const sample = async (voice: string) => {
+  /** Plays the sample sentence in the selected voice: the on-device engine
+   *  synthesizes it (downloading the pack first when missing), system
+   *  voices go through the browser's speech synthesis. */
+  const playSample = async () => {
+    if (!selection) return;
     setSampleError(null);
-    setSampling(voice);
+    setSampling(true);
     try {
-      await ttsPreviewVoice(voice, narration.rate);
+      if (selection.startsWith("kokoro:")) {
+        await ttsPreviewVoice(selection.slice("kokoro:".length), narration.rate);
+      } else if (speechSupported()) {
+        const utterance = new SpeechSynthesisUtterance(SAMPLE_SENTENCE);
+        const voice = window.speechSynthesis.getVoices().find((v) => v.voiceURI === selection);
+        if (voice) {
+          utterance.voice = voice;
+          utterance.lang = voice.lang;
+        }
+        utterance.rate = narration.rate;
+        window.speechSynthesis.cancel();
+        window.speechSynthesis.speak(utterance);
+      }
     } catch (e) {
       setSampleError(String(e));
     } finally {
-      setSampling(null);
+      setSampling(false);
     }
   };
 
@@ -117,6 +117,41 @@ export default function SettingsScreen({
         <section className="settings-section">
           <h3>Narration</h3>
           <div className="settings-row">
+            <span>Voice</span>
+            <div className="voice-picker">
+              <select
+                value={selection}
+                onChange={(e) => narration.setVoiceURI(e.target.value)}
+                aria-label="Narration voice"
+              >
+                {onDevice.length > 0 && (
+                  <optgroup label="Bookshelf (on-device)">{onDevice.map((option) => (
+                    <option key={option.uri} value={option.uri}>
+                      {option.label}
+                    </option>
+                  ))}</optgroup>
+                )}
+                {system.length > 0 && (
+                  <optgroup label="System voices">{system.map((option) => (
+                    <option key={option.uri} value={option.uri}>
+                      {option.label}
+                    </option>
+                  ))}</optgroup>
+                )}
+                {onDevice.length + system.length === 0 && <option value="">Loading voices…</option>}
+              </select>
+              <button
+                className="btn icon"
+                onClick={() => void playSample()}
+                disabled={sampling || !selection}
+                title="Play a sample in the selected voice"
+              >
+                {sampling ? "…" : "▶"}
+              </button>
+            </div>
+          </div>
+
+          <div className="settings-row">
             <span>Speed</span>
             <div className="speed-stepper">
               <button
@@ -155,42 +190,15 @@ export default function SettingsScreen({
             <div className="voice-download">
               <button
                 className="btn primary"
-                onClick={startPackDownload}
-                disabled={downloading || narration.download.kokoroActive}
+                onClick={narration.download.start}
+                disabled={narration.download.active}
               >
-                {downloading || narration.download.kokoroActive
-                  ? `Downloading engine… ${Math.round(narration.download.kokoroProgress * 100)}%`
+                {narration.download.active
+                  ? `Downloading engine… ${Math.round(narration.download.progress * 100)}%`
                   : "⬇ Download narration engine (~87 MB)"}
               </button>
             </div>
           )}
-
-          <div className="voice-catalog">
-            {grouped.map(([group, items]) => (
-              <div key={group} className="voice-group">
-                <h4>{group}</h4>
-                {items.map((voice) => {
-                  const selected = narration.voiceURI === `kokoro:${voice.id}`;
-                  return (
-                    <div key={voice.id} className={`voice-row ${selected ? "selected" : ""}`}>
-                      <button className="voice-select" onClick={() => narration.setVoiceURI(`kokoro:${voice.id}`)}>
-                        <span className="voice-name">{voice.label}</span>
-                        {selected && <span className="voice-selected-mark">✓</span>}
-                      </button>
-                      <button
-                        className="btn icon voice-sample"
-                        disabled={!packInstalled || sampling !== null}
-                        onClick={() => void sample(voice.id)}
-                        title="Play a sample"
-                      >
-                        {sampling === voice.id ? "…" : "▶"}
-                      </button>
-                    </div>
-                  );
-                })}
-              </div>
-            ))}
-          </div>
           {sampleError && <p className="muted narration-unsupported">{sampleError}</p>}
         </section>
       </div>

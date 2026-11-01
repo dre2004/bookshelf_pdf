@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import {
   type CodeHandling,
-  ttsInstallDefaultVoices,
+  type TtsVoice,
   ttsInstallKokoro,
   ttsPause,
   ttsResume,
@@ -20,19 +20,16 @@ export interface SpokenRange {
   end: number;
 }
 
-export interface PiperVoice {
-  id: string;
-  label: string;
-  lang: string;
-  engine: "piper" | "kokoro";
-}
+/** Sentence spoken by the settings screen's sample button. Matches the
+ *  Rust preview path (`tts_preview_voice`). */
+export const SAMPLE_SENTENCE = "This is a sample of how this voice reads your books.";
 
 export interface NarrationVoiceOption {
-  /** Stable selection key; `piper:<id>` for on-device voices, the system
+  /** Stable selection key; `kokoro:<id>` for on-device voices, the system
    *  voice's own URI otherwise. */
   uri: string;
   label: string;
-  engine: "piper" | "kokoro" | "speech";
+  engine: "kokoro" | "speech";
 }
 
 /** Local voices first, then by name — they tend to respond faster. */
@@ -55,7 +52,7 @@ interface UseNarrationArgs {
 
 export interface NarrationController {
   supported: boolean;
-  /** All selectable voices: on-device (Piper) first, then system voices. */
+  /** All selectable voices: on-device (Kokoro) first, then system voices. */
   options: NarrationVoiceOption[];
   speaking: boolean;
   paused: boolean;
@@ -73,26 +70,19 @@ export interface NarrationController {
   pause: () => void;
   resume: () => void;
   stop: () => void;
-  /** States of the default-voice download offered when none are installed. */
+  /** State of the on-device engine pack download offered in settings. */
   download: {
     active: boolean;
     progress: number; // 0..1 when the total size is known
-    knownTotal: boolean;
-    downloadedMb: number;
     error: string | null;
     start: () => void;
-    kokoroActive: boolean;
-    kokoroProgress: number; // 0..1
-    kokoroError: string | null;
-    startKokoro: () => void;
   };
 }
 
-const PIPER_PREFIX = "piper:";
 const KOKORO_PREFIX = "kokoro:";
 
-function isPiperVoice(uri: string): boolean {
-  return uri.startsWith(PIPER_PREFIX);
+function isOnDeviceVoice(uri: string): boolean {
+  return uri.startsWith(KOKORO_PREFIX);
 }
 
 export function useNarration({
@@ -105,7 +95,7 @@ export function useNarration({
   const supported = speechSupported();
 
   const [systemVoices, setSystemVoices] = useState<SpeechSynthesisVoice[]>([]);
-  const [piperVoices, setPiperVoices] = useState<PiperVoice[]>([]);
+  const [engineVoices, setEngineVoices] = useState<TtsVoice[]>([]);
   const [speaking, setSpeaking] = useState(false);
   const [paused, setPaused] = useState(false);
   const [spokenRange, setSpokenRange] = useState<SpokenRange | null>(null);
@@ -146,10 +136,10 @@ export function useNarration({
   }, [continuous]);
 
   const options: NarrationVoiceOption[] = [
-    ...piperVoices.map((voice) => ({
-      uri: voice.engine === "kokoro" ? `${KOKORO_PREFIX}${voice.id}` : `${PIPER_PREFIX}${voice.id}`,
+    ...engineVoices.map((voice) => ({
+      uri: `${KOKORO_PREFIX}${voice.id}`,
       label: voice.label,
-      engine: voice.engine,
+      engine: "kokoro" as const,
     })),
     ...(supported
       ? systemVoices.map((voice) => ({
@@ -160,21 +150,12 @@ export function useNarration({
       : []),
   ];
 
-  /** Default pick: Daniela when installed, else the usual system heuristic. */
+  /** Default pick: Heart when listed, else the usual system heuristic. */
   const defaultVoiceURI = useCallback(
-    (system: SpeechSynthesisVoice[], piper: PiperVoice[]): string => {
-      const heart = piper.find(
-        (voice) => voice.engine === "kokoro" && voice.id === "af_heart",
-      );
+    (system: SpeechSynthesisVoice[], engine: TtsVoice[]): string => {
+      const heart = engine.find((voice) => voice.id === "af_heart");
       if (heart) return `${KOKORO_PREFIX}${heart.id}`;
-      const daniela = piper.find((voice) => voice.id.includes("daniela"));
-      if (daniela) return `${PIPER_PREFIX}${daniela.id}`;
-      const firstPiper = piper[0];
-      if (firstPiper) {
-        return firstPiper.engine === "kokoro"
-          ? `${KOKORO_PREFIX}${firstPiper.id}`
-          : `${PIPER_PREFIX}${firstPiper.id}`;
-      }
+      if (engine[0]) return `${KOKORO_PREFIX}${engine[0].id}`;
       const list = sortVoices(system);
       const preferred =
         list.find((v) => v.localService && v.lang.startsWith(navigator.language)) ??
@@ -194,8 +175,9 @@ export function useNarration({
       const list = sortVoices(synth.getVoices());
       setSystemVoices(list);
       setVoiceURIState((current) => {
-        if (current && !autoPicked.current) return current;
-        if (current && isPiperVoice(current)) return current;
+        // A user choice always wins; an on-device default holds until the
+        // engine list settles it.
+        if (current && (!autoPicked.current || isOnDeviceVoice(current))) return current;
         const next = defaultVoiceURI(list, []);
         if (next) autoPicked.current = true;
         return next || current;
@@ -207,11 +189,11 @@ export function useNarration({
   }, [supported, defaultVoiceURI]);
 
   // On-device voices come from the Rust engine; arriving last, they get the
-  // final say over any automatic default (Daniela wins when installed).
-  const refreshPiperVoices = useCallback(() => {
+  // final say over any automatic default (Heart wins when listed).
+  const refreshEngineVoices = useCallback(() => {
     ttsVoices()
       .then((voices) => {
-        setPiperVoices(voices);
+        setEngineVoices(voices);
         setVoiceURIState((current) => {
           if (current && !autoPicked.current) return current;
           const next = defaultVoiceURI(systemVoices, voices);
@@ -224,54 +206,14 @@ export function useNarration({
   }, [defaultVoiceURI]);
 
   useEffect(() => {
-    refreshPiperVoices();
+    refreshEngineVoices();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [docId, refreshPiperVoices]);
+  }, [docId, refreshEngineVoices]);
 
-  // ---- default-voice download (offered when no on-device voices exist) ----
+  // ---- Kokoro engine pack download ----
   const [downloadActive, setDownloadActive] = useState(false);
   const [downloadProgress, setDownloadProgress] = useState(0);
   const [downloadError, setDownloadError] = useState<string | null>(null);
-  const [downloadKnownTotal, setDownloadKnownTotal] = useState(false);
-  const [downloadedMb, setDownloadedMb] = useState(0);
-
-  useEffect(() => {
-    const unlisten = listen<{
-      kind: "started" | "progress" | "voiceDone" | "done" | "failed";
-      totalBytes?: number;
-      downloadedBytes?: number;
-      reason?: string;
-    }>("voice-download", (event) => {
-      const payload = event.payload;
-      if (payload.kind === "started") {
-        setDownloadActive(true);
-        setDownloadError(null);
-        setDownloadProgress(0);
-        setDownloadedMb(0);
-        setDownloadKnownTotal((payload.totalBytes ?? 0) > 0);
-      } else if (payload.kind === "progress") {
-        const downloaded = payload.downloadedBytes ?? 0;
-        setDownloadedMb(downloaded / (1024 * 1024));
-        const total = payload.totalBytes;
-        if (total) setDownloadProgress(Math.min(1, downloaded / total));
-      } else if (payload.kind === "done") {
-        setDownloadActive(false);
-        setDownloadProgress(1);
-        refreshPiperVoices();
-      } else if (payload.kind === "failed") {
-        setDownloadActive(false);
-        setDownloadError(payload.reason ?? "download failed");
-      }
-    });
-    return () => {
-      void unlisten.then((fn) => fn());
-    };
-  }, [refreshPiperVoices]);
-
-  // ---- Kokoro pack download ----
-  const [kokoroActive, setKokoroActive] = useState(false);
-  const [kokoroProgress, setKokoroProgress] = useState(0);
-  const [kokoroError, setKokoroError] = useState<string | null>(null);
 
   useEffect(() => {
     const unlisten = listen<{
@@ -282,42 +224,32 @@ export function useNarration({
     }>("kokoro-download", (event) => {
       const payload = event.payload;
       if (payload.kind === "started") {
-        setKokoroActive(true);
-        setKokoroError(null);
-        setKokoroProgress(0);
+        setDownloadActive(true);
+        setDownloadError(null);
+        setDownloadProgress(0);
       } else if (payload.kind === "progress") {
         const total = payload.totalBytes ?? 0;
         const downloaded = payload.downloadedBytes ?? 0;
-        if (total > 0) setKokoroProgress(Math.min(1, downloaded / total));
+        if (total > 0) setDownloadProgress(Math.min(1, downloaded / total));
       } else if (payload.kind === "done") {
-        setKokoroActive(false);
-        setKokoroProgress(1);
-        refreshPiperVoices();
+        setDownloadActive(false);
+        setDownloadProgress(1);
+        refreshEngineVoices();
       } else if (payload.kind === "failed") {
-        setKokoroActive(false);
-        setKokoroError(payload.reason ?? "download failed");
+        setDownloadActive(false);
+        setDownloadError(payload.reason ?? "download failed");
       }
     });
     return () => {
       void unlisten.then((fn) => fn());
     };
-  }, [refreshPiperVoices]);
-
-  const startKokoroDownload = useCallback(() => {
-    setKokoroError(null);
-    setKokoroActive(true);
-    setKokoroProgress(0);
-    ttsInstallKokoro().catch((e) => {
-      setKokoroActive(false);
-      setKokoroError(String(e));
-    });
-  }, []);
+  }, [refreshEngineVoices]);
 
   const startDownload = useCallback(() => {
     setDownloadError(null);
     setDownloadActive(true);
     setDownloadProgress(0);
-    ttsInstallDefaultVoices().catch((e) => {
+    ttsInstallKokoro().catch((e) => {
       setDownloadActive(false);
       setDownloadError(String(e));
     });
@@ -330,11 +262,7 @@ export function useNarration({
 
   const stop = useCallback(() => {
     stoppedRef.current = true;
-    if (
-      isPiperVoice(voiceURIRef.current) ||
-      voiceURIRef.current.startsWith(KOKORO_PREFIX) ||
-      speakingPageRef.current !== null
-    ) {
+    if (isOnDeviceVoice(voiceURIRef.current) || speakingPageRef.current !== null) {
       void ttsStop().catch(() => {});
     }
     if (supported) window.speechSynthesis.cancel();
@@ -356,7 +284,7 @@ export function useNarration({
       setSpokenRange(null);
 
       const selection = voiceURIRef.current;
-      if (selection.startsWith(PIPER_PREFIX) || selection.startsWith(KOKORO_PREFIX)) {
+      if (isOnDeviceVoice(selection)) {
         speakingPageRef.current = target;
         void getText(target)
           .then((text) =>
@@ -480,7 +408,7 @@ export function useNarration({
 
   const pause = useCallback(() => {
     if (!speaking) return;
-    if (isPiperVoice(voiceURIRef.current) || voiceURIRef.current.startsWith(KOKORO_PREFIX)) {
+    if (isOnDeviceVoice(voiceURIRef.current)) {
       void ttsPause().catch(() => {});
     } else if (supported) {
       window.speechSynthesis.pause();
@@ -490,7 +418,7 @@ export function useNarration({
 
   const resume = useCallback(() => {
     if (!speaking) return;
-    if (isPiperVoice(voiceURIRef.current) || voiceURIRef.current.startsWith(KOKORO_PREFIX)) {
+    if (isOnDeviceVoice(voiceURIRef.current)) {
       void ttsResume().catch(() => {});
     } else if (supported) {
       window.speechSynthesis.resume();
@@ -515,6 +443,7 @@ export function useNarration({
               voiceId: voiceURIRef.current,
               rate: nextRate,
               docId,
+              codeHandling: codeHandlingRef.current,
             }),
           )
           .catch(() => stop());
@@ -524,7 +453,7 @@ export function useNarration({
   );
 
   return {
-    supported: supported || piperVoices.length > 0,
+    supported: supported || engineVoices.length > 0,
     options,
     speaking,
     paused,
@@ -545,14 +474,8 @@ export function useNarration({
     download: {
       active: downloadActive,
       progress: downloadProgress,
-      knownTotal: downloadKnownTotal,
-      downloadedMb,
       error: downloadError,
       start: startDownload,
-      kokoroActive,
-      kokoroProgress,
-      kokoroError,
-      startKokoro: startKokoroDownload,
     },
   };
 }

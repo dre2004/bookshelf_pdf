@@ -1,7 +1,7 @@
-//! Kokoro-82M engine: natural neural voices computed on-device through the
-//! same ONNX Runtime as the Piper engine. Pack layout (app-data `kokoro/` or
-//! dev `engine/kokoro/`): `model.onnx`, `tokenizer.json`, `voices/<name>.bin`
-//! (510×256 float32 style embeddings).
+//! Kokoro-82M engine: natural neural voices computed on-device through
+//! ONNX Runtime. Pack layout (app-data `kokoro/` or dev `engine/kokoro/`):
+//! `model.onnx`, `tokenizer.json`, `voices/<name>.bin` (510×256 float32
+//! style embeddings).
 
 use std::{
     collections::HashMap,
@@ -10,6 +10,7 @@ use std::{
 };
 
 use ort::{
+    environment::Environment,
     session::{Session, builder::GraphOptimizationLevel},
     value::Tensor,
 };
@@ -18,7 +19,24 @@ use serde::Serialize;
 use serde_json::Value;
 use tauri::Emitter;
 
-use super::voice_downloads::download_file;
+/// The process-wide ONNX Runtime environment. ort allows only one
+/// `Environment` per process — a second `init().build()` fails even after
+/// the first is dropped — so every session shares this one.
+static ORT_ENV: Mutex<Option<Environment>> = Mutex::new(None);
+
+fn ort_environment() -> Result<Environment, String> {
+    let mut slot = ORT_ENV
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(env) = slot.as_ref() {
+        return Ok(env.clone());
+    }
+    let env = ort::init()
+        .build()
+        .map_err(|e| format!("ONNX Runtime environment: {e}"))?;
+    *slot = Some(env.clone());
+    Ok(env)
+}
 
 /// The model's synthesis window: token sequences are capped at this length
 /// (matching the reference implementations' MAX_PHONEME_LENGTH).
@@ -218,8 +236,7 @@ impl KokoroModel {
         if !model_path.is_file() {
             return Err("Kokoro model is not installed".into());
         }
-        let env =
-            piper_plus::ort_env::environment().map_err(|e| format!("ort environment: {e}"))?;
+        let env = ort_environment()?;
         let session = Session::builder(&env)
             .map_err(|e| format!("session builder: {e}"))?
             .with_optimization_level(GraphOptimizationLevel::Level3)
@@ -563,7 +580,7 @@ pub fn play_voice_sample(dir: &Path, voice: &str, speed: f32) -> Result<(), Stri
     // Sample playback is fire-and-forget on its own audio player; the
     // narration engine is untouched.
     std::thread::spawn(move || {
-        let Ok(_env) = piper_plus::ort_env::environment() else {
+        let Ok(_env) = ort_environment() else {
             return;
         };
         let Ok(sink) = rodio::DeviceSinkBuilder::open_default_sink() else {
@@ -595,6 +612,58 @@ fn head_content_length(url: &str) -> u64 {
                 .and_then(|value| value.parse().ok())
         })
         .unwrap_or(0)
+}
+
+/// Streams `url` to `path` via a `.part` temp file, verifying the expected
+/// size when known. `downloaded`/`last_reported` carry cumulative progress
+/// across sequential files; `report` fires roughly every 1 MB.
+#[allow(clippy::too_many_arguments)]
+fn download_file(
+    agent: &ureq::Agent,
+    url: &str,
+    path: &Path,
+    expected_size: u64,
+    downloaded: &mut u64,
+    last_reported: &mut u64,
+    report: &mut dyn FnMut(u64),
+) -> Result<(), String> {
+    use std::io::{Read, Write};
+
+    let mut reader = agent
+        .get(url)
+        .call()
+        .map_err(|e| format!("request failed: {e}"))?
+        .into_body()
+        .into_reader();
+
+    let temp_path = path.with_extension("part");
+    let mut file = std::fs::File::create(&temp_path).map_err(|e| format!("create: {e}"))?;
+    let mut buffer = vec![0u8; 256 * 1024];
+    let mut written = 0u64;
+    loop {
+        let read = reader.read(&mut buffer).map_err(|e| format!("read: {e}"))?;
+        if read == 0 {
+            break;
+        }
+        file.write_all(&buffer[..read])
+            .map_err(|e| format!("write: {e}"))?;
+        written += read as u64;
+        *downloaded += read as u64;
+        // Throttle progress to ~1 MB steps.
+        if *downloaded - *last_reported >= 1024 * 1024 {
+            *last_reported = *downloaded;
+            report(*downloaded);
+        }
+    }
+    drop(file);
+    if expected_size > 0 && written != expected_size {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(format!(
+            "size mismatch: got {written}, expected {expected_size}"
+        ));
+    }
+    std::fs::rename(&temp_path, path).map_err(|e| format!("rename: {e}"))?;
+    Ok(())
 }
 
 #[cfg(test)]

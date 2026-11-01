@@ -67,7 +67,6 @@ vi.mock("./api", () => ({
   ttsPause: vi.fn().mockResolvedValue(undefined),
   ttsResume: vi.fn().mockResolvedValue(undefined),
   ttsStop: vi.fn().mockResolvedValue(undefined),
-  ttsInstallDefaultVoices: vi.fn().mockResolvedValue(undefined),
   ttsInstallKokoro: vi.fn().mockResolvedValue(undefined),
 }));
 

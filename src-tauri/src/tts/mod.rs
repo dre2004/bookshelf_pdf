@@ -1,32 +1,22 @@
-//! On-device text-to-speech for classic Piper voices (rhasspy/piper-voices
-//! `.onnx` + `.onnx.json` pairs): ONNX inference through piper-plus's
-//! engine, phonemization through its pure-Rust G2P (no espeak-ng, no
-//! Python), playback through rodio. Voices load lazily on first use.
-//!
-//! piper-plus's high-level `PiperVoice` rejects classic voices
-//! (`phoneme_type: espeak`), so this module drives its public low-level
-//! pieces directly and replicates classic Piper's phoneme-id construction:
-//! ids from the model's own map, a pad after every phoneme, BOS prefix and
-//! EOS suffix (`^`, `_`, `$` tokens in the map).
+//! On-device narration: the Kokoro-82M engine (see [`kokoro`]) synthesizes
+//! each page chunk through ONNX Runtime, phonemization is pure-Rust G2P
+//! (`piper_plus_g2p`, no espeak-ng, no Python), playback runs through rodio
+//! with prefetch so chunks flow without gaps.
 
 mod chunker;
 pub mod homograph;
 pub mod kokoro;
-pub mod voice_downloads;
 
 use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
 };
 
-use piper_plus::{OnnxEngine, SynthesisRequest, VoiceConfig};
 use serde::Serialize;
-use serde_json::Value;
-use tauri::{Emitter, Manager};
+use tauri::Emitter;
 
 use chunker::split_for_narration;
 use kokoro::KokoroModel;
@@ -34,7 +24,7 @@ use kokoro::KokoroModel;
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TtsVoiceInfo {
-    /// Selection key: `piper:<stem>` or `kokoro:<voice>`.
+    /// Selection key: `kokoro:<voice>`.
     pub id: String,
     /// Human-friendly label.
     pub label: String,
@@ -62,18 +52,8 @@ pub enum TtsEvent {
     },
 }
 
-struct LoadedVoice {
-    engine: Mutex<OnnxEngine>,
-    phonemizer: Box<dyn piper_plus_g2p::Phonemizer>,
-    id_map: piper_plus_g2p::PhonemeIdMap,
-    noise_scale: f32,
-    length_scale: f32,
-    noise_w: f32,
-}
-
 pub struct TtsEngine {
     app: tauri::AppHandle,
-    loaded: Mutex<HashMap<String, Arc<LoadedVoice>>>,
     kokoro: Mutex<Option<(PathBuf, Arc<KokoroModel>)>>,
     playback: Mutex<PlaybackControl>,
     device: Mutex<Option<rodio::MixerDeviceSink>>,
@@ -621,7 +601,6 @@ impl TtsEngine {
     pub fn new(app: tauri::AppHandle) -> Self {
         Self {
             app,
-            loaded: Mutex::new(HashMap::new()),
             kokoro: Mutex::new(None),
             playback: Mutex::new(PlaybackControl {
                 stop: Arc::new(AtomicBool::new(false)),
@@ -632,38 +611,8 @@ impl TtsEngine {
         }
     }
 
-    /// Voice lookup locations, resolved per call: the user's app-data
-    /// directory (where downloads install) plus the repo's engine/voices
-    /// for dev checkouts. The download happens after startup, so caching
-    /// one dir at construction would hide freshly installed voices.
-    fn voices_dirs(&self) -> Vec<PathBuf> {
-        let mut candidates = Vec::new();
-        if let Ok(data) = self.app.path().app_data_dir() {
-            candidates.push(data.join("voices"));
-        }
-        if let Ok(cwd) = std::env::current_dir() {
-            candidates.push(cwd.join("engine").join("voices"));
-            candidates.push(cwd.join("..").join("engine").join("voices"));
-        }
-        candidates.into_iter().filter(|dir| dir.is_dir()).collect()
-    }
-
-    /// Where downloads install to: the per-user voices directory, created
-    /// on demand (distinct from the read-only lookup candidates).
-    pub fn install_dir(&self) -> Result<PathBuf, String> {
-        let dir = self
-            .app
-            .path()
-            .app_data_dir()
-            .map_err(|e| format!("cannot resolve app data dir: {e}"))?
-            .join("voices");
-        std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create voices dir: {e}"))?;
-        Ok(dir)
-    }
-
-    /// The narration voice list: the full Kokoro English catalog (voices
-    /// download on demand) plus system voices. Piper is retired from the
-    /// catalog per user decision — its engine code remains dormant.
+    /// The narration voice list: the full Kokoro English catalog; voice
+    /// style files download on demand with the engine pack.
     pub fn list_voices(&self) -> Vec<TtsVoiceInfo> {
         let mut voices: Vec<TtsVoiceInfo> = kokoro::KOKORO_VOICE_SPECS
             .iter()
@@ -721,26 +670,6 @@ impl TtsEngine {
         // A fresh voice file must not be hidden by a cached model handle.
         self.kokoro.lock().unwrap().take();
         kokoro::play_voice_sample(&dir, voice, speed)
-    }
-
-    fn voice(&self, id: &str) -> Result<Arc<LoadedVoice>, String> {
-        if let Some(voice) = self.loaded.lock().unwrap().get(id) {
-            return Ok(voice.clone());
-        }
-        let Some(model) = self
-            .voices_dirs()
-            .iter()
-            .map(|dir| dir.join(format!("{id}.onnx")))
-            .find(|model| model.is_file())
-        else {
-            return Err(format!("voice '{id}' is not installed"));
-        };
-        let voice = Arc::new(load_voice(&model)?);
-        self.loaded
-            .lock()
-            .unwrap()
-            .insert(id.to_string(), voice.clone());
-        Ok(voice)
     }
 
     fn ensure_device(&self) -> Result<(), String> {
@@ -1008,203 +937,10 @@ impl TtsEngine {
             return Ok(());
         }
 
-        let piper_id = voice_id
-            .strip_prefix("piper:")
-            .unwrap_or(&voice_id)
-            .to_string();
-        let voice = self.voice(&piper_id)?;
-        std::thread::spawn(move || {
-            let mut announce_pending = false;
-            for (index, (start, end)) in chunks.into_iter().enumerate() {
-                if stop.load(Ordering::Relaxed) {
-                    return;
-                }
-                if code_chunks[index] {
-                    if announce_code && !announce_pending {
-                        announce_pending = true;
-                        if let Ok((samples, piece_rate)) = synthesize_with_config(
-                            &mut voice.engine.lock().unwrap(),
-                            &voice,
-                            "Code listing.",
-                            rate,
-                        ) && !samples.is_empty()
-                        {
-                            let samples: Vec<f32> =
-                                samples.iter().map(|&s| s as f32 / 32768.0).collect();
-                            append_piece(
-                                &player,
-                                &schedule,
-                                page,
-                                (start, end),
-                                samples,
-                                piece_rate,
-                                1500,
-                                last_chunk,
-                            );
-                        }
-                    } else if !announce_code {
-                        schedule(
-                            Vec::new(),
-                            24_000u32.try_into().expect("rate"),
-                            page,
-                            Some((start, end)),
-                        );
-                    }
-                    continue;
-                }
-                announce_pending = false;
-                let pieces = heading_aware_pieces(
-                    &text_chars,
-                    (start, end),
-                    &outline_titles,
-                    &paragraph_breaks,
-                );
-                for (piece, pause_ms, piece_text) in pieces {
-                    if stop.load(Ordering::Relaxed) {
-                        return;
-                    }
-                    let synthesized = {
-                        let mut engine = voice.engine.lock().unwrap();
-                        synthesize_with_config(&mut engine, &voice, &piece_text, rate)
-                    };
-                    let (samples, piece_rate) = match synthesized {
-                        Ok(audio) => audio,
-                        Err(e) => {
-                            let _ = app.emit(
-                                "tts-event",
-                                TtsEvent::Error {
-                                    reason: e.to_string(),
-                                },
-                            );
-                            return;
-                        }
-                    };
-                    if samples.is_empty() {
-                        continue;
-                    }
-                    let mut samples: Vec<f32> =
-                        samples.iter().map(|&s| s as f32 / 32768.0).collect();
-                    let sample_rate =
-                        rodio::SampleRate::new(piece_rate).expect("nonzero sample rate");
-                    // Each piece carries its own trailing pause; the
-                    // page's final piece ends clean so the next page
-                    // starts immediately.
-                    if piece.1 != last_chunk.1 {
-                        samples.extend(vec![
-                            0.0;
-                            sample_rate.get() as usize * pause_ms as usize / 1000
-                        ]);
-                    }
-                    player.append(rodio::buffer::SamplesBuffer::new(
-                        rodio::ChannelCount::new(1).expect("nonzero channels"),
-                        sample_rate,
-                        samples.clone(),
-                    ));
-                    schedule(samples, sample_rate, page, Some(piece));
-                }
-            }
-            schedule(
-                Vec::new(),
-                std::num::NonZero::new(24_000).expect("rate"),
-                page,
-                None,
-            );
-        });
-        Ok(())
+        Err(format!(
+            "unknown voice '{voice_id}': only Kokoro voices are available"
+        ))
     }
-}
-
-/// Classic-Piper synthesis: text → G2P tokens → model id map (skipping
-/// unknown phonemes, as classic Piper does) → pad/BOS/EOS wrapping → ONNX.
-fn synthesize_with_config(
-    engine: &mut OnnxEngine,
-    voice: &LoadedVoice,
-    text: &str,
-    rate: f32,
-) -> Result<(Vec<i16>, u32), String> {
-    let (tokens, _) = voice
-        .phonemizer
-        .phonemize_with_prosody(text)
-        .map_err(|e| format!("phonemize: {e}"))?;
-
-    let mut ids: Vec<i64> = Vec::with_capacity(tokens.len() * 2);
-    for token in &tokens {
-        if let Some(token_ids) = voice.id_map.get(token) {
-            ids.extend_from_slice(token_ids);
-        }
-    }
-    if ids.is_empty() {
-        return Ok((Vec::new(), 0));
-    }
-
-    let id_count = ids.len();
-    let (ids, _) = piper_plus_g2p::multilingual::default_post_process_ids(
-        ids,
-        vec![None; id_count],
-        &voice.id_map,
-        "$",
-    );
-
-    let request = SynthesisRequest {
-        phoneme_ids: ids,
-        noise_scale: voice.noise_scale,
-        // length_scale multiplies phoneme duration, so it is the inverse of
-        // the playback rate.
-        length_scale: voice.length_scale / rate,
-        noise_w: voice.noise_w,
-        ..Default::default()
-    };
-    let result = engine
-        .synthesize(&request)
-        .map_err(|e| format!("inference: {e}"))?;
-    Ok((result.audio, result.sample_rate))
-}
-
-/// Loads a classic Piper voice: ONNX session + language phonemizer chosen
-/// by the config's espeak locale, plus its synthesis scales.
-fn load_voice(model: &Path) -> Result<LoadedVoice, String> {
-    let json_path = model.with_file_name(format!(
-        "{}.json",
-        model.file_name().unwrap_or_default().to_string_lossy()
-    ));
-    let raw: Value = serde_json::from_str(
-        &std::fs::read_to_string(&json_path)
-            .map_err(|e| format!("reading {}: {e}", json_path.display()))?,
-    )
-    .map_err(|e| format!("parsing {}: {e}", json_path.display()))?;
-
-    let espeak_voice = raw["espeak"]["voice"].as_str().unwrap_or("en");
-    let lang = espeak_voice.split(['-', '_']).next().unwrap_or("en");
-    let phonemizer: Box<dyn piper_plus_g2p::Phonemizer> = match lang {
-        "en" => Box::new(
-            piper_plus_g2p::english::EnglishPhonemizer::new_bundled()
-                .map_err(|e| format!("english phonemizer: {e}"))?,
-        ),
-        "es" => Box::new(piper_plus_g2p::spanish::SpanishPhonemizer),
-        "fr" => Box::new(piper_plus_g2p::french::FrenchPhonemizer::new()),
-        "pt" => Box::new(piper_plus_g2p::portuguese::PortuguesePhonemizer::new()),
-        "sv" => Box::new(piper_plus_g2p::swedish::SwedishPhonemizer::new()),
-        other => {
-            return Err(format!(
-                "on-device narration doesn't support language '{other}' yet"
-            ));
-        }
-    };
-
-    let config = VoiceConfig::load(&json_path).map_err(|e| format!("voice config: {e}"))?;
-    let engine = OnnxEngine::load(model, &config, "cpu")
-        .map_err(|e| format!("loading {}: {e}", model.display()))?;
-
-    // Classic Piper's defaults when the config omits the inference block.
-    let inference = &raw["inference"];
-    Ok(LoadedVoice {
-        engine: Mutex::new(engine),
-        phonemizer,
-        id_map: config.phoneme_id_map,
-        noise_scale: inference["noise_scale"].as_f64().unwrap_or(0.667) as f32,
-        length_scale: inference["length_scale"].as_f64().unwrap_or(1.0) as f32,
-        noise_w: inference["noise_w"].as_f64().unwrap_or(0.8) as f32,
-    })
 }
 
 #[cfg(test)]

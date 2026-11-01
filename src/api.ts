@@ -95,13 +95,13 @@ export async function getPageText(docId: number, page: number): Promise<PageText
   return invoke<PageTextData>("get_page_text", { docId, page });
 }
 
-// ---- on-device narration (Piper) ----
+// ---- on-device narration (Kokoro) ----
 
 export interface TtsVoice {
   id: string;
   label: string;
   lang: string;
-  engine: "piper" | "kokoro";
+  engine: "kokoro";
 }
 
 export async function ttsVoices(): Promise<TtsVoice[]> {
@@ -143,11 +143,6 @@ export async function ttsResume(): Promise<void> {
 
 export async function ttsStop(): Promise<void> {
   return invoke("tts_stop");
-}
-
-/** Downloads the default on-device voice set; progress via `voice-download` events. */
-export async function ttsInstallDefaultVoices(): Promise<void> {
-  return invoke("tts_install_default_voices");
 }
 
 export async function searchDocument(
