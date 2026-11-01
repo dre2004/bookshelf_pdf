@@ -1037,7 +1037,7 @@ mod g2p_tests {
         let p = EnglishPhonemizer::new_bundled().expect("phonemizer");
         assert_eq!(
             resolve_control_artifacts(&format!("12{}34", '\u{0002}'), &p),
-            format!("12-34")
+            "12-34"
         );
         assert_eq!(
             resolve_control_artifacts(&format!("word{}", '\u{0002}'), &p),
