@@ -67,6 +67,10 @@ const SUPPLEMENTS: &[(&str, &str)] = &[
     ("affordance", "əfˈɔɹdəns"),
     ("affordances", "əfˈɔɹdənsɪz"),
     ("accesses", "əksˈɛsɪz"),
+    // Reported from the book: CMU lacks both, and they letter-spell
+    // ("a-s-s-o-c-i-a-t-i-v-i-t-y").
+    ("associative", "əsˈoʊsiˌeɪtɪv"),
+    ("associativity", "əsˌoʊsiəˈtɪvəti"),
 ];
 
 /// espeak-IPA appended to a stem's pronunciation for each derivational
@@ -255,6 +259,16 @@ mod tests {
     fn curated_words_resolve_directly_and_decline() {
         let f = fake_dict(&[]);
         assert_eq!(resolve("executable", &f), Some("ɪɡzˈɛkjətəbəl".to_string()));
+        // Both reported from the book letter-spelling through the CMU
+        // fallback; the curated rows pin the fix.
+        assert_eq!(
+            resolve("associativity", &f),
+            Some("əsˌoʊsiəˈtɪvəti".to_string())
+        );
+        assert_eq!(
+            resolve("associative", &f),
+            Some("əsˈoʊsiˌeɪtɪv".to_string())
+        );
         // Inflections of curated words derive through the table with
         // allomorph selection on the stem's final phoneme.
         assert_eq!(
