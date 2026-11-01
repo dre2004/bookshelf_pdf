@@ -137,3 +137,76 @@ fn real_pdf_link_scan() {
     );
     assert!(internal + external > 0, "no links found in {path}");
 }
+
+/// Dev probe: dumps the raw chars PDFium extracts (with whitespace made
+/// visible) plus per-character box gaps for the first line containing the
+/// BOOKSHELF_TEXT_NEEDLE (default "Chapter"). Skipped unless
+/// BOOKSHELF_TEXT_PDF is set. Mirrors Engine::page_text's conversion.
+#[test]
+fn real_pdf_text_dump() {
+    let Ok(path) = std::env::var("BOOKSHELF_TEXT_PDF") else {
+        eprintln!("skipping: BOOKSHELF_TEXT_PDF not set");
+        return;
+    };
+    let needle = std::env::var("BOOKSHELF_TEXT_NEEDLE").unwrap_or_else(|_| "Chapter".into());
+    let pdfium = bind_pdfium();
+    let doc = pdfium
+        .load_pdf_from_file(&path, None)
+        .unwrap_or_else(|e| panic!("opening {path}: {e}"));
+
+    for (index, page) in doc.pages().iter().enumerate() {
+        let text = page.text().unwrap();
+        let whole: String = text
+            .chars()
+            .iter()
+            .map(|c| c.unicode_char().unwrap_or('?'))
+            .collect();
+        let Some(at) = whole.find(&needle) else {
+            continue;
+        };
+        let from = at.saturating_sub(120);
+        let to = (at + 80).min(whole.len());
+        let slice = &whole[from..to];
+        eprintln!("--- page {index} around {needle:?} (chars {from}..{to}) ---");
+        eprintln!(
+            "raw: {:?}",
+            slice
+                .chars()
+                .map(|c| if c.is_whitespace() {
+                    match c {
+                        '\r' => '<',
+                        '\n' => '>',
+                        ' ' => '.',
+                        other => other,
+                    }
+                } else {
+                    c
+                })
+                .collect::<String>()
+        );
+        // Per-char boxes around the needle: x-left, y-bottom, width and the
+        // gap to the previous char's right edge.
+        let page_chars = text.chars();
+        let chars: Vec<_> = page_chars.iter().collect();
+        let mut prev_right: Option<f32> = None;
+        for (i, ch) in whole[from..to]
+            .chars()
+            .enumerate()
+            .map(|(i, c)| (i + from, c))
+        {
+            let Some(pdf_char) = chars.get(i) else { break };
+            let Ok(rect) = pdf_char.loose_bounds() else {
+                continue;
+            };
+            let (l, b, w) = (rect.left().value, rect.bottom().value, rect.width().value);
+            let gap = prev_right.map(|p| l - p).unwrap_or(0.0);
+            prev_right = Some(l + w);
+            eprintln!(
+                "  [{i:>4}] {:?} x={l:7.2} y={b:7.2} w={w:6.2} gap={gap:6.2}",
+                ch
+            );
+        }
+        return;
+    }
+    panic!("{needle:?} not found in {path}");
+}

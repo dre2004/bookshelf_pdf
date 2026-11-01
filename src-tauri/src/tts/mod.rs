@@ -235,13 +235,17 @@ pub(crate) fn split_heading_lead(
             .trim_end()
             .to_string();
         if is_chapter_kicker(&line1) {
-            let mut cursor = start + nl;
-            while matches!(chars.get(cursor), Some(c) if c.is_whitespace() && *c != '\n' && *c != '\r')
+            // Cursor stays inside the chunk: a paragraph break can land
+            // between the \r and \n of a split CRLF, and scanning past
+            // `end` would panic (and pull the next chunk's text in).
+            let mut cursor = (start + nl).min(end);
+            while cursor < end
+                && matches!(chars.get(cursor), Some(c) if c.is_whitespace() && *c != '\n' && *c != '\r')
             {
                 cursor += 1;
             }
             // skip consecutive newline whitespace
-            while matches!(chars.get(cursor), Some('\n') | Some('\r')) {
+            while cursor < end && matches!(chars.get(cursor), Some('\n') | Some('\r')) {
                 cursor += 1;
             }
             // Title line runs to the next line break.
@@ -1021,6 +1025,21 @@ mod heading_lead_tests {
     }
 
     #[test]
+    fn kicker_chunk_ending_between_crlf_halves_stays_whole() {
+        // A paragraph break can land between the \r and \n of a split
+        // CRLF, so the kicker chunk carries only the \r and the title
+        // lives in the next chunk. The kicker must still read whole (and
+        // the cursor must not scan past the chunk end). Shape traced from
+        // page 11 of the test book after the paragraph-break fix.
+        let text = "Chapter 0\r\nIf You\u{2019}re New Here";
+        let chars = chars(text);
+        let pieces = heading_aware_pieces(&chars, (0, 10), &[], &[]);
+        assert_eq!(pieces.len(), 2, "kicker + empty tail: {pieces:?}");
+        assert_eq!(pieces[0].2.trim(), "Chapter 0");
+        assert_eq!(pieces[0].1, HEADING_KICKER_PAUSE_MS);
+    }
+
+    #[test]
     fn plain_body_never_splits() {
         let text = "The rain fell for days and the river rose over its banks. Fields flooded.";
         let pieces = pieces(text, &[]);
@@ -1392,5 +1411,73 @@ mod code_handling_tests {
         let blocks = vec![(0, 8), (12, 20)];
         // 16/20 = 80% covered
         assert_eq!(classify_code_chunks(&chunks, &blocks), vec![true]);
+    }
+}
+
+#[cfg(test)]
+mod trace_probe {
+    use super::*;
+
+    /// Dev probe: runs the exact speak-path text derivation (page text →
+    /// paragraph breaks → chunks → heading pieces) on a real book page and
+    /// prints every piece, so extraction damage is visible end to end.
+    /// Skipped unless BOOKSHELF_TRACE_PDF is set:
+    ///   BOOKSHELF_TRACE_PDF="book.pdf" BOOKSHELF_TRACE_PAGE=11 \
+    ///     cargo test --lib trace_real_page -- --nocapture
+    #[test]
+    fn trace_real_page_pieces() {
+        let Ok(path) = std::env::var("BOOKSHELF_TRACE_PDF") else {
+            eprintln!("skipping: BOOKSHELF_TRACE_PDF not set");
+            return;
+        };
+        let page: i32 = std::env::var("BOOKSHELF_TRACE_PAGE")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(0);
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let lib = [
+            manifest.join("resources/pdfium/pdfium.dll"),
+            manifest.join("resources/pdfium/libpdfium.dylib"),
+            manifest.join("resources/pdfium/libpdfium.so"),
+        ]
+        .into_iter()
+        .find(|p| p.is_file())
+        .expect("pdfium library");
+        let engine = crate::pdfium_engine::Engine::with_library_path(&lib).unwrap();
+        let doc = engine.open_document(&path, None).unwrap();
+        let data = engine.page_text(doc.doc_id, page).unwrap();
+        let text: String = data.chars.clone();
+        let char_count = text.chars().count();
+        let breaks = engine
+            .paragraph_breaks(doc.doc_id, page, char_count)
+            .unwrap_or_default();
+        let outline = engine.outline_titles_for_page(doc.doc_id, page);
+        eprintln!(
+            "page {page}: {char_count} chars, {} breaks, outline={outline:?}",
+            breaks.len()
+        );
+        eprintln!("breaks={breaks:?}");
+        let chunks = split_for_narration(&text, &breaks);
+        let code_chunks = classify_code_chunks(&chunks, &data.code_blocks);
+        let text_chars: Vec<char> = text.chars().collect();
+        let preview = |text: &str, max: usize| text.chars().take(max).collect::<String>();
+        for (index, (start, end)) in chunks.iter().copied().enumerate() {
+            let chunk: String = text_chars[start..end].iter().collect();
+            eprintln!(
+                "chunk {index} [{start},{end}) code={} {:?}",
+                code_chunks[index],
+                preview(&chunk, 90)
+            );
+            for (piece, pause, piece_text) in
+                heading_aware_pieces(&text_chars, (start, end), &outline, &breaks)
+            {
+                eprintln!(
+                    "    piece {pause:4}ms [{},{}): {:?}",
+                    piece.0,
+                    piece.1,
+                    preview(&piece_text, 70)
+                );
+            }
+        }
     }
 }

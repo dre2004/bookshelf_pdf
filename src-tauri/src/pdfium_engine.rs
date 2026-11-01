@@ -479,9 +479,16 @@ impl Engine {
         }
 
         // Char index -> top of its box (PDF points, y grows upward);
-        // chars without a box inherit the last seen top.
+        // chars without a box inherit the last seen top. Whitespace glyphs
+        // never vote: some PDF generators (LaTeX among them) report spaces
+        // and CR/LF a few points above the letter baseline, and letting
+        // them split "lines" shatters headings into per-word fragments —
+        // which the narrator then spells letter by letter.
         let mut indexed_tops: Vec<(usize, f32)> = Vec::with_capacity(char_count);
         for (index, ch) in (0..).zip(text.chars().iter()) {
+            if ch.unicode_char().unwrap_or('\u{FFFD}').is_whitespace() {
+                continue;
+            }
             let top = ch
                 .loose_bounds()
                 .ok()
@@ -495,35 +502,7 @@ impl Engine {
             return Some(Vec::new());
         }
 
-        // Group into lines: a new line starts when the top moves by more
-        // than a small fraction of the page height.
-        let mut lines: Vec<(usize, f32)> = Vec::new();
-        let mut line_start = indexed_tops[0];
-        for &(index, top) in &indexed_tops {
-            if (line_start.1 - top).abs() > 1.5 {
-                lines.push(line_start);
-                line_start = (index, top);
-            }
-        }
-        lines.push(line_start);
-        if lines.len() < 3 {
-            return Some(Vec::new());
-        }
-
-        let mut pitches: Vec<f32> = lines.windows(2).map(|w| (w[0].1 - w[1].1).abs()).collect();
-        pitches.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let median = pitches[pitches.len() / 2];
-
-        let mut breaks = Vec::new();
-        for window in lines.windows(2) {
-            let gap = (window[0].1 - window[1].1).abs();
-            if gap > median * 1.6 {
-                let next_start = window[1].0;
-                if next_start > 0 {
-                    breaks.push(next_start - 1);
-                }
-            }
-        }
+        let breaks = break_candidates_from_line_tops(&indexed_tops);
         Some(breaks)
     }
 
@@ -719,6 +698,43 @@ fn collect_child_titles(bookmark: &PdfBookmark<'_>, page: PdfPageIndex, titles: 
 /// of an in-document link is either the link's own destination or the
 /// destination wrapped in a GoTo action; links with neither a destination
 /// nor a URI are dropped (nothing to activate).
+/// Derives paragraph-break char indices from line tops. `tops` is
+/// `(char_index, box_top)` for the page's visible glyphs, in order. Lines
+/// group within a 1.5pt baseline tolerance; a gap larger than 1.6× the
+/// median line pitch is a paragraph break, reported at the char before the
+/// next line starts. Pages with fewer than three lines have no measurable
+/// pitch and yield no breaks.
+fn break_candidates_from_line_tops(tops: &[(usize, f32)]) -> Vec<usize> {
+    let mut lines: Vec<(usize, f32)> = Vec::new();
+    let mut line_start = tops[0];
+    for &(index, top) in tops {
+        if (line_start.1 - top).abs() > 1.5 {
+            lines.push(line_start);
+            line_start = (index, top);
+        }
+    }
+    lines.push(line_start);
+    if lines.len() < 3 {
+        return Vec::new();
+    }
+
+    let mut pitches: Vec<f32> = lines.windows(2).map(|w| (w[0].1 - w[1].1).abs()).collect();
+    pitches.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = pitches[pitches.len() / 2];
+
+    let mut breaks = Vec::new();
+    for window in lines.windows(2) {
+        let gap = (window[0].1 - window[1].1).abs();
+        if gap > median * 1.6 {
+            let next_start = window[1].0;
+            if next_start > 0 {
+                breaks.push(next_start - 1);
+            }
+        }
+    }
+    breaks
+}
+
 pub fn collect_page_links(page: &PdfPage) -> Vec<PageLink> {
     let mut links = Vec::new();
     for link in page.links().iter() {
@@ -836,6 +852,49 @@ mod tests {
 
     fn entry(bytes: u8) -> Arc<Vec<u8>> {
         Arc::new(vec![0u8; bytes as usize])
+    }
+
+    #[test]
+    fn paragraph_breaks_split_only_at_line_pitch_gaps() {
+        // Five body lines at 14pt pitch: every gap is the median, so no
+        // break is emitted.
+        let tops: Vec<(usize, f32)> = (0..5).map(|i| (i * 10, 700.0 - i as f32 * 14.0)).collect();
+        assert!(break_candidates_from_line_tops(&tops).is_empty());
+    }
+
+    #[test]
+    fn paragraph_break_fire_on_gap_larger_than_pitch() {
+        // Three tight lines, then a heading-sized gap before the last one.
+        let tops = vec![
+            (0, 700.0),
+            (10, 686.0),
+            (20, 672.0),
+            (30, 600.0), // 72pt gap
+        ];
+        assert_eq!(break_candidates_from_line_tops(&tops), vec![29]);
+    }
+
+    #[test]
+    fn fewer_than_three_lines_yield_no_breaks() {
+        let tops = vec![(0, 700.0), (10, 600.0)];
+        assert!(break_candidates_from_line_tops(&tops).is_empty());
+    }
+
+    #[test]
+    fn letter_top_jitter_inside_a_line_does_not_split_it() {
+        // Small-caps/old-style figures can sit a hair above the baseline;
+        // 1pt of jitter on visible glyphs must not create phantom lines
+        // (which would collapse the median pitch and break mid-word).
+        let mut tops = Vec::new();
+        let mut index = 0;
+        for line in 0..4 {
+            for glyph in 0..8 {
+                let jitter = if glyph % 2 == 0 { 0.0 } else { 1.0 };
+                tops.push((index, 700.0 - line as f32 * 14.0 + jitter));
+                index += 1;
+            }
+        }
+        assert!(break_candidates_from_line_tops(&tops).is_empty());
     }
 
     #[test]
