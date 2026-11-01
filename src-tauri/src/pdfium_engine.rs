@@ -1043,6 +1043,52 @@ mod tests {
     }
 }
 
+/// Opt-in probe: every control character on a page with its box width
+/// and surrounding text, to distinguish zero-width kerning artifacts from
+/// real hyphen glyphs PDFium could not map. Set BOOKSHELF_TRACE_BOOK
+/// (+ BOOKSHELF_TRACE_PAGE).
+#[cfg(test)]
+mod artifact_trace_tests {
+    use super::*;
+
+    #[test]
+    fn trace_control_chars() {
+        let Ok(book) = std::env::var("BOOKSHELF_TRACE_BOOK") else {
+            return;
+        };
+        let page: i32 = std::env::var("BOOKSHELF_TRACE_PAGE")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(10);
+        let library = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("resources/pdfium/pdfium.dll");
+        let engine = Engine::with_library_path(&library).expect("pdfium");
+        let info = engine.open_document(&book, None).expect("book");
+        let data = engine.page_text(info.doc_id, page).expect("page text");
+        let chars: Vec<char> = data.chars.chars().collect();
+        for (i, &c) in chars.iter().enumerate() {
+            if !c.is_control() {
+                continue;
+            }
+            let (x, y, w, h) = (
+                data.boxes[i * 4],
+                data.boxes[i * 4 + 1],
+                data.boxes[i * 4 + 2],
+                data.boxes[i * 4 + 3],
+            );
+            let before: String = chars[i.saturating_sub(12)..i].iter().collect();
+            let after: String = chars[(i + 1).min(chars.len())..(i + 13).min(chars.len())]
+                .iter()
+                .collect();
+            println!(
+                "ctrl U+{:04X} @{i} box=({x:.2},{y:.2},{w:.2},{h:.2}) ctx={before:?} ‹› {after:?}",
+                c as u32
+            );
+        }
+        engine.close_document(info.doc_id);
+    }
+}
+
 #[cfg(test)]
 mod code_block_tests {
     use super::*;

@@ -95,13 +95,64 @@ fn normalize_typographic(text: &str) -> String {
             '\u{2019}' | '\u{2018}' | '\u{02BC}' => '\'',
             '\u{201C}' | '\u{201D}' => '"',
             '\u{2013}' | '\u{2014}' | '\u{2011}' | '\u{2010}' | '\u{FE63}' | '\u{FF0D}' => '-',
-            // Control characters (PDFium glyph placeholders): a hyphen is
-            // the harmless stand-in — the only place they've been observed
-            // is compound words. \t \r \n never reach here (word-split).
-            c if c.is_control() => '-',
+            // Control characters survive normalization on purpose: they
+            // are PDFium's stand-in for glyphs without a Unicode mapping,
+            // and whether such a glyph is a hyphen or invisible spacing
+            // is decided per word later (see `resolve_control_artifacts`).
+            // \t \r \n are whitespace, so they never end up inside a
+            // word token.
             other => other,
         })
         .collect()
+}
+
+/// Decides how a control character inside a word token reads. Between
+/// letters it is usually a font-switch spacing mark ("assign<ctrl>ment"
+/// is the single word "assignment"), but a hyphen glyph can extract the
+/// same way ("cross<ctrl>references"). The letter-name fallback tells
+/// them apart: "assignment" is a dictionary word and reads with one
+/// stress, while "crossreferences" letter-spells — a stress on nearly
+/// every letter. A control char not wedged between two letters always
+/// takes the hyphen reading.
+fn resolve_control_artifacts(token: &str, phonemizer: &EnglishPhonemizer) -> String {
+    use piper_plus_g2p::Phonemizer as _;
+    let chars: Vec<char> = token.chars().collect();
+    if !chars.iter().any(|c| c.is_control()) {
+        return token.to_string();
+    }
+    let hyphenated: String = chars
+        .iter()
+        .map(|c| if c.is_control() { '-' } else { *c })
+        .collect();
+    let between_letters = |i: usize| {
+        chars
+            .get(i.wrapping_sub(1))
+            .is_some_and(|c| c.is_alphabetic())
+            && chars.get(i + 1).is_some_and(|c| c.is_alphabetic())
+    };
+    if !chars
+        .iter()
+        .enumerate()
+        .all(|(i, c)| !c.is_control() || between_letters(i))
+    {
+        return hyphenated;
+    }
+    let joined: String = chars.iter().filter(|c| !c.is_control()).collect();
+    let bare: String = joined
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '\'')
+        .collect();
+    let joined_reads_cleanly = !bare.is_empty()
+        && phonemizer
+            .phonemize_with_prosody(&bare)
+            .is_ok_and(|(tokens, _)| {
+                !crate::tts::lexicon::spells_letter_by_letter(&bare, &tokens.concat())
+            });
+    if joined_reads_cleanly {
+        joined
+    } else {
+        hyphenated
+    }
 }
 
 /// Char-level phoneme tokenizer parsed straight from `tokenizer.json`
@@ -150,6 +201,9 @@ pub struct KokoroModel {
     /// lexicon can't help; the dictionary's fallback stands). One entry
     /// per distinct word ever narrated.
     lexicon_cache: Mutex<HashMap<String, Option<String>>>,
+    /// Resolved control-char artifacts ("assign<U+0002>ment"), cached per
+    /// raw token.
+    artifact_cache: Mutex<HashMap<String, String>>,
 }
 
 /// A stretch of words to hand the phonemizer in one piece.
@@ -284,7 +338,28 @@ impl KokoroModel {
             tokens_input,
             style_is_full,
             lexicon_cache: Mutex::new(HashMap::new()),
+            artifact_cache: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Cached `resolve_control_artifacts` — the hot path (words without
+    /// artifacts) skips both the lock and the phonemizer.
+    fn resolve_token_artifacts(&self, token: String) -> String {
+        if !token.chars().any(|c| c.is_control()) {
+            return token;
+        }
+        {
+            let cache = self.artifact_cache.lock().unwrap();
+            if let Some(hit) = cache.get(&token) {
+                return hit.clone();
+            }
+        }
+        let resolved = resolve_control_artifacts(&token, &self.phonemizer);
+        self.artifact_cache
+            .lock()
+            .unwrap()
+            .insert(token, resolved.clone());
+        resolved
     }
 
     /// A lexicon-derived pronunciation for `word`, or None. Only words
@@ -355,7 +430,10 @@ impl KokoroModel {
         // fallback spell words letter by letter ("you<U+2019>re" is heard
         // as "y-o-u-r-e").
         let text = normalize_typographic(text);
-        let repaired = repair_letter_spaced(&text);
+        let repaired: Vec<String> = repair_letter_spaced(&text)
+            .into_iter()
+            .map(|token| self.resolve_token_artifacts(token))
+            .collect();
         let tokens: Vec<&str> = repaired.iter().map(String::as_str).collect();
         use piper_plus_g2p::Phonemizer as _;
         // Words the dictionary would letter-spell get a lexicon-derived
@@ -911,7 +989,11 @@ mod g2p_tests {
             format!("cross{}references", '\u{FF0D}'),
         ] {
             let normalized = normalize_typographic(&variant);
-            let (got, _) = p.phonemize_with_prosody(&normalized).expect("g2p");
+            // The U+0002 form goes through the artifact resolver (the
+            // joined "crossreferences" letter-spells, so it hyphenates);
+            // the typographic hyphens normalize to ASCII directly.
+            let resolved = resolve_control_artifacts(&normalized, &p);
+            let (got, _) = p.phonemize_with_prosody(&resolved).expect("g2p");
             assert_eq!(
                 got.concat(),
                 ascii,
@@ -924,5 +1006,52 @@ mod g2p_tests {
             .expect("g2p");
         let (b, _) = p.phonemize_with_prosody("you're").expect("g2p");
         assert_eq!(a.concat(), b.concat());
+    }
+
+    /// The other face of the artifact: a font-switch spacing mark inside
+    /// a word ("assign<U+0002>ment" on book page 12) used to read as
+    /// "assign e-m-e-n-t-i-e". The joined form is a dictionary word, so
+    /// it joins.
+    #[test]
+    fn mid_word_control_artifact_joins_when_the_word_is_real() {
+        let p = EnglishPhonemizer::new_bundled().expect("phonemizer");
+        let raw = format!("In C, assign{}ment is an expression", '\u{0002}');
+        let normalized = normalize_typographic(&raw);
+        let tokens: Vec<String> = normalized.split(' ').map(str::to_string).collect();
+        let resolved: Vec<String> = tokens
+            .iter()
+            .map(|token| resolve_control_artifacts(token, &p))
+            .collect();
+        assert!(resolved.contains(&"assignment".to_string()), "{resolved:?}");
+        let (a, _) = p.phonemize_with_prosody(&resolved.join(" ")).expect("g2p");
+        let (b, _) = p
+            .phonemize_with_prosody("In C, assignment is an expression")
+            .expect("g2p");
+        assert_eq!(a.concat(), b.concat());
+    }
+
+    /// A control char that is not wedged between two letters (edge of a
+    /// token, next to a digit) always takes the hyphen reading.
+    #[test]
+    fn control_artifact_outside_letters_hyphenates() {
+        let p = EnglishPhonemizer::new_bundled().expect("phonemizer");
+        assert_eq!(
+            resolve_control_artifacts(&format!("12{}34", '\u{0002}'), &p),
+            format!("12-34")
+        );
+        assert_eq!(
+            resolve_control_artifacts(&format!("word{}", '\u{0002}'), &p),
+            "word-"
+        );
+    }
+
+    /// Joined forms the dictionary doesn't know must not be joined: the
+    /// stress-per-letter fallback is the decider, not blind joining.
+    #[test]
+    fn joined_gibberish_is_never_preferred() {
+        let p = EnglishPhonemizer::new_bundled().expect("phonemizer");
+        let joined_garbage = format!("xyzz{}qwump", '\u{0002}');
+        let resolved = resolve_control_artifacts(&joined_garbage, &p);
+        assert_eq!(resolved, "xyzz-qwump", "unknown compound must hyphenate");
     }
 }
