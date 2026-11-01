@@ -136,6 +136,15 @@ fn find_matches(haystack: &[char], needle: &[char], case_sensitive: bool) -> Vec
     matches
 }
 
+/// Whether a match at [start, end) sits on word boundaries: any
+/// alphanumeric neighbor keeps it inside a larger word ("read" inside
+/// "reading" or "thread"). Punctuation and whitespace are boundaries.
+fn is_whole_word(normalized: &[char], start: usize, end: usize) -> bool {
+    let before_word = start > 0 && normalized[start - 1].is_alphanumeric();
+    let after_word = end < normalized.len() && normalized[end].is_alphanumeric();
+    !before_word && !after_word
+}
+
 fn outline_node(bookmark: &PdfBookmark<'_>, depth: usize) -> OutlineNode {
     let page = bookmark
         .destination()
@@ -378,6 +387,7 @@ impl Engine {
         doc_id: u32,
         query: &str,
         case_sensitive: bool,
+        whole_words: bool,
         max_results: usize,
     ) -> Result<Vec<SearchMatch>, ApiError> {
         if query.is_empty() {
@@ -405,6 +415,9 @@ impl Engine {
 
             let (normalized, index_map) = normalize_for_search(&page_chars);
             for (norm_start, norm_end) in find_matches(&normalized, &query, case_sensitive) {
+                if whole_words && !is_whole_word(&normalized, norm_start, norm_end) {
+                    continue;
+                }
                 // Map normalized positions back to real character indices.
                 let start = index_map[norm_start];
                 let end = if norm_end < index_map.len() {
@@ -852,6 +865,21 @@ mod tests {
 
     fn entry(bytes: u8) -> Arc<Vec<u8>> {
         Arc::new(vec![0u8; bytes as usize])
+    }
+
+    #[test]
+    fn whole_word_boundary_recognizes_punctuation_and_rejects_inner_matches() {
+        //            012345678901234567890123
+        let text: Vec<char> = "read the reading; thread".chars().collect();
+        // "read" at 0..4: start boundary, space follows — a whole word.
+        assert!(is_whole_word(&text, 0, 4));
+        // "read" inside "reading" (9..13): 'i' follows — not a word.
+        assert!(!is_whole_word(&text, 9, 13));
+        // "read" inside "thread" (19..23): 'h' precedes — not a word.
+        assert!(!is_whole_word(&text, 19, 23));
+        // Punctuation is a boundary.
+        let punct: Vec<char> = "(read)".chars().collect();
+        assert!(is_whole_word(&punct, 1, 5));
     }
 
     #[test]

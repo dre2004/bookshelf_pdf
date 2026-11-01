@@ -154,8 +154,9 @@ export async function searchDocument(
   docId: number,
   query: string,
   caseSensitive: boolean,
+  wholeWords: boolean,
 ): Promise<SearchMatch[]> {
-  return invoke<SearchMatch[]>("search_document", { docId, query, caseSensitive });
+  return invoke<SearchMatch[]>("search_document", { docId, query, caseSensitive, wholeWords });
 }
 
 export async function getOutline(docId: number): Promise<OutlineNode[]> {

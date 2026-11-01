@@ -59,8 +59,9 @@ pub fn search_document(
     doc_id: u32,
     query: String,
     case_sensitive: bool,
+    whole_words: bool,
 ) -> Result<Vec<SearchMatch>, ApiError> {
-    engine.search_document(doc_id, &query, case_sensitive, 2000)
+    engine.search_document(doc_id, &query, case_sensitive, whole_words, 2000)
 }
 
 #[tauri::command]

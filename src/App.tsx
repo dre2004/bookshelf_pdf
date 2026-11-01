@@ -7,7 +7,7 @@ import Reader from "./Reader";
 import Library from "./Library";
 import Sidebar, { type SidebarTab } from "./Sidebar";
 import Resizer from "./Resizer";
-import SearchBar from "./SearchBar";
+import SearchPanel from "./SearchPanel";
 import SettingsScreen from "./SettingsScreen";
 import NarrationBar from "./NarrationBar";
 import { useNarration } from "./narration";
@@ -63,6 +63,8 @@ interface CurrentBook {
 const DIM_BATCH = 100;
 const SAVE_DEBOUNCE_MS = 700;
 const SEARCH_DEBOUNCE_MS = 250;
+/** Mirrors the backend's per-query cap (search_document). */
+const SEARCH_RESULT_CAP = 2000;
 
 function describeError(e: unknown): string {
   const api = toApiError(e);
@@ -108,7 +110,17 @@ export default function App() {
     results: SearchMatch[];
     active: number;
     searching: boolean;
-  }>({ open: false, query: "", results: [], active: 0, searching: false });
+    caseSensitive: boolean;
+    wholeWords: boolean;
+  }>({
+    open: false,
+    query: "",
+    results: [],
+    active: 0,
+    searching: false,
+    caseSensitive: false,
+    wholeWords: false,
+  });
 
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(240);
@@ -626,29 +638,40 @@ export default function App() {
   );
 
   // ---- search ----
-  const runSearch = useCallback((query: string) => {
-    const book = currentRef.current;
-    if (searchTimer.current !== null) window.clearTimeout(searchTimer.current);
-    if (!book || !query) {
-      setSearch((s) => ({ ...s, results: [], active: 0, searching: false }));
-      return;
+  const runSearch = useCallback(
+    (query: string, caseSensitive: boolean, wholeWords: boolean) => {
+      const book = currentRef.current;
+      if (searchTimer.current !== null) window.clearTimeout(searchTimer.current);
+      if (!book || !query) {
+        setSearch((s) => ({ ...s, results: [], active: 0, searching: false }));
+        return;
+      }
+      setSearch((s) => ({ ...s, searching: true }));
+      const seq = ++searchSeq.current;
+      searchTimer.current = window.setTimeout(() => {
+        searchDocument(book.doc.docId, query, caseSensitive, wholeWords)
+          .then((results) => {
+            if (searchSeq.current !== seq) return;
+            setSearch((s) => ({ ...s, results, active: 0, searching: false }));
+            if (results.length > 0) jumpTo(results[0].page);
+          })
+          .catch(() => {
+            if (searchSeq.current === seq) {
+              setSearch((s) => ({ ...s, results: [], active: 0, searching: false }));
+            }
+          });
+      }, SEARCH_DEBOUNCE_MS);
+    },
+    [jumpTo],
+  );
+
+  // Toggling an option re-runs the search with the new flags.
+  useEffect(() => {
+    if (search.open && search.query) {
+      runSearch(search.query, search.caseSensitive, search.wholeWords);
     }
-    setSearch((s) => ({ ...s, searching: true }));
-    const seq = ++searchSeq.current;
-    searchTimer.current = window.setTimeout(() => {
-      searchDocument(book.doc.docId, query, false)
-        .then((results) => {
-          if (searchSeq.current !== seq) return;
-          setSearch((s) => ({ ...s, results, active: 0, searching: false }));
-          if (results.length > 0) jumpTo(results[0].page);
-        })
-        .catch(() => {
-          if (searchSeq.current === seq) {
-            setSearch((s) => ({ ...s, results: [], active: 0, searching: false }));
-          }
-        });
-    }, SEARCH_DEBOUNCE_MS);
-  }, [jumpTo]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [search.caseSensitive, search.wholeWords, search.open]);
 
   const stepSearch = useCallback(
     (direction: 1 | -1) => {
@@ -661,6 +684,58 @@ export default function App() {
     },
     [jumpTo],
   );
+
+  const selectSearchResult = useCallback(
+    (index: number) => {
+      setSearch((s) => (s.results[index] ? { ...s, active: index } : s));
+      const hit = search.results[index];
+      if (hit) jumpTo(hit.page);
+    },
+    [jumpTo, search.results],
+  );
+
+  // Snippets for the result list: the text around each match, built from
+  // the cached page text (one fetch per page containing hits).
+  const [snippets, setSnippets] = useState<Map<number, [string, string, string]>>(new Map());
+  useEffect(() => {
+    let cancelled = false;
+    const book = currentRef.current;
+    if (!book || search.results.length === 0) {
+      setSnippets(new Map());
+      return;
+    }
+    const byPage = new Map<number, { index: number; hit: SearchMatch }[]>();
+    search.results.forEach((hit, index) => {
+      const list = byPage.get(hit.page);
+      if (list) list.push({ index, hit });
+      else byPage.set(hit.page, [{ index, hit }]);
+    });
+    const build = async () => {
+      const out = new Map<number, [string, string, string]>();
+      for (const [pageIndex, hits] of byPage) {
+        try {
+          const text = await cachedPageText(book.doc.docId, pageIndex);
+          if (cancelled) return;
+          for (const { index, hit } of hits) {
+            const chars = text.chars;
+            const before = chars
+              .slice(Math.max(0, hit.start - 32), hit.start)
+              .replace(/\s+/g, " ");
+            const matched = chars.slice(hit.start, hit.end).replace(/\s+/g, " ");
+            const after = chars.slice(hit.end, hit.end + 32).replace(/\s+/g, " ");
+            out.set(index, [before, matched, after]);
+          }
+        } catch {
+          /* the row renders without a snippet */
+        }
+      }
+      if (!cancelled) setSnippets(out);
+    };
+    void build();
+    return () => {
+      cancelled = true;
+    };
+  }, [search.results]);
 
   // Fetch remaining page dimensions in the background for long documents.
   useEffect(() => {
@@ -855,21 +930,6 @@ export default function App() {
           )}
           {sidebarTab !== null && <Resizer onResize={resizeSidebar} />}
           <div className="reader-stack">
-            {search.open && (
-              <SearchBar
-                query={search.query}
-                onQueryChange={(query) => {
-                  setSearch((s) => ({ ...s, query }));
-                  runSearch(query);
-                }}
-                resultCount={search.results.length}
-                activeIndex={search.active}
-                onNext={() => stepSearch(1)}
-                onPrev={() => stepSearch(-1)}
-                onClose={() => setSearch((s) => ({ ...s, open: false }))}
-                searching={search.searching}
-              />
-            )}
             <Reader
               doc={current.doc}
               mode={mode}
@@ -888,8 +948,35 @@ export default function App() {
               spokenRange={narration.spokenRange}
               onAddHighlight={(p, s2, e2, text, color) => void addHighlight(p, s2, e2, text, color)}
               onJumpPage={(target) => jumpTo(target)}
+              onJumpToHit={selectSearchResult}
             />
           </div>
+          {search.open && (
+            <aside className="search-dock">
+              <SearchPanel
+                query={search.query}
+                onQueryChange={(query) => {
+                  setSearch((s) => ({ ...s, query }));
+                  runSearch(query, search.caseSensitive, search.wholeWords);
+                }}
+                caseSensitive={search.caseSensitive}
+                wholeWords={search.wholeWords}
+                onToggleCase={() => setSearch((s) => ({ ...s, caseSensitive: !s.caseSensitive }))}
+                onToggleWholeWords={() => setSearch((s) => ({ ...s, wholeWords: !s.wholeWords }))}
+                rows={search.results.map((match, index) => ({
+                  match,
+                  snippet: snippets.get(index) ?? null,
+                }))}
+                activeIndex={search.active}
+                searching={search.searching}
+                truncated={search.results.length >= SEARCH_RESULT_CAP}
+                onSelect={selectSearchResult}
+                onNext={() => stepSearch(1)}
+                onPrev={() => stepSearch(-1)}
+                onClose={() => setSearch((s) => ({ ...s, open: false }))}
+              />
+            </aside>
+          )}
         </div>
       ) : (
         <Library

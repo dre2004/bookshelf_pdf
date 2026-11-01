@@ -465,6 +465,27 @@ export interface ReaderProps {
   ) => void;
   /** Jumps to a page, recording history (in-page link navigation). */
   onJumpPage: (page: number) => void;
+  /** Clicking a search marker on the scrollbar jumps to that hit. */
+  onJumpToHit?: (index: number) => void;
+}
+
+/** Position of each search hit as a fraction of the scrollable content,
+ *  for the scrollbar markers. -1 when the geometry isn't known yet.
+ *  `pageMetrics` maps a page to its (offsetTop, height) in the scroll
+ *  content; `hitYFractions` maps the hit's array index to its vertical
+ *  fraction within its page (0 = top). Exported for unit testing. */
+export function markerFractions(
+  hits: SearchMatch[],
+  pageMetrics: Map<number, { top: number; height: number }>,
+  hitYFractions: Map<number, number>,
+  scrollHeight: number,
+): number[] {
+  return hits.map((hit, index) => {
+    const metrics = pageMetrics.get(hit.page);
+    const yFraction = hitYFractions.get(index);
+    if (!metrics || yFraction === undefined || scrollHeight <= 0) return -1;
+    return (metrics.top + yFraction * metrics.height) / scrollHeight;
+  });
 }
 
 export default function Reader({
@@ -485,6 +506,7 @@ export default function Reader({
   spokenRange,
   onAddHighlight,
   onJumpPage,
+  onJumpToHit,
 }: ReaderProps) {
   const [containerRef, viewport] = useElementSize<HTMLDivElement>();
   const [containerEl, setContainerEl] = useState<HTMLElement | null>(null);
@@ -686,6 +708,100 @@ export default function Reader({
           <LazyPage key={i} {...pageImageProps(i)} container={containerEl} registerEl={registerEl} />
         ))}
       </div>
+      {searchHits.length > 0 && (
+        <SearchMarkers
+          hits={searchHits}
+          activeHitKey={activeHitKey}
+          pageEls={pageEls.current}
+          container={containerEl}
+          dims={dims}
+          docId={doc.docId}
+          onJumpToHit={onJumpToHit}
+        />
+      )}
+    </div>
+  );
+}
+
+/** Scrollbar match markers: a strip along the right edge of the reader
+ *  with one tick per search hit, positioned by the hit's fraction of the
+ *  scrollable content. Clicking a tick jumps to that hit. */
+function SearchMarkers({
+  hits,
+  activeHitKey,
+  pageEls,
+  container,
+  dims,
+  docId,
+  onJumpToHit,
+}: {
+  hits: SearchMatch[];
+  activeHitKey: string | null;
+  pageEls: Map<number, HTMLDivElement>;
+  container: HTMLElement | null;
+  dims: PageInfo[];
+  docId: number;
+  onJumpToHit?: (index: number) => void;
+}) {
+  const [fractions, setFractions] = useState<number[]>([]);
+
+  // Hit positions need two geometries: the hit's y inside its page (from
+  // the page's character boxes) and the page's offset inside the scroll
+  // content. Both settle asynchronously (text fetch, dims stream), so
+  // recompute whenever inputs move; unknown positions stay -1.
+  useEffect(() => {
+    let cancelled = false;
+    const compute = async () => {
+      const hitYFractions = new Map<number, number>();
+      const pages = [...new Set(hits.map((h) => h.page))];
+      for (const pageIndex of pages) {
+        try {
+          const text = await cachedPageText(docId, pageIndex);
+          if (cancelled) return;
+          const height = Math.max(1, text.height);
+          hits.forEach((hit, index) => {
+            if (hit.page !== pageIndex) return;
+            // boxes[i*4..] = (x, y-bottom-origin, w, h) in PDF points.
+            const y = text.boxes[hit.start * 4 + 1] ?? 0;
+            const h = text.boxes[hit.start * 4 + 3] ?? 0;
+            const fromTop = 1 - (y + h) / height;
+            hitYFractions.set(index, Math.min(1, Math.max(0, fromTop)));
+          });
+        } catch {
+          /* no text layer for that page: those hits stay unplaced */
+        }
+      }
+      const pageMetrics = new Map<number, { top: number; height: number }>();
+      for (const pageIndex of pages) {
+        const el = pageEls.get(pageIndex);
+        if (el) pageMetrics.set(pageIndex, { top: el.offsetTop, height: el.offsetHeight });
+      }
+      const scrollHeight = container?.scrollHeight ?? 0;
+      if (!cancelled) setFractions(markerFractions(hits, pageMetrics, hitYFractions, scrollHeight));
+    };
+    void compute();
+    return () => {
+      cancelled = true;
+    };
+  }, [hits, pageEls, container, dims, docId]);
+
+  return (
+    <div className="search-markers" role="toolbar" aria-label="Search match positions">
+      {hits.map((hit, index) => {
+        const fraction = fractions[index];
+        if (fraction === undefined || fraction < 0) return null;
+        const active = activeHitKey === `${hit.page}:${hit.start}:${hit.end}`;
+        return (
+          <button
+            key={`${hit.page}:${hit.start}:${hit.end}`}
+            className={`search-marker ${active ? "active" : ""}`}
+            style={{ top: `${fraction * 100}%` }}
+            onClick={() => onJumpToHit?.(index)}
+            title={`Page ${hit.page + 1}`}
+            aria-label={`Go to match on page ${hit.page + 1}`}
+          />
+        );
+      })}
     </div>
   );
 }
