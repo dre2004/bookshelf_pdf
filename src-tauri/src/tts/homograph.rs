@@ -34,6 +34,10 @@ pub(crate) enum Context {
     /// word can't settle ("Two tracks lead through": any noun can be a
     /// plural subject, but "lead through" is only ever the verb).
     FollowedBy(&'static [&'static str]),
+    /// Matches regardless of context — for spellings with exactly one
+    /// pronunciation where the dictionary's default is simply wrong
+    /// ("reading" is always REED-ing; there is no "red-ing" word).
+    Always,
 }
 
 /// Preceders that make a following word a verb: infinitive "to", modals,
@@ -112,6 +116,23 @@ pub(crate) const ENTRIES: &[Entry] = &[
             // Past tense/participle ("have read") is the dictionary default.
         ],
     },
+    Entry {
+        word: "reading",
+        rules: &[(
+            Context::Always,
+            // The gerund/participle has exactly one pronunciation
+            // (REED-ing); the dictionary's default "red-ing" is not a
+            // word. The only exception is the town Reading, PA — rare
+            // enough in narration to ignore.
+            Pronunciation::Phonemes("ɹˈiːdɪŋ"),
+        )],
+    },
+    Entry {
+        word: "readings",
+        rules: &[(Context::Always, Pronunciation::Phonemes("ɹˈiːdɪŋz"))],
+    },
+    // "reads" (ɹˈiːdz) and "reader" (ɹˈiːdɚ) are already correct in the
+    // dictionary; only the -ing forms default wrong.
     Entry {
         word: "lead",
         rules: &[
@@ -346,6 +367,7 @@ pub(crate) fn resolve(words: &[&str], index: usize) -> Option<&'static Pronuncia
                         list.iter()
                             .any(|candidate| candidate.eq_ignore_ascii_case(next))
                     }),
+                Context::Always => true,
             };
         matched.then_some(pronunciation)
     })
@@ -489,6 +511,28 @@ mod tests {
     fn unambiguous_words_are_untouched() {
         assert_eq!(spoken("the book", "book"), None);
         assert_eq!(spoken("to write", "write"), None);
+    }
+
+    /// The reported sentence: the gerund has no past-tense pronunciation,
+    /// so it overrides everywhere regardless of context.
+    #[test]
+    fn reading_forms_are_always_present_tense() {
+        assert_eq!(
+            spoken(
+                "Reading with a finger in Chapter 7 tonight, or in Appendix A",
+                "reading"
+            ),
+            Some(&Pronunciation::Phonemes("ɹˈiːdɪŋ"))
+        );
+        // The noun ("the reading of the will") is the same sound.
+        assert_eq!(
+            spoken("the reading of the will", "reading"),
+            Some(&Pronunciation::Phonemes("ɹˈiːdɪŋ"))
+        );
+        assert_eq!(
+            spoken("the readings varied", "readings"),
+            Some(&Pronunciation::Phonemes("ɹˈiːdɪŋz"))
+        );
     }
 
     /// Documents the dictionary defaults these rules override, and pins

@@ -166,32 +166,43 @@ const MAX_HEADING_PIECES_PER_CHUNK: usize = 2;
 /// gap: a dash is a breath inside a sentence, not a boundary.
 const DASH_PAUSE_MS: u32 = 300;
 
-/// Minimum non-whitespace text on each side of a dash for it to earn a
-/// beat; dashes glued between short fragments stay inline.
-const DASH_SPLIT_MIN_CHARS: usize = 6;
+/// The beat after a semicolon, which joins two independent clauses:
+/// longer than a dash's breath, shorter than the sentence gap. Without
+/// this, semicolons are silently dropped by the phoneme tokenizer and
+/// contribute no pause at all.
+const SEMICOLON_PAUSE_MS: u32 = 350;
 
-/// Splits a body piece at parenthetical em/en dashes, each becoming a
-/// shorter beat (DASH_PAUSE_MS) on the piece before it. Numeric ranges
-/// ("3–7") and hyphenated compounds (U+002D) never split. The final
-/// sub-piece keeps the pause the body carried (sentence/paragraph).
-fn split_at_dashes(
+/// Minimum non-whitespace text on each side of a beat marker for it to
+/// earn a pause; markers glued between short fragments stay inline.
+const BEAT_SPLIT_MIN_CHARS: usize = 6;
+
+/// Splits a body piece at its in-sentence beat markers — parenthetical
+/// em/en dashes and semicolons — each becoming a short pause on the
+/// piece before it. Numeric ranges ("3–7") and hyphenated compounds
+/// (U+002D) never split. The final sub-piece keeps the pause the body
+/// carried (sentence/paragraph).
+fn split_at_beats(
     chars: &[char],
     range: (usize, usize),
     final_pause: u32,
 ) -> Vec<((usize, usize), u32, String)> {
     let (start, end) = range;
-    let mut cuts: Vec<usize> = Vec::new();
+    let mut cuts: Vec<(usize, u32)> = Vec::new();
     let mut last_cut = start;
     for i in start..end {
-        let c = chars[i];
-        if c != '\u{2014}' && c != '\u{2013}' {
-            continue;
-        }
-        let prev_digit = i > 0 && chars[i - 1].is_ascii_digit();
-        let next_digit = chars.get(i + 1).is_some_and(|c| c.is_ascii_digit());
-        if prev_digit && next_digit {
-            continue;
-        }
+        let pause = match chars[i] {
+            '\u{2014}' | '\u{2013}' => {
+                let prev_digit = i > 0 && chars[i - 1].is_ascii_digit();
+                let next_digit = chars.get(i + 1).is_some_and(|c| c.is_ascii_digit());
+                if prev_digit && next_digit {
+                    // Numeric range "3–7", not a parenthetical.
+                    continue;
+                }
+                DASH_PAUSE_MS
+            }
+            ';' => SEMICOLON_PAUSE_MS,
+            _ => continue,
+        };
         let before = chars[last_cut..i]
             .iter()
             .filter(|c| !c.is_whitespace())
@@ -200,8 +211,8 @@ fn split_at_dashes(
             .iter()
             .filter(|c| !c.is_whitespace())
             .count();
-        if before >= DASH_SPLIT_MIN_CHARS && after >= DASH_SPLIT_MIN_CHARS {
-            cuts.push(i);
+        if before >= BEAT_SPLIT_MIN_CHARS && after >= BEAT_SPLIT_MIN_CHARS {
+            cuts.push((i, pause));
             last_cut = i;
         }
     }
@@ -211,13 +222,14 @@ fn split_at_dashes(
     }
     let mut pieces = Vec::with_capacity(cuts.len() + 1);
     let mut piece_start = start;
-    for cut in cuts.iter().copied().chain(std::iter::once(end)) {
+    for (cut, pause) in cuts
+        .iter()
+        .copied()
+        .chain(std::iter::once((end, final_pause)))
+    {
         let text: String = chars[piece_start..cut].iter().collect();
-        pieces.push(((piece_start, cut), DASH_PAUSE_MS, text));
+        pieces.push(((piece_start, cut), pause, text));
         piece_start = cut + 1;
-    }
-    if let Some(last) = pieces.last_mut() {
-        last.1 = final_pause;
     }
     pieces
 }
@@ -441,7 +453,7 @@ fn heading_aware_pieces(
         let trimmed = line.trim();
         if !trimmed.is_empty() && is_heading_line(trimmed, outline_titles) {
             if chars[body_start..cursor].iter().any(|c| !c.is_whitespace()) {
-                pieces.extend(split_at_dashes(
+                pieces.extend(split_at_beats(
                     chars,
                     (body_start, cursor),
                     PARAGRAPH_PAUSE_MS,
@@ -456,7 +468,7 @@ fn heading_aware_pieces(
 
     let mut all = lead_pieces;
     all.append(&mut pieces);
-    all.extend(split_at_dashes(chars, (body_start, end), final_pause));
+    all.extend(split_at_beats(chars, (body_start, end), final_pause));
     all
 }
 
@@ -1210,15 +1222,47 @@ mod heading_lead_tests {
     }
 
     #[test]
+    fn semicolons_get_a_beat() {
+        // Semicolons used to be dropped by the phoneme tokenizer with no
+        // pause at all; they now join two clauses with a 350ms beat.
+        let text = "It was quiet for a while; nothing moved after that. The end came slowly. ";
+        let pieces = pieces(text, &[]);
+        assert_eq!(pieces.len(), 2, "{pieces:?}");
+        assert_eq!(pieces[0].1, SEMICOLON_PAUSE_MS);
+        assert!(pieces[0].2.trim_end().ends_with("while"));
+        assert_eq!(pieces[1].1, SENTENCE_PAUSE_MS);
+    }
+
+    #[test]
+    fn semicolon_beats_combine_with_dash_beats() {
+        let text =
+            "First comes the dash \u{2014} a breath; then the semicolon settles it. The end. ";
+        let pieces = pieces(text, &[]);
+        assert_eq!(pieces.len(), 3, "{pieces:?}");
+        let pauses: Vec<u32> = pieces.iter().map(|(_, p, _)| *p).collect();
+        assert_eq!(
+            pauses,
+            vec![DASH_PAUSE_MS, SEMICOLON_PAUSE_MS, SENTENCE_PAUSE_MS]
+        );
+    }
+
+    #[test]
+    fn short_semicolon_fragments_stay_inline() {
+        let text = "It stopped; soon. ";
+        assert_eq!(pieces(text, &[]).len(), 1);
+    }
+
+    #[test]
     fn numbered_heading_line_mid_chunk_splits() {
         let text = "It assumes nothing, it moves slowly by this book\u{2019}s standards, and it exists so that\r\nevery reader \u{2014} newcomer or arriving polyglot \u{2014} starts Chapter 1 on the same ground.\r\n0.1 How to read this book\r\nTwo tracks lead through this book; take the one that fits.\r\nNew to C, or new to programming. ";
         let pieces = pieces(text, &[]);
         // The first body's parenthetical dashes each earn a beat before the
-        // heading line splits off with its full pause.
+        // heading line splits off with its full pause; the trailing body
+        // also splits at its semicolon.
         assert_eq!(
             pieces.len(),
-            5,
-            "expected dash-split body + heading + body: {pieces:?}"
+            6,
+            "expected dash-split body + heading + semicolon-split body: {pieces:?}"
         );
         let pauses: Vec<u32> = pieces.iter().map(|(_, p, _)| *p).collect();
         assert_eq!(
@@ -1228,11 +1272,13 @@ mod heading_lead_tests {
                 DASH_PAUSE_MS,
                 PARAGRAPH_PAUSE_MS,
                 HEADING_PAUSE_MS,
+                SEMICOLON_PAUSE_MS,
                 SENTENCE_PAUSE_MS
             ]
         );
         assert_eq!(pieces[3].2, "0.1 How to read this book");
-        assert!(pieces[4].2.trim_start().starts_with("Two tracks"));
+        assert!(pieces[4].2.trim_end().ends_with("book"));
+        assert!(pieces[5].2.trim_start().starts_with("take the one"));
     }
 
     #[test]
