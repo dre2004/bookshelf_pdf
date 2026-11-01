@@ -4,24 +4,33 @@
 
 use bookshelf_pdf_lib::pdfium_engine::collect_page_links;
 use pdfium_render::prelude::*;
+use std::sync::OnceLock;
 use std::{io::Cursor, path::PathBuf};
 
-fn bind_pdfium() -> Pdfium {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let mut candidates = vec![
-        manifest_dir.join("resources/pdfium/pdfium.dll"),
-        manifest_dir.join("resources/pdfium/libpdfium.dylib"),
-        manifest_dir.join("resources/pdfium/libpdfium.so"),
-    ];
-    if let Ok(path) = std::env::var("BOOKSHELF_PDFIUM_PATH") {
-        candidates.insert(0, PathBuf::from(path));
-    }
-    let path = candidates
-        .iter()
-        .find(|p| p.is_file())
-        .expect("PDFium library not found; run `npm run fetch:pdfium` first");
-    let bindings = Pdfium::bind_to_library(path).unwrap();
-    Pdfium::new(bindings)
+/// pdfium-render keeps the loaded library in a process-global static, so
+/// a second `bind_to_library` fails with `AlreadyInitialized`. Parallel
+/// test threads raced that global — either every bind checked the static
+/// before any stored (all passed) or the late checkers panicked — so the
+/// library is bound exactly once and shared.
+fn bind_pdfium() -> &'static Pdfium {
+    static PDFIUM: OnceLock<Pdfium> = OnceLock::new();
+    PDFIUM.get_or_init(|| {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mut candidates = vec![
+            manifest_dir.join("resources/pdfium/pdfium.dll"),
+            manifest_dir.join("resources/pdfium/libpdfium.dylib"),
+            manifest_dir.join("resources/pdfium/libpdfium.so"),
+        ];
+        if let Ok(path) = std::env::var("BOOKSHELF_PDFIUM_PATH") {
+            candidates.insert(0, PathBuf::from(path));
+        }
+        let path = candidates
+            .iter()
+            .find(|p| p.is_file())
+            .expect("PDFium library not found; run `npm run fetch:pdfium` first");
+        let bindings = Pdfium::bind_to_library(path).unwrap();
+        Pdfium::new(bindings)
+    })
 }
 
 #[test]
