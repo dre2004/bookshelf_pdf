@@ -115,6 +115,7 @@ export default function App() {
   const [narrationVoice, setNarrationVoice] = useState("");
   const [narrationRate, setNarrationRate] = useState(1);
   const [narrationContinuous, setNarrationContinuous] = useState(true);
+  const [narrationCodeHandling, setNarrationCodeHandling] = useState<"skip" | "announce">("skip");
 
   const [error, setError] = useState<string | null>(null);
   const [passwordFor, setPasswordFor] = useState<{ path: string; incorrect: boolean } | null>(null);
@@ -164,6 +165,12 @@ export default function App() {
         try {
           const continuous = JSON.parse(stored.narrationContinuous ?? "true");
           if (typeof continuous === "boolean") setNarrationContinuous(continuous);
+        } catch {
+          /* keep default */
+        }
+        try {
+          const handling = JSON.parse(stored.narrationCodeHandling ?? '"skip"');
+          if (handling === "skip" || handling === "announce") setNarrationCodeHandling(handling);
         } catch {
           /* keep default */
         }
@@ -463,6 +470,7 @@ export default function App() {
     if (narrationVoice) narration.setVoiceURI(narrationVoice);
     narration.setRate(narrationRate);
     narration.setContinuous(narrationContinuous);
+    narration.setCodeHandling(narrationCodeHandling);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ready]);
 
@@ -472,6 +480,7 @@ export default function App() {
   }, [narration.voiceURI, persist]);
   useEffect(() => {
     persist("narrationRate", narration.rate);
+  persist("narrationCodeHandling", narration.codeHandling);
   }, [narration.rate, persist]);
   useEffect(() => {
     persist("narrationContinuous", narration.continuous);

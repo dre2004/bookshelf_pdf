@@ -6,7 +6,7 @@ use crate::db::{BookState, BookSummary, Bookmark, Db, Highlight, NewHighlight};
 use crate::pdfium_engine::{
     ApiError, DocumentInfo, Engine, OutlineNode, PageInfo, PageTextData, SearchMatch,
 };
-use crate::tts::{TtsEngine, TtsVoiceInfo};
+use crate::tts::{SpeakRequest, TtsEngine, TtsVoiceInfo};
 
 #[tauri::command]
 pub fn open_document(
@@ -233,6 +233,7 @@ pub fn tts_preview_voice(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // Tauri command args are the IPC contract
 pub fn tts_speak(
     engine: tauri::State<'_, Arc<TtsEngine>>,
     pdfium: tauri::State<'_, Arc<crate::pdfium_engine::Engine>>,
@@ -241,20 +242,34 @@ pub fn tts_speak(
     voice_id: String,
     rate: f64,
     doc_id: Option<u32>,
+    code_handling: Option<String>,
 ) -> Result<(), String> {
-    // Paragraph boundaries come from page geometry when the caller says
-    // which document it is reading; otherwise sentence-only chunking.
-    let (breaks, outline_titles) = doc_id
+    // Paragraph and code geometry come from the page itself when the
+    // caller says which document it is reading.
+    let (breaks, outline_titles, code_blocks) = doc_id
         .map(|id| {
             (
                 pdfium
                     .paragraph_breaks(id, page, text.chars().count())
                     .unwrap_or_default(),
                 pdfium.outline_titles_for_page(id, page),
+                pdfium
+                    .page_text(id, page)
+                    .map(|data| data.code_blocks)
+                    .unwrap_or_default(),
             )
         })
         .unwrap_or_default();
-    engine.speak(&text, page, &voice_id, rate as f32, breaks, outline_titles)
+    engine.speak(SpeakRequest {
+        text: &text,
+        page,
+        voice_id: &voice_id,
+        rate: rate as f32,
+        paragraph_breaks: breaks,
+        outline_titles,
+        code_blocks,
+        code_handling: code_handling.unwrap_or_else(|| "skip".to_string()),
+    })
 }
 
 #[tauri::command]

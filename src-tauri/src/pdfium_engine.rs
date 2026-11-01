@@ -51,6 +51,11 @@ pub struct DocumentInfo {
 pub struct PageTextData {
     pub chars: String,
     pub boxes: Vec<f32>,
+    /// `true` per character set in a fixed-pitch (monospace) font — the
+    /// primary signal for code listings.
+    pub mono: Vec<bool>,
+    /// Char ranges `[start, end)` of detected code blocks.
+    pub code_blocks: Vec<(usize, usize)>,
     pub width: f64,
     pub height: f64,
 }
@@ -305,8 +310,10 @@ impl Engine {
 
         let mut chars = String::with_capacity(text.len().max(0) as usize);
         let mut boxes = Vec::with_capacity(chars.capacity() * 4);
+        let mut mono = Vec::with_capacity(chars.capacity());
         for ch in text.chars().iter() {
             chars.push(ch.unicode_char().unwrap_or('\u{FFFD}'));
+            mono.push(ch.font_is_fixed_pitch());
             match ch.loose_bounds() {
                 Ok(rect) => {
                     boxes.push(rect.left().value);
@@ -317,10 +324,14 @@ impl Engine {
                 Err(_) => boxes.extend([0.0, 0.0, 0.0, 0.0]),
             }
         }
+        let chars_vec: Vec<char> = chars.chars().collect();
+        let code_blocks = detect_code_blocks(&chars_vec, &mono);
 
         Ok(PageTextData {
             chars,
             boxes,
+            mono,
+            code_blocks,
             width: page.width().value as f64,
             height: page.height().value as f64,
         })
@@ -668,6 +679,82 @@ fn collect_child_titles(bookmark: &PdfBookmark<'_>, page: PdfPageIndex, titles: 
     }
 }
 
+/// Code-block detection: 2+ consecutive lines whose text is predominantly
+/// fixed-pitch form a block. Lines split on PDFium's newline characters;
+/// blank lines between code lines keep the block open. Returns char ranges.
+pub fn detect_code_blocks(chars: &[char], mono: &[bool]) -> Vec<(usize, usize)> {
+    #[derive(Default)]
+    struct Line {
+        start: usize,
+        end: usize,
+        mono_count: usize,
+        text_count: usize,
+    }
+    let mut lines: Vec<Line> = Vec::new();
+    let mut current = Line::default();
+    let mut in_line = false;
+    for (i, &c) in chars.iter().enumerate() {
+        if c == '\n' || c == '\r' {
+            if in_line {
+                lines.push(std::mem::take(&mut current));
+                in_line = false;
+            }
+            continue;
+        }
+        if !in_line {
+            current = Line {
+                start: i,
+                ..Default::default()
+            };
+            in_line = true;
+        }
+        current.end = i + 1;
+        if c.is_alphanumeric() {
+            current.text_count += 1;
+            if mono.get(i).copied().unwrap_or(false) {
+                current.mono_count += 1;
+            }
+        }
+    }
+    if in_line {
+        lines.push(current);
+    }
+
+    let is_code_line =
+        |line: &Line| line.text_count >= 4 && line.mono_count * 10 >= line.text_count * 6;
+
+    let mut blocks = Vec::new();
+    let mut open: Option<(usize, usize)> = None;
+    let mut blanks_since_code = 0;
+    for line in &lines {
+        if line.text_count == 0 {
+            if open.is_some() {
+                blanks_since_code += 1;
+            }
+            continue;
+        }
+        if is_code_line(line) {
+            match open.as_mut() {
+                Some((_, end)) => *end = line.end,
+                None => open = Some((line.start, line.end)),
+            }
+            blanks_since_code = 0;
+        } else if let Some((_, end)) = open.as_mut() {
+            if blanks_since_code == 0 && line.text_count < 4 {
+                // A short non-mono fragment right after code (trailing
+                // comment debris) extends the block.
+                *end = line.end;
+            } else {
+                blocks.push(open.take().unwrap());
+            }
+        }
+    }
+    if let Some(block) = open.take() {
+        blocks.push(block);
+    }
+    blocks
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -768,5 +855,58 @@ mod tests {
     fn find_matches_handles_empty_needle_and_overflow() {
         assert!(find_matches(&s("abc"), &[], false).is_empty());
         assert!(find_matches(&s("ab"), &s("abc"), false).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod code_block_tests {
+    use super::*;
+
+    fn detect(text: &str, mono_marks: &[usize]) -> Vec<(usize, usize)> {
+        let chars: Vec<char> = text.chars().collect();
+        let mono: Vec<bool> = (0..chars.len()).map(|i| mono_marks.contains(&i)).collect();
+        detect_code_blocks(&chars, &mono)
+    }
+
+    #[test]
+    fn two_mono_lines_form_a_block() {
+        let text = "let x = 1\nlet y = 2\nAnd prose follows.";
+        let start = text.find("let x").unwrap();
+        let prose = text.find("And prose").unwrap();
+        // Both code lines are set in a monospace font.
+        let blocks = detect(text, &(start..prose).collect::<Vec<_>>());
+        assert_eq!(blocks.len(), 1);
+        assert!(text[blocks[0].0..blocks[0].1].contains("let y"));
+    }
+
+    #[test]
+    fn single_mono_line_is_not_a_block() {
+        let text = "return 4\nProse. More prose here.";
+        let start = text.find("return").unwrap();
+        assert!(detect(text, &[start]).is_empty());
+    }
+
+    #[test]
+    fn prose_is_never_a_block() {
+        let text = "Just words on this line.\nAnd this second line too.";
+        assert!(detect(text, &[]).is_empty());
+    }
+
+    #[test]
+    fn blank_line_between_code_keeps_block_open() {
+        let text = "int a = 0;
+
+int b = 1;
+The end.";
+        let first = text.find("int a").unwrap();
+        let second = text.find("int b").unwrap();
+        let mut mono: Vec<usize> = vec![];
+        for (i, _) in text.char_indices() {
+            if (i >= first && i < first + 9) || (i >= second && i < second + 9) {
+                mono.push(i);
+            }
+        }
+        let blocks = detect(text, &mono);
+        assert_eq!(blocks.len(), 1, "split at blank line: {blocks:?}");
     }
 }

@@ -130,6 +130,88 @@ pub struct KokoroModel {
     style_is_full: bool,
 }
 
+/// A stretch of words to hand the phonemizer in one piece.
+///
+/// Words are phonemized as whole runs so the engine hears connected
+/// prosody — per-word phonemization made every word an isolated utterance
+/// ("If - You're - New - Here"). Runs only break where a homograph override
+/// supplies raw phonemes that must not be re-phonemized as text.
+enum G2pRun<'a> {
+    Sentence(Vec<&'a str>),
+    Phonemes(&'static str),
+}
+
+/// Joins runs of single-letter tokens ("i t a l i c" -> "italic").
+///
+/// Italic and small-caps faces often extract one glyph per "word"; every
+/// letter is then an unknown word to the dictionary and the narration
+/// spells it. A run of 3+ single-letter alphabetic tokens is virtually
+/// always extraction damage. Word gaps survive as the empty tokens that
+/// `split(' ')` keeps for repeated spaces, so "t h e   q u i c k"
+/// rejoins as two words, not one.
+fn repair_letter_spaced(text: &str) -> Vec<String> {
+    let mut words: Vec<String> = Vec::new();
+    let mut run: Vec<char> = Vec::new();
+
+    fn end_run(run: &mut Vec<char>, words: &mut Vec<String>) {
+        if run.len() >= 3 {
+            let joined: String = run.drain(..).collect();
+            words.push(joined);
+        } else {
+            for c in run.drain(..) {
+                words.push(c.to_string());
+            }
+        }
+    }
+
+    for token in text.split(' ') {
+        if token.is_empty() {
+            end_run(&mut run, &mut words);
+            continue;
+        }
+        // Only a bare single alphabetic character joins a letter-run:
+        // "J." carries its period (initials), so it passes through.
+        let mut chars = token.chars();
+        if let (Some(c), None) = (chars.next(), chars.next())
+            && c.is_alphabetic()
+        {
+            run.push(c);
+            continue;
+        }
+        end_run(&mut run, &mut words);
+        words.push(token.to_string());
+    }
+    end_run(&mut run, &mut words);
+    words
+}
+
+fn g2p_runs<'a>(tokens: &[&'a str]) -> Vec<G2pRun<'a>> {
+    let mut runs = Vec::new();
+    let mut batch: Vec<&str> = Vec::new();
+    for (index, token) in tokens.iter().enumerate() {
+        match crate::tts::homograph::resolve(tokens, index) {
+            // Raw phonemes splice in as-is; flush the pending sentence so
+            // the override never passes through the dictionary.
+            Some(crate::tts::homograph::Pronunciation::Phonemes(phonemes)) => {
+                if !batch.is_empty() {
+                    runs.push(G2pRun::Sentence(std::mem::take(&mut batch)));
+                }
+                runs.push(G2pRun::Phonemes(phonemes));
+            }
+            // A respelling is dictionary text ("read" -> "reed"): it joins
+            // the run in place, keeping the sentence connected.
+            Some(crate::tts::homograph::Pronunciation::Respell(spoken)) => {
+                batch.push(spoken);
+            }
+            None => batch.push(token),
+        }
+    }
+    if !batch.is_empty() {
+        runs.push(G2pRun::Sentence(batch));
+    }
+    runs
+}
+
 impl KokoroModel {
     pub fn load(dir: &Path) -> Result<Self, String> {
         let model_path = dir.join("model.onnx");
@@ -202,33 +284,26 @@ impl KokoroModel {
         // fallback spell words letter by letter ("you<U+2019>re" is heard
         // as "y-o-u-r-e").
         let text = normalize_typographic(text);
-        let tokens: Vec<&str> = text.split_whitespace().collect();
-        let mut words = Vec::with_capacity(tokens.len());
-        for (index, word) in tokens.iter().copied().enumerate() {
-            use piper_plus_g2p::Phonemizer as _;
-            match crate::tts::homograph::resolve(&tokens, index) {
-                // Context resolved the word to a homophone the dictionary
-                // knows ("read" -> "reed").
-                Some(crate::tts::homograph::Pronunciation::Respell(spoken)) => {
+        let repaired = repair_letter_spaced(&text);
+        let tokens: Vec<&str> = repaired.iter().map(String::as_str).collect();
+        use piper_plus_g2p::Phonemizer as _;
+        let mut parts = Vec::new();
+        for run in g2p_runs(&tokens) {
+            match run {
+                // Words are phonemized as whole sentences so the engine
+                // hears connected prosody — per-word phonemization made
+                // every word an isolated utterance ("If - You're - New -
+                // Here").
+                G2pRun::Sentence(words) => {
                     let (tokens, _) = self
                         .phonemizer
-                        .phonemize_with_prosody(spoken)
+                        .phonemize_with_prosody(&words.join(" "))
                         .map_err(|e| format!("phonemize: {e}"))?;
-                    words.push(tokens.concat());
+                    parts.push(tokens.concat());
                 }
-                // Context picked an exact pronunciation the dictionary
-                // doesn't spell any other way (stress pairs like REcord
-                // vs reCORD).
-                Some(crate::tts::homograph::Pronunciation::Phonemes(phonemes)) => {
-                    words.push(phonemes.to_string());
-                }
-                None => {
-                    let (tokens, _) = self
-                        .phonemizer
-                        .phonemize_with_prosody(word)
-                        .map_err(|e| format!("phonemize: {e}"))?;
-                    words.push(tokens.concat());
-                }
+                // A raw-phoneme homograph override splices in as-is; its
+                // IPA must not be re-phonemized as text.
+                G2pRun::Phonemes(phonemes) => parts.push(phonemes.to_string()),
             }
         }
         let trailing: String = text
@@ -239,7 +314,7 @@ impl KokoroModel {
             .into_iter()
             .rev()
             .collect();
-        Ok(format!("{} {}", words.join(" "), trailing))
+        Ok(format!("{} {}", parts.join(" "), trailing))
     }
 
     /// Text → audio samples at 24 kHz. Long windows split at token 0-pad
@@ -616,6 +691,25 @@ mod g2p_tests {
         let (a, _) = p.phonemize_with_prosody(&normalized).expect("g2p");
         let (b, _) = p.phonemize_with_prosody("you're").expect("g2p");
         assert_eq!(a.concat(), b.concat());
+    }
+
+    /// Italic faces often extract one glyph per word; the letters must
+    /// rejoin into words before G2P sees them, with widened spaces kept
+    /// as word boundaries.
+    #[test]
+    fn letter_spaced_runs_rejoin_into_words() {
+        // Single spaces separate glyphs; the wider gap separates words.
+        assert_eq!(
+            repair_letter_spaced("t h e   q u i c k   fox"),
+            vec!["the".to_string(), "quick".to_string(), "fox".to_string()]
+        );
+        // Real single-letter words ("a I") never stack three deep.
+        assert_eq!(
+            repair_letter_spaced("a I saw"),
+            vec!["a".to_string(), "I".to_string(), "saw".to_string()]
+        );
+        // Initials keep their periods (not bare letters) and pass through.
+        assert_eq!(repair_letter_spaced("J. R. R. Tolkien").len(), 4);
     }
 
     /// The reported "c-r-o-s-s-r-e-f-e-r-e-n-c-e-s": the book's hyphen

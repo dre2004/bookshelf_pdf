@@ -137,6 +137,20 @@ export default function SettingsScreen({
             </div>
           </div>
 
+          <div className="settings-row">
+            <span>Code blocks</span>
+            <select
+              className="code-handling"
+              value={narration.codeHandling}
+              onChange={(e) =>
+                narration.setCodeHandling(e.target.value as "skip" | "announce")
+              }
+            >
+              <option value="skip">Skip silently</option>
+              <option value="announce">Say "Code listing"</option>
+            </select>
+          </div>
+
           {!packInstalled && (
             <div className="voice-download">
               <button

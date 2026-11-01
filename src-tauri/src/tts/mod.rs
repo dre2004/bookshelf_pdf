@@ -181,11 +181,7 @@ const BEAT_SPLIT_MIN_CHARS: usize = 6;
 /// piece before it. Numeric ranges ("3–7") and hyphenated compounds
 /// (U+002D) never split. The final sub-piece keeps the pause the body
 /// carried (sentence/paragraph).
-fn split_at_beats(
-    chars: &[char],
-    range: (usize, usize),
-    final_pause: u32,
-) -> Vec<((usize, usize), u32, String)> {
+fn split_at_beats(chars: &[char], range: (usize, usize), final_pause: u32) -> Vec<Piece> {
     let (start, end) = range;
     let mut cuts: Vec<(usize, u32)> = Vec::new();
     let mut last_cut = start;
@@ -405,6 +401,75 @@ fn is_heading_line(trimmed: &str, outline_titles: &[String]) -> bool {
         && !after_number.contains('?')
 }
 
+/// Appends one playback piece: samples, a trailing pause (in ms, skipped
+/// on the page's final piece), and the highlight scheduled at its
+/// projected play offset. Shared by the announcement paths.
+#[allow(clippy::too_many_arguments)] // one arg per playback concern
+fn append_piece(
+    player: &Arc<rodio::Player>,
+    schedule: Schedule<'_>,
+    page: i32,
+    range: (usize, usize),
+    samples: Vec<f32>,
+    sample_rate: u32,
+    pause_ms: u32,
+    last_chunk: (usize, usize),
+) {
+    let sample_rate = std::num::NonZero::new(sample_rate).expect("nonzero rate");
+    let mut buffered = samples;
+    if range.1 != last_chunk.1 {
+        buffered.extend(vec![
+            0.0;
+            sample_rate.get() as usize * pause_ms as usize / 1000
+        ]);
+    }
+    player.append(rodio::buffer::SamplesBuffer::new(
+        rodio::ChannelCount::new(1).expect("nonzero channels"),
+        sample_rate,
+        buffered.clone(),
+    ));
+    schedule(buffered, sample_rate, page, Some(range));
+}
+
+/// Everything the speak pipeline needs, collected so the entry point stays
+/// at one argument.
+pub struct SpeakRequest<'a> {
+    pub text: &'a str,
+    pub page: i32,
+    pub voice_id: &'a str,
+    pub rate: f32,
+    pub paragraph_breaks: Vec<usize>,
+    pub outline_titles: Vec<String>,
+    pub code_blocks: Vec<(usize, usize)>,
+    pub code_handling: String,
+}
+
+/// A playback piece: char range, trailing pause in ms, spoken text.
+type Piece = ((usize, usize), u32, String);
+
+/// The speak loops' highlight scheduler.
+type Schedule<'a> = &'a dyn Fn(Vec<f32>, std::num::NonZero<u32>, i32, Option<(usize, usize)>);
+
+/// Marks each narration chunk as code when >= 60% of its characters fall
+/// inside a detected code block.
+fn classify_code_chunks(chunks: &[(usize, usize)], code_blocks: &[(usize, usize)]) -> Vec<bool> {
+    chunks
+        .iter()
+        .map(|(start, end)| {
+            let length = end.saturating_sub(*start).max(1);
+            let covered: usize = code_blocks
+                .iter()
+                .map(|(bs, be)| {
+                    let lo = (*start).max(*bs);
+                    let hi = (*end).min(*be);
+                    hi.saturating_sub(lo)
+                })
+                .sum();
+            covered * 10 >= length * 6
+        })
+        .collect()
+}
+
 /// Playback pieces for one chunk: a heading lead at the chunk start, and
 /// standalone heading lines anywhere after it, become their own pieces
 /// carrying the heading pause; body text between them carries the
@@ -414,7 +479,7 @@ fn heading_aware_pieces(
     chunk: (usize, usize),
     outline_titles: &[String],
     paragraph_breaks: &[usize],
-) -> Vec<((usize, usize), u32, String)> {
+) -> Vec<Piece> {
     let (start, end) = chunk;
     // Pure boundary classification: whether a paragraph break sits at this
     // chunk's end. The speak loops separately suppress the pause on the
@@ -742,18 +807,21 @@ impl TtsEngine {
     /// Speaks `text` (a whole page) chunk by chunk on a worker thread,
     /// emitting progress events as each chunk starts playing. Returns once
     /// the worker is launched; playback continues in the background.
-    pub fn speak(
-        &self,
-        text: &str,
-        page: i32,
-        voice_id: &str,
-        rate: f32,
-        paragraph_breaks: Vec<usize>,
-        outline_titles: Vec<String>,
-    ) -> Result<(), String> {
+    pub fn speak(&self, request: SpeakRequest<'_>) -> Result<(), String> {
         self.stop();
 
-        let text = text.to_string();
+        let SpeakRequest {
+            text: request_text,
+            page,
+            voice_id,
+            rate,
+            paragraph_breaks,
+            outline_titles,
+            code_blocks,
+            code_handling,
+        } = request;
+        let text = request_text.to_string();
+        let voice_id = voice_id.to_string();
         let player = self.player()?;
         let app = self.app.clone();
 
@@ -836,15 +904,54 @@ impl TtsEngine {
         const SPEED_CALIBRATION: f32 = 0.95;
         let text_chars: Vec<char> = text.chars().collect();
         let chunks = split_for_narration(&text, &paragraph_breaks);
+        // Code-block handling per the narration setting: chunk overlap
+        // with a detected block decides membership; announcements collapse
+        // consecutive code chunks into one "Code listing." piece.
+        let announce_code = code_handling != "skip";
+        let code_chunks = classify_code_chunks(&chunks, &code_blocks);
         let last_chunk = chunks.last().copied().unwrap_or((0, 0));
 
         if let Some(kokoro_voice) = voice_id.strip_prefix("kokoro:").map(str::to_string) {
             let (dir, model) = self.kokoro_model()?;
             std::thread::spawn(move || {
-                for (start, end) in chunks {
+                let mut announce_pending = false;
+                for (index, (start, end)) in chunks.into_iter().enumerate() {
                     if stop.load(Ordering::Relaxed) {
                         return;
                     }
+                    if code_chunks[index] {
+                        // Code listing: synthesize nothing from its text —
+                        // either a single announcement or silence.
+                        if announce_code && !announce_pending {
+                            announce_pending = true;
+                            if let Ok((samples, piece_rate)) =
+                                model.synthesize(&dir, "Code listing.", &kokoro_voice, rate)
+                                && !samples.is_empty()
+                            {
+                                append_piece(
+                                    &player,
+                                    &schedule,
+                                    page,
+                                    (start, end),
+                                    samples,
+                                    piece_rate,
+                                    1500,
+                                    last_chunk,
+                                );
+                            }
+                        } else if !announce_code {
+                            // Skip mode: still advance the highlight briefly
+                            // so the selection tracks past the listing.
+                            schedule(
+                                Vec::new(),
+                                24_000u32.try_into().expect("rate"),
+                                page,
+                                Some((start, end)),
+                            );
+                        }
+                        continue;
+                    }
+                    announce_pending = false;
                     // A heading glued to body text becomes two pieces:
                     // the heading (1s pause after), then the body.
                     let pieces = heading_aware_pieces(
@@ -903,14 +1010,49 @@ impl TtsEngine {
 
         let piper_id = voice_id
             .strip_prefix("piper:")
-            .unwrap_or(voice_id)
+            .unwrap_or(&voice_id)
             .to_string();
         let voice = self.voice(&piper_id)?;
         std::thread::spawn(move || {
-            for (start, end) in chunks {
+            let mut announce_pending = false;
+            for (index, (start, end)) in chunks.into_iter().enumerate() {
                 if stop.load(Ordering::Relaxed) {
                     return;
                 }
+                if code_chunks[index] {
+                    if announce_code && !announce_pending {
+                        announce_pending = true;
+                        if let Ok((samples, piece_rate)) = synthesize_with_config(
+                            &mut voice.engine.lock().unwrap(),
+                            &voice,
+                            "Code listing.",
+                            rate,
+                        ) && !samples.is_empty()
+                        {
+                            let samples: Vec<f32> =
+                                samples.iter().map(|&s| s as f32 / 32768.0).collect();
+                            append_piece(
+                                &player,
+                                &schedule,
+                                page,
+                                (start, end),
+                                samples,
+                                piece_rate,
+                                1500,
+                                last_chunk,
+                            );
+                        }
+                    } else if !announce_code {
+                        schedule(
+                            Vec::new(),
+                            24_000u32.try_into().expect("rate"),
+                            page,
+                            Some((start, end)),
+                        );
+                    }
+                    continue;
+                }
+                announce_pending = false;
                 let pieces = heading_aware_pieces(
                     &text_chars,
                     (start, end),
@@ -1484,5 +1626,35 @@ mod book_trace_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod code_handling_tests {
+    use super::*;
+
+    #[test]
+    fn chunks_inside_blocks_classify_as_code() {
+        let chunks = vec![(0, 10), (10, 20), (20, 30)];
+        let blocks = vec![(10, 20)];
+        assert_eq!(
+            classify_code_chunks(&chunks, &blocks),
+            vec![false, true, false]
+        );
+    }
+
+    #[test]
+    fn partial_overlap_under_sixty_percent_is_prose() {
+        let chunks = vec![(0, 100)];
+        let blocks = vec![(0, 50)];
+        assert_eq!(classify_code_chunks(&chunks, &blocks), vec![false]);
+    }
+
+    #[test]
+    fn overlapping_blocks_sum_coverage() {
+        let chunks = vec![(0, 20)];
+        let blocks = vec![(0, 8), (12, 20)];
+        // 16/20 = 80% covered
+        assert_eq!(classify_code_chunks(&chunks, &blocks), vec![true]);
     }
 }

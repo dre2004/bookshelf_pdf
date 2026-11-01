@@ -120,12 +120,15 @@ export async function ttsInstallKokoro(): Promise<void> {
   return invoke("tts_install_kokoro");
 }
 
+export type CodeHandling = "skip" | "announce";
+
 export async function ttsSpeak(args: {
   text: string;
   page: number;
   voiceId: string;
   rate: number;
   docId?: number;
+  codeHandling?: CodeHandling;
 }): Promise<void> {
   return invoke("tts_speak", args);
 }

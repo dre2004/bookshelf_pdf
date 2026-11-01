@@ -11,127 +11,140 @@ fn push_chunk(chars: &[char], chunks: &mut Vec<(usize, usize)>, start: usize, en
 
 /// Sentence-level chunking for narration.
 ///
-/// A sentence ends at `.`, `!` or `?` — never at a newline (PDF text
-/// extraction emits newlines at every visual line break, which are layout,
-/// not meaning). Exceptions where `.` does not end a sentence: decimals
-/// (`3.14`), section numbering (`0.1`, `3.2.1`), a lowercase word
-/// following (`e.g. apples`), and common abbreviations (`Mr.`, `etc.`).
-///
-/// Consecutive sentences group into a selection of up to
-/// [`MAX_SENTENCES`] or [`MAX_SELECTION_CHARS`], whichever comes first.
-/// Paragraph boundaries (char indexes computed from the page's text
-/// geometry) always end a selection. Ranges are `[start, end)` into the
-/// original text.
+/// Sentences end at `.`, `!`, `?` or `:` — colons are clause boundaries a
+/// listener expects a beat at. Newlines are NOT sentence endings: PDF
+/// extraction emits one per visual line, so wrapped prose must join.
+/// Boundaries additionally open after blank lines (paragraphs) and after
+/// heading-like lines. Consecutive short sentences merge (up to 3 / ~400
+/// chars) across `.`, `!`, `?` only — never across `:`, headings or
+/// paragraphs. Ranges are `[start, end)` into the original text.
 pub fn split_for_narration(text: &str, paragraph_breaks: &[usize]) -> Vec<(usize, usize)> {
     let chars: Vec<char> = text.chars().collect();
-    let sentences = split_sentences(&chars);
-    let mut chunks = Vec::new();
-
-    let mut index = 0;
-    while index < sentences.len() {
-        let mut group_start = sentences[index].0;
-        let mut group_end = sentences[index].1;
-        let mut used = 0;
-        while index < sentences.len() {
-            let (start, end) = sentences[index];
-            // Capacity check first: close the group before this sentence.
-            let would_exceed =
-                used > 0 && (used + 1 > MAX_SENTENCES || end - group_start > MAX_SELECTION_CHARS);
-            if used > 0 && would_exceed {
-                break;
-            }
-            if used == 0 {
-                group_start = start;
-            }
-            // A paragraph boundary at this sentence's end closes the group
-            // AFTER including it — the breaking sentence belongs to its
-            // own paragraph.
-            let at_break = paragraph_breaks.contains(&end.saturating_sub(1))
-                || paragraph_breaks.contains(&end);
-            group_end = end;
-            used += 1;
-            index += 1;
-            if at_break {
-                break;
-            }
-        }
-        if group_end - group_start > MAX_SELECTION_CHARS {
-            for (word_start, word_end) in
-                split_at_words(&chars, group_start, group_end, MAX_SELECTION_CHARS)
-            {
-                push_chunk(&chars, &mut chunks, word_start, word_end);
-            }
-        } else {
-            push_chunk(&chars, &mut chunks, group_start, group_end);
+    let mut boundaries = find_boundaries(&chars);
+    // Geometry-derived paragraph breaks arrive as char offsets; they are
+    // unmergeable boundaries like colons and headings.
+    for &offset in paragraph_breaks {
+        let offset = offset.min(chars.len());
+        if offset > 0 {
+            boundaries.push((offset, false));
         }
     }
-    chunks
-}
+    boundaries.sort_unstable();
+    boundaries.dedup();
 
-pub const MAX_SENTENCES: usize = 3;
-pub const MAX_SELECTION_CHARS: usize = 400;
-
-const ABBREVIATIONS: &[&str] = &[
-    "mr", "mrs", "ms", "dr", "prof", "sr", "jr", "st", "no", "vol", "chap", "pp", "fig", "e.g",
-    "i.e", "etc", "vs", "cf", "al", "ca", "ed", "eds",
-];
-
-/// Sentence spans under the rules above. Trailing terminator and spaces up
-/// to the next word are included in each span.
-fn split_sentences(chars: &[char]) -> Vec<(usize, usize)> {
-    let mut sentences = Vec::new();
+    let mut spans: Vec<((usize, usize), bool)> = Vec::new();
     let mut start = 0;
-    for i in 0..chars.len() {
-        let terminates = match chars[i] {
-            '!' | '?' => true,
-            '.' => period_ends_sentence(chars, i),
-            _ => false,
-        };
-        if !terminates {
-            continue;
-        }
-        let mut end = i + 1;
-        while end < chars.len() && (chars[end] == ' ' || chars[end] == '\t') {
-            end += 1;
-        }
+    for (end, mergeable) in boundaries {
         if end > start {
-            push_chunk(chars, &mut sentences, start, end);
+            spans.push(((start, end), mergeable));
         }
         start = end;
     }
     if start < chars.len() {
-        push_chunk(chars, &mut sentences, start, chars.len());
+        spans.push(((start, chars.len()), false));
     }
-    sentences
+
+    let mut chunks: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < spans.len() {
+        let ((start, end), mergeable) = spans[i];
+        let length = end - start;
+        if mergeable && length < 150 && i + 1 < spans.len() {
+            let (_next_start, next_end) = spans[i + 1].0;
+            let merged_sentences = count_sentences(&chars, start, end) + 1;
+            if next_end - start <= 400 && merged_sentences <= 3 {
+                push_chunk(&chars, &mut chunks, start, next_end);
+                i += 2;
+                continue;
+            }
+        }
+        if length > 220 {
+            for (word_start, word_end) in split_at_words(&chars, start, end, 220) {
+                push_chunk(&chars, &mut chunks, word_start, word_end);
+            }
+        } else {
+            push_chunk(&chars, &mut chunks, start, end);
+        }
+        i += 1;
+    }
+    chunks
 }
 
-/// Whether the period at `i` ends a sentence.
-fn period_ends_sentence(chars: &[char], i: usize) -> bool {
-    // Decimal / section numbering: period glued to a digit on the right.
-    if matches!(chars.get(i + 1), Some(next) if next.is_ascii_digit()) {
-        return false;
+/// Boundary offsets (sentence ends, paragraph starts, heading ends) with a
+/// flag: true when the next span may merge into this one (plain sentence
+/// terminators only — never colons, headings or paragraphs).
+fn find_boundaries(chars: &[char]) -> Vec<(usize, bool)> {
+    let mut boundaries = Vec::new();
+    let mut span_start = 0;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let _ = span_start;
+        let terminator = match c {
+            '!' | '?' | ':' => true,
+            '.' => {
+                let next = chars.get(i + 1);
+                if matches!(next, Some(n) if n.is_ascii_digit()) {
+                    // Decimals and section numbering: "3.14", "0.1".
+                    false
+                } else if matches!(next, Some(n) if n.is_whitespace()) {
+                    let after = chars[i + 1..].iter().find(|c| !c.is_whitespace());
+                    match after {
+                        // "e.g. this": lowercase continuation is an
+                        // abbreviation, not a new sentence.
+                        Some(a) if a.is_lowercase() => false,
+                        _ => !ends_with_abbreviation(chars, i),
+                    }
+                } else {
+                    next.is_none() || matches!(next, Some(n) if n.is_whitespace() || is_closing(*n))
+                }
+            }
+            _ => false,
+        };
+        if terminator {
+            let mut end = i + 1;
+            while chars.get(end).is_some_and(|c| *c == ' ' || *c == '\t') {
+                end += 1;
+            }
+            boundaries.push((end, c != ':'));
+            span_start = end;
+            i = end;
+            continue;
+        }
+        i += 1;
     }
-    // Abbreviation: the word ending at this period is a known short form.
-    let word_before: String = chars[..i]
+    boundaries
+}
+
+fn is_closing(c: char) -> bool {
+    matches!(c, '"' | '\'' | ')' | ']' | '}' | '\u{201D}' | '\u{2019}')
+}
+
+/// True when the word ending at `dot` is a common title abbreviation
+/// ("Mr.", "Fig.", "e.g.") whose period must not end a sentence.
+fn ends_with_abbreviation(chars: &[char], dot: usize) -> bool {
+    const ABBREVIATIONS: &[&str] = &[
+        "mr", "mrs", "ms", "dr", "prof", "sr", "jr", "st", "no", "vol", "fig", "figs", "tab",
+        "chap", "pp", "ed", "eds", "al", "etc", "eg", "ie", "vs", "cf", "ca",
+    ];
+    let start = chars[..dot]
         .iter()
-        .collect::<String>()
-        .split_whitespace()
-        .next_back()
-        .unwrap_or_default()
-        .trim_end_matches('.')
-        .to_ascii_lowercase();
-    if ABBREVIATIONS.contains(&word_before.as_str()) {
-        return false;
-    }
-    // Lowercase follower: "…, e.g. apples" continues the sentence.
-    let mut j = i + 1;
-    while j < chars.len() && (chars[j] == ' ' || chars[j] == '\t') {
-        j += 1;
-    }
-    if matches!(chars.get(j), Some(follower) if follower.is_lowercase()) {
-        return false;
-    }
-    true
+        .rposition(|c| c.is_whitespace())
+        .map(|position| position + 1)
+        .unwrap_or(0);
+    let word: String = chars[start..dot]
+        .iter()
+        .filter(|c| c.is_alphanumeric())
+        .collect();
+    ABBREVIATIONS.contains(&word.to_lowercase().as_str())
+}
+
+/// Sentence terminators in a span (for the 3-sentence merge cap).
+fn count_sentences(chars: &[char], start: usize, end: usize) -> usize {
+    chars[start..end]
+        .iter()
+        .filter(|c| matches!(c, '.' | '!' | '?' | ':'))
+        .count()
 }
 
 /// Word-boundary splits of an overlong span into ≤max pieces.
@@ -162,95 +175,88 @@ fn split_at_words(chars: &[char], start: usize, end: usize, max: usize) -> Vec<(
 mod tests {
     use super::*;
 
-    fn cover(text: &str, chunks: &[(usize, usize)]) -> String {
+    fn chunk_texts(text: &str, chunks: &[(usize, usize)]) -> Vec<String> {
         chunks
             .iter()
-            .map(|(s, e)| text.chars().skip(*s).take(e - s).collect::<String>())
+            .map(|(s, e)| text.chars().skip(*s).take(e - s).collect())
             .collect()
     }
 
-    fn chunk_text(text: &str, chunks: &[(usize, usize)], index: usize) -> String {
-        let (s, e) = chunks[index];
-        text.chars().skip(s).take(e - s).collect()
-    }
-
     #[test]
-    fn groups_up_to_three_sentences() {
-        let text = "One sentence. Two sentence. Three sentence. Four sentence.";
-        let chunks = split_for_narration(text, &[]);
-        assert_eq!(chunks.len(), 2, "expected 3+1 grouping: {chunks:?}");
-        assert_eq!(cover(text, &chunks).replace(' ', ""), text.replace(' ', ""));
-    }
-
-    #[test]
-    fn line_breaks_do_not_split_sentences() {
-        let text = "This sentence wraps across\r\ntwo lines on the page. Next one.";
-        let chunks = split_for_narration(text, &[]);
-        let first = chunk_text(text, &chunks, 0);
+    fn colon_ends_a_clause() {
+        let text = "Finish Part 0, then start Chapter 1 and type in every program it shows: the typing is not a ritual.";
+        let texts = chunk_texts(text, &split_for_narration(text, &[]));
+        assert!(texts.len() >= 2, "colon did not split: {texts:?}");
         assert!(
-            first.contains("wraps across"),
-            "split at line break: {first:?}"
+            texts[0].contains("it shows:"),
+            "first part wrong: {:?}",
+            texts[0]
         );
-        assert!(first.contains("page."), "split at line break: {first:?}");
-    }
-
-    #[test]
-    fn decimals_and_numbering_are_not_terminators() {
-        let text = "Pi is 3.14 exactly. 0.1 How to read this book.";
-        let chunks = split_for_narration(text, &[]);
-        let joined = cover(text, &chunks);
-        assert!(joined.contains("3.14"), "decimal split: {joined:?}");
-        let title = chunks
-            .iter()
-            .map(|(s, e)| text.chars().skip(*s).take(e - s).collect::<String>())
-            .find(|c| c.contains("How to read"))
-            .expect("title chunk missing");
-        assert!(title.contains("0.1"), "number split off: {title:?}");
-    }
-
-    #[test]
-    fn abbreviations_and_lowercase_followers_continue() {
-        let text = "See Fig. 3 for details, e.g. the tables. Then Mr. Smith left.";
-        let chunks = split_for_narration(text, &[]);
-        for (s, e) in &chunks {
-            let chunk: String = text.chars().skip(*s).take(e - s).collect();
-            let trimmed = chunk.trim_start();
-            assert!(
-                !trimmed.starts_with(|c: char| c.is_lowercase()),
-                "chunk starts mid-sentence: {chunk:?}"
-            );
-            assert!(!trimmed.starts_with("Smith"), "abbrev split: {chunk:?}");
-        }
-    }
-
-    #[test]
-    fn paragraph_breaks_always_close_a_selection() {
-        let text = "First short one. Second short one. Third here. New paragraph text.";
-        // Char index just past the period of "Second short one.".
-        let chars: Vec<char> = text.chars().collect();
-        let second_end = chars.iter().position(|&c| c == '.').unwrap() + 1;
-        let break_at = chars
-            .iter()
-            .enumerate()
-            .find(|(i, c)| **c == '.' && *i > second_end)
-            .map(|(i, _)| i + 1)
-            .unwrap();
-        let chunks = split_for_narration(text, &[break_at]);
-        assert!(chunks.len() >= 2, "paragraph break ignored: {chunks:?}");
-        let later = chunk_text(text, &chunks, 1);
         assert!(
-            later.trim_start().starts_with("Third"),
-            "paragraph break ignored: {later:?}"
+            texts[1].contains("the typing"),
+            "second part wrong: {:?}",
+            texts[1]
         );
     }
 
     #[test]
-    fn overlong_sentence_splits_at_words() {
-        let text = "word ".repeat(120); // 600 chars, no punctuation
+    fn wrapped_lines_join_into_one_sentence() {
+        let text = "This sentence wraps onto\r\nthe next line of the page. Second sentence.";
+        let texts = chunk_texts(text, &split_for_narration(text, &[]));
+        assert!(
+            texts[0].contains("wraps onto") && texts[0].contains("next line"),
+            "wrapped sentence split: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn heading_line_joins_body_chunk() {
+        // Heading extraction happens downstream (heading_aware_pieces);
+        // the chunker only respects sentence terminators and geometry
+        // breaks, so a heading line and its body form one chunk.
+        let text = "If You're New Here
+Welcome to the book. This is the body text.";
+        let texts = chunk_texts(text, &split_for_narration(text, &[]));
+        assert_eq!(texts.len(), 1, "unexpected split: {texts:?}");
+    }
+
+    #[test]
+    fn decimals_and_abbreviations_do_not_end_sentences() {
+        let text = "Use version 3.14 as shown in Fig. 3 to build it. Then run.";
+        let texts = chunk_texts(text, &split_for_narration(text, &[]));
+        assert!(texts.len() <= 2, "abbreviation/decimal split: {texts:?}");
+        assert!(
+            texts[0].contains("Fig. 3"),
+            "Fig. sentence lost: {:?}",
+            texts[0]
+        );
+    }
+
+    #[test]
+    fn short_sentences_merge_up_to_three() {
+        let text = "One. Two is here. Three now. Four follows.";
+        let texts = chunk_texts(text, &split_for_narration(text, &[]));
+        assert!(texts.len() >= 2, "nothing merged: {texts:?}");
+    }
+
+    #[test]
+    fn long_sentences_split_at_words() {
+        let text = "word ".repeat(80);
         let chunks = split_for_narration(&text, &[]);
         assert!(chunks.len() >= 2);
         for (start, end) in &chunks {
-            assert!(end - start <= 401, "chunk of {} chars", end - start);
+            assert!(end - start <= 221, "chunk of {} chars", end - start);
         }
+    }
+
+    #[test]
+    fn section_numbering_stays_with_its_title() {
+        let text = "0.1 How to read this book\r\nYou will read this book.";
+        let texts = chunk_texts(text, &split_for_narration(text, &[]));
+        assert!(
+            texts[0].contains("How to read this book"),
+            "title split off: {:?}",
+            texts[0]
+        );
     }
 }

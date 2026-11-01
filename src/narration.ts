@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import {
+  type CodeHandling,
   ttsInstallDefaultVoices,
   ttsInstallKokoro,
   ttsPause,
@@ -64,6 +65,8 @@ export interface NarrationController {
   setVoiceURI: (uri: string) => void;
   rate: number;
   setRate: (rate: number) => void;
+  codeHandling: CodeHandling;
+  setCodeHandling: (value: CodeHandling) => void;
   continuous: boolean;
   setContinuous: (value: boolean) => void;
   play: (fromPage?: number) => void;
@@ -110,6 +113,7 @@ export function useNarration({
 
   const [voiceURI, setVoiceURIState] = useState("");
   const [rate, setRateState] = useState(1);
+  const [codeHandling, setCodeHandling] = useState<CodeHandling>("skip");
   const [continuous, setContinuousState] = useState(true);
 
   // True while the selection is an automatic default rather than a user
@@ -120,6 +124,7 @@ export function useNarration({
   // Live refs so in-flight playback picks up setting changes.
   const voiceURIRef = useRef(voiceURI);
   const rateRef = useRef(rate);
+  const codeHandlingRef = useRef(codeHandling);
   const continuousRef = useRef(continuous);
   const stoppedRef = useRef(false);
   const lastBoundaryRef = useRef(0);
@@ -133,6 +138,9 @@ export function useNarration({
   useEffect(() => {
     rateRef.current = rate;
   }, [rate]);
+  useEffect(() => {
+    codeHandlingRef.current = codeHandling;
+  }, [codeHandling]);
   useEffect(() => {
     continuousRef.current = continuous;
   }, [continuous]);
@@ -358,6 +366,7 @@ export function useNarration({
               voiceId: selection,
               rate: rateRef.current,
               docId,
+              codeHandling: codeHandlingRef.current,
             }),
           )
           .catch(() => stop());
@@ -525,6 +534,8 @@ export function useNarration({
     setVoiceURI,
     rate,
     setRate,
+    codeHandling,
+    setCodeHandling,
     continuous,
     setContinuous: setContinuousState,
     play,
