@@ -125,6 +125,10 @@ export async function ttsInstallKokoro(): Promise<void> {
   return invoke("tts_install_kokoro");
 }
 
+export async function ttsDownloadVoices(): Promise<void> {
+  return invoke("tts_download_voices");
+}
+
 export type CodeHandling = "skip" | "announce";
 
 export async function ttsSpeak(args: {

@@ -57,6 +57,8 @@ jobs:
 
       - name: Fetch PDFium (needed by render tests)
         run: node scripts/fetch-pdfium.mjs linux-x64
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Formatting
         run: cargo fmt --all --check

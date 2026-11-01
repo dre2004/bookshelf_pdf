@@ -16,7 +16,9 @@ interface Props {
   onToggleSidebar: () => void;
   onSearch: () => void;
   onNarration: () => void;
+  onNarrationSetup: () => void;
   narrationActive: boolean;
+  narrationSetupNeeded: boolean;
   onAddBookmark: () => void;
   onBack: () => void;
   onForward: () => void;
@@ -38,7 +40,9 @@ export default function Toolbar({
   onToggleSidebar,
   onSearch,
   onNarration,
+  onNarrationSetup,
   narrationActive,
+  narrationSetupNeeded,
   onAddBookmark,
   onBack,
   onForward,
@@ -83,14 +87,25 @@ export default function Toolbar({
         <button className="btn" disabled={disabled} onClick={onSearch} title="Search in document (Ctrl+F)">
           Search
         </button>
-        <button
-          className={`btn ${narrationActive ? "active" : ""}`}
-          disabled={disabled}
-          onClick={onNarration}
-          title="Narration — read the book aloud"
-        >
-          🔊 Narrate
-        </button>
+        {narrationSetupNeeded ? (
+          <button
+            className="btn"
+            disabled={disabled}
+            onClick={onNarrationSetup}
+            title="Narration needs a one-time download (~92 MB) — set it up now"
+          >
+            🔊 Set up narration
+          </button>
+        ) : (
+          <button
+            className={`btn ${narrationActive ? "active" : ""}`}
+            disabled={disabled}
+            onClick={onNarration}
+            title="Narration — read the book aloud"
+          >
+            🔊 Narrate
+          </button>
+        )}
         <button className="btn" disabled={disabled} onClick={onAddBookmark} title="Bookmark this position (Ctrl+B)">
           ⚑ Bookmark
         </button>

@@ -3,7 +3,9 @@ import { listen } from "@tauri-apps/api/event";
 import {
   type CodeHandling,
   type TtsVoice,
+  ttsDownloadVoices,
   ttsInstallKokoro,
+  ttsPackInstalled,
   ttsPause,
   ttsResume,
   ttsSpeak,
@@ -50,6 +52,9 @@ interface UseNarrationArgs {
   onAdvancePage: (page: number) => void;
 }
 
+/** Phases of the one-time on-device narration download. */
+export type NarrationSetupPhase = "idle" | "engine" | "voices" | "done" | "failed";
+
 export interface NarrationController {
   supported: boolean;
   /** All selectable voices: on-device (Kokoro) first, then system voices. */
@@ -70,10 +75,24 @@ export interface NarrationController {
   pause: () => void;
   resume: () => void;
   stop: () => void;
-  /** State of the on-device engine pack download offered in settings. */
-  download: {
-    active: boolean;
-    progress: number; // 0..1 when the total size is known
+  /** `null` while the check is in flight; narration is gated only on a
+   *  confirmed `false`. */
+  packInstalled: boolean | null;
+  /** True when narration cannot run yet: the engine pack is missing and
+   *  the selection is (or would default to) an on-device voice. */
+  needsSetup: boolean;
+  /** Why playback stopped unexpectedly, if it did. Cleared on replay. */
+  error: string | null;
+  clearError: () => void;
+  /** State of the one-time on-device engine + voices download. */
+  setup: {
+    phase: NarrationSetupPhase;
+    downloadedBytes: number;
+    totalBytes: number;
+    voicesFetched: number;
+    voicesTotal: number;
+    /** Voice currently downloading, if any. */
+    voice: string | null;
     error: string | null;
     start: () => void;
   };
@@ -210,50 +229,109 @@ export function useNarration({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [docId, refreshEngineVoices]);
 
-  // ---- Kokoro engine pack download ----
-  const [downloadActive, setDownloadActive] = useState(false);
-  const [downloadProgress, setDownloadProgress] = useState(0);
-  const [downloadError, setDownloadError] = useState<string | null>(null);
+  // ---- On-device narration setup (engine pack + voices) ----
+  const [phase, setPhase] = useState<NarrationSetupPhase>("idle");
+  const [downloadedBytes, setDownloadedBytes] = useState(0);
+  const [totalBytes, setTotalBytes] = useState(0);
+  const [voicesFetched, setVoicesFetched] = useState(0);
+  const [setupVoice, setSetupVoice] = useState<string | null>(null);
+  const [setupError, setSetupError] = useState<string | null>(null);
+  const [packInstalled, setPackInstalled] = useState<boolean | null>(null);
+  // Mirrors `phase` for the event listener, which must branch without a
+  // re-render (and must not run side effects inside a state updater).
+  const phaseRef = useRef<NarrationSetupPhase>("idle");
+  const setPhaseBoth = useCallback((next: NarrationSetupPhase) => {
+    phaseRef.current = next;
+    setPhase(next);
+  }, []);
+  const VOICES_TOTAL = 9; // the curated on-device catalog
+
+  const checkPackInstalled = useCallback(() => {
+    ttsPackInstalled()
+      .then((installed) => setPackInstalled(installed))
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    checkPackInstalled();
+  }, [checkPackInstalled]);
 
   useEffect(() => {
     const unlisten = listen<{
-      kind: "started" | "progress" | "done" | "failed";
+      kind:
+        | "started"
+        | "progress"
+        | "done"
+        | "failed"
+        | "voiceStarted"
+        | "voiceDone";
       totalBytes?: number;
       downloadedBytes?: number;
+      voice?: string;
       reason?: string;
     }>("kokoro-download", (event) => {
       const payload = event.payload;
-      if (payload.kind === "started") {
-        setDownloadActive(true);
-        setDownloadError(null);
-        setDownloadProgress(0);
-      } else if (payload.kind === "progress") {
-        const total = payload.totalBytes ?? 0;
-        const downloaded = payload.downloadedBytes ?? 0;
-        if (total > 0) setDownloadProgress(Math.min(1, downloaded / total));
-      } else if (payload.kind === "done") {
-        setDownloadActive(false);
-        setDownloadProgress(1);
-        refreshEngineVoices();
-      } else if (payload.kind === "failed") {
-        setDownloadActive(false);
-        setDownloadError(payload.reason ?? "download failed");
+      switch (payload.kind) {
+        case "started":
+          setPhaseBoth("engine");
+          setDownloadedBytes(0);
+          setTotalBytes(payload.totalBytes ?? 0);
+          setSetupError(null);
+          break;
+        case "progress":
+          if (payload.totalBytes) setTotalBytes(payload.totalBytes);
+          if (payload.downloadedBytes) setDownloadedBytes(payload.downloadedBytes);
+          break;
+        case "done":
+          // Engine pack settled (downloaded or already present): fetch
+          // the voices; the next done event completes the setup.
+          if (phaseRef.current === "engine") {
+            setPhaseBoth("voices");
+            ttsDownloadVoices().catch((e: unknown) => {
+              setSetupError(String(e));
+              setPhaseBoth("failed");
+            });
+          } else if (phaseRef.current === "voices") {
+            setSetupVoice(null);
+            setPackInstalled(true);
+            setPhaseBoth("done");
+            refreshEngineVoices();
+          }
+          break;
+        case "voiceStarted":
+          setSetupVoice(payload.voice ?? null);
+          break;
+        case "voiceDone":
+          setSetupVoice(null);
+          setVoicesFetched((count) => count + 1);
+          break;
+        case "failed":
+          setSetupError(payload.reason ?? "download failed");
+          setPhaseBoth("failed");
+          checkPackInstalled();
+          break;
       }
     });
     return () => {
       void unlisten.then((fn) => fn());
     };
-  }, [refreshEngineVoices]);
+  }, [refreshEngineVoices, checkPackInstalled, setPhaseBoth]);
 
-  const startDownload = useCallback(() => {
-    setDownloadError(null);
-    setDownloadActive(true);
-    setDownloadProgress(0);
+  const startSetup = useCallback(() => {
+    setSetupError(null);
+    setVoicesFetched(0);
+    setSetupVoice(null);
+    setDownloadedBytes(0);
+    setTotalBytes(0);
+    setPhaseBoth("engine");
     ttsInstallKokoro().catch((e) => {
-      setDownloadActive(false);
-      setDownloadError(String(e));
+      setSetupError(String(e));
+      setPhaseBoth("failed");
     });
-  }, []);
+  }, [setPhaseBoth]);
+
+  const [speakError, setSpeakError] = useState<string | null>(null);
+  const clearError = useCallback(() => setSpeakError(null), []);
 
   const setVoiceURI = useCallback((uri: string) => {
     autoPicked.current = false;
@@ -273,6 +351,20 @@ export function useNarration({
     setNarratingPage(null);
     setSpokenRange(null);
   }, [supported]);
+
+  /** Stops playback and leaves a persistent reason instead of silently
+   *  ripping the narration bar away. */
+  const fail = useCallback(
+    (reason: unknown) => {
+      stop();
+      setSpeakError(
+        typeof reason === "string" && reason
+          ? reason
+          : String(reason ?? "narration stopped"),
+      );
+    },
+    [stop],
+  );
 
   const speakPage = useCallback(
     (target: number) => {
@@ -297,7 +389,7 @@ export function useNarration({
               codeHandling: codeHandlingRef.current,
             }),
           )
-          .catch(() => stop());
+          .catch((e) => fail(e));
         return;
       }
 
@@ -343,13 +435,15 @@ export function useNarration({
             }
           };
           utterance.onerror = () => {
-            if (speakingPageRef.current === target) stop();
+            if (speakingPageRef.current === target) {
+              fail("the system voice failed to speak — pick a Bookshelf voice in Settings");
+            }
           };
           window.speechSynthesis.speak(utterance);
         })
-        .catch(() => stop());
+        .catch((e) => fail(e));
     },
-    [getText, pageCount, onAdvancePage, stop, supported],
+    [getText, pageCount, onAdvancePage, stop, fail, supported],
   );
 
   // On-device engine events: progress → highlight, pageDone → advance.
@@ -370,7 +464,7 @@ export function useNarration({
         };
         setSpokenRange({ page: payload.page, start: payload.start ?? 0, end: payload.end ?? 0 });
       } else if (payload.kind === "error") {
-        stop();
+        fail(payload.reason ?? "the narration engine stopped unexpectedly");
       } else if (payload.kind === "pageDone") {
         const done = payload.page ?? narratingPageRef.current;
         if (done == null) return;
@@ -385,7 +479,7 @@ export function useNarration({
     return () => {
       void unlisten.then((fn) => fn());
     };
-  }, [speakPage, stop, onAdvancePage, pageCount]);
+  }, [speakPage, stop, fail, onAdvancePage, pageCount]);
 
   // Keep a ref of the narrating page for late pageDone events.
   const narratingPageRef = useRef<number | null>(null);
@@ -401,9 +495,10 @@ export function useNarration({
 
   const play = useCallback(
     (fromPage?: number) => {
+      clearError();
       speakPage(fromPage ?? page);
     },
-    [speakPage, page],
+    [clearError, speakPage, page],
   );
 
   const pause = useCallback(() => {
@@ -446,10 +541,10 @@ export function useNarration({
               codeHandling: codeHandlingRef.current,
             }),
           )
-          .catch(() => stop());
+          .catch((e) => fail(e));
       }
     },
-    [docId, getText, stop],
+    [docId, fail, getText, stop],
   );
 
   return {
@@ -471,11 +566,20 @@ export function useNarration({
     pause,
     resume,
     stop,
-    download: {
-      active: downloadActive,
-      progress: downloadProgress,
-      error: downloadError,
-      start: startDownload,
+    packInstalled,
+    needsSetup:
+      packInstalled === false && (voiceURI === "" || isOnDeviceVoice(voiceURI)),
+    error: speakError,
+    clearError,
+    setup: {
+      phase,
+      downloadedBytes,
+      totalBytes,
+      voicesFetched,
+      voicesTotal: VOICES_TOTAL,
+      voice: setupVoice,
+      error: setupError,
+      start: startSetup,
     },
   };
 }
