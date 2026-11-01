@@ -152,15 +152,20 @@ const DASH_PAUSE_MS: u32 = 300;
 /// contribute no pause at all.
 const SEMICOLON_PAUSE_MS: u32 = 350;
 
+/// The beat after a colon, which introduces a list or an explanation
+/// ("it shows: the typing is not a ritual"). Same length as a semicolon;
+/// kept separate so it can be tuned independently.
+const COLON_PAUSE_MS: u32 = 350;
+
 /// Minimum non-whitespace text on each side of a beat marker for it to
 /// earn a pause; markers glued between short fragments stay inline.
 const BEAT_SPLIT_MIN_CHARS: usize = 6;
 
 /// Splits a body piece at its in-sentence beat markers — parenthetical
-/// em/en dashes and semicolons — each becoming a short pause on the
-/// piece before it. Numeric ranges ("3–7") and hyphenated compounds
-/// (U+002D) never split. The final sub-piece keeps the pause the body
-/// carried (sentence/paragraph).
+/// em/en dashes, semicolons and colons — each becoming a short pause on
+/// the piece before it. Numeric ranges ("3–7") and times ("12:30") never
+/// split, and hyphenated compounds (U+002D) never split. The final
+/// sub-piece keeps the pause the body carried (sentence/paragraph).
 fn split_at_beats(chars: &[char], range: (usize, usize), final_pause: u32) -> Vec<Piece> {
     let (start, end) = range;
     let mut cuts: Vec<(usize, u32)> = Vec::new();
@@ -175,6 +180,15 @@ fn split_at_beats(chars: &[char], range: (usize, usize), final_pause: u32) -> Ve
                     continue;
                 }
                 DASH_PAUSE_MS
+            }
+            ':' => {
+                let prev_digit = i > 0 && chars[i - 1].is_ascii_digit();
+                let next_digit = chars.get(i + 1).is_some_and(|c| c.is_ascii_digit());
+                if prev_digit && next_digit {
+                    // Time or ratio "12:30", not an introduction.
+                    continue;
+                }
+                COLON_PAUSE_MS
             }
             ';' => SEMICOLON_PAUSE_MS,
             _ => continue,
@@ -1080,8 +1094,8 @@ mod heading_lead_tests {
         let pieces = pieces(text, &outline);
         assert_eq!(
             pieces.len(),
-            5,
-            "expected kicker + title + dash-split body: {pieces:?}"
+            6,
+            "expected kicker + title + beat-split body: {pieces:?}"
         );
         let pauses: Vec<u32> = pieces.iter().map(|(_, p, _)| *p).collect();
         assert_eq!(
@@ -1089,6 +1103,7 @@ mod heading_lead_tests {
             vec![
                 HEADING_KICKER_PAUSE_MS,
                 HEADING_PAUSE_MS,
+                COLON_PAUSE_MS,
                 DASH_PAUSE_MS,
                 DASH_PAUSE_MS,
                 SENTENCE_PAUSE_MS
@@ -1096,8 +1111,8 @@ mod heading_lead_tests {
         );
         assert_eq!(pieces[0].2.trim(), "Chapter 0");
         assert!(pieces[1].2.contains("New Here"));
-        assert!(pieces[2].2.trim_end().ends_with("lean on facts"));
-        assert!(pieces[4].2.trim_start().starts_with("that deserve"));
+        assert!(pieces[2].2.trim_end().ends_with("surprised by it"));
+        assert!(pieces[5].2.trim_start().starts_with("that deserve"));
     }
 
     #[test]
@@ -1158,6 +1173,24 @@ mod heading_lead_tests {
             pauses,
             vec![DASH_PAUSE_MS, SEMICOLON_PAUSE_MS, SENTENCE_PAUSE_MS]
         );
+    }
+
+    #[test]
+    fn colons_get_a_beat() {
+        // The reported sentence: the colon used to read as one run-on.
+        let text = "Finish Part 0, then start Chapter 1 and type in every program it shows: the typing is not a ritual, it is the course. ";
+        let pieces = pieces(text, &[]);
+        assert_eq!(pieces.len(), 2, "{pieces:?}");
+        assert_eq!(pieces[0].1, COLON_PAUSE_MS);
+        assert!(pieces[0].2.trim_end().ends_with("it shows"));
+        assert!(pieces[1].2.trim_start().starts_with("the typing"));
+    }
+
+    #[test]
+    fn times_do_not_split_at_colons() {
+        let text = "The meeting ran 12:30 to 2:00 and overran badly. Nothing else happened. ";
+        let pieces = pieces(text, &[]);
+        assert_eq!(pieces.len(), 1, "{pieces:?}");
     }
 
     #[test]
