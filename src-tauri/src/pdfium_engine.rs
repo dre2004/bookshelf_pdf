@@ -793,6 +793,10 @@ pub fn detect_code_blocks(chars: &[char], mono: &[bool]) -> Vec<(usize, usize)> 
         end: usize,
         mono_count: usize,
         text_count: usize,
+        /// Non-alphanumeric, non-whitespace glyphs (`{`, `}`, `*/`, `…`),
+        /// and how many of them are monospace.
+        symbol_count: usize,
+        mono_symbol_count: usize,
     }
     let mut lines: Vec<Line> = Vec::new();
     let mut current = Line::default();
@@ -813,10 +817,16 @@ pub fn detect_code_blocks(chars: &[char], mono: &[bool]) -> Vec<(usize, usize)> 
             in_line = true;
         }
         current.end = i + 1;
+        let is_mono = mono.get(i).copied().unwrap_or(false);
         if c.is_alphanumeric() {
             current.text_count += 1;
-            if mono.get(i).copied().unwrap_or(false) {
+            if is_mono {
                 current.mono_count += 1;
+            }
+        } else if !c.is_whitespace() {
+            current.symbol_count += 1;
+            if is_mono {
+                current.mono_symbol_count += 1;
             }
         }
     }
@@ -826,11 +836,24 @@ pub fn detect_code_blocks(chars: &[char], mono: &[bool]) -> Vec<(usize, usize)> 
 
     let is_code_line =
         |line: &Line| line.text_count >= 4 && line.mono_count * 10 >= line.text_count * 6;
+    // A brace-only line carries no alphanumerics for the ratio test, but
+    // an all-mono glyph line inside an open listing (the closing `}`) is
+    // part of the code. It only ever extends a block, never opens one.
+    let is_symbol_code_line = |line: &Line| {
+        line.text_count == 0 && line.mono_symbol_count == line.symbol_count && line.symbol_count > 0
+    };
 
     let mut blocks = Vec::new();
     let mut open: Option<(usize, usize)> = None;
     let mut blanks_since_code = 0;
     for line in &lines {
+        if is_symbol_code_line(line) {
+            if let Some((_, end)) = open.as_mut() {
+                *end = line.end;
+                blanks_since_code = 0;
+            }
+            continue;
+        }
         if line.text_count == 0 {
             if open.is_some() {
                 blanks_since_code += 1;
@@ -1070,5 +1093,28 @@ The end.";
         }
         let blocks = detect(text, &mono);
         assert_eq!(blocks.len(), 1, "split at blank line: {blocks:?}");
+    }
+
+    /// A listing's closing `}` carries no alphanumerics, so the ratio
+    /// test can never call it a code line — it must still extend the
+    /// block instead of being left behind as narration text.
+    #[test]
+    fn brace_only_mono_lines_extend_an_open_block() {
+        let text = "int main(void)\n{\n/* body */\n}\r\nProse follows the listing.";
+        let code_end = text.find("Prose").unwrap();
+        let mono: Vec<usize> = (0..code_end).collect();
+        let blocks = detect(text, &mono);
+        assert_eq!(blocks.len(), 1, "{blocks:?}");
+        let block_text = &text[blocks[0].0..blocks[0].1];
+        assert!(block_text.contains('{') && block_text.contains('}'));
+    }
+
+    /// A proportional-font glyph line (an em-dash divider) must not
+    /// extend anything, and a lone mono glyph line must not open a block.
+    #[test]
+    fn symbol_lines_do_not_open_blocks() {
+        let text = "Just prose here.\n---\nMore prose follows.";
+        let dash = text.find("---").unwrap();
+        assert!(detect(text, &(dash..dash + 3).collect::<Vec<_>>()).is_empty());
     }
 }

@@ -70,6 +70,72 @@ pub fn split_for_narration(text: &str, paragraph_breaks: &[usize]) -> Vec<(usize
     chunks
 }
 
+/// Chunks a page for narration with code listings kept whole: each
+/// detected code block becomes exactly one chunk flagged as code, and the
+/// prose between blocks is sentence-chunked as usual. Without this,
+/// sentence chunking fuses a listing with its surrounding prose and the
+/// old coverage-percentage guess narrated the code as text.
+pub fn split_with_code_blocks(
+    text: &str,
+    paragraph_breaks: &[usize],
+    code_blocks: &[(usize, usize)],
+) -> Vec<((usize, usize), bool)> {
+    let chars: Vec<char> = text.chars().collect();
+    // Sorted, clamped, non-overlapping blocks.
+    let mut blocks: Vec<(usize, usize)> = code_blocks
+        .iter()
+        .copied()
+        .filter(|(start, end)| *end > *start && *start < chars.len())
+        .map(|(start, end)| (start.min(chars.len()), end.min(chars.len())))
+        .collect();
+    blocks.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in blocks {
+        match merged.last_mut() {
+            Some((_, last_end)) if start <= *last_end => *last_end = (*last_end).max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+
+    let mut chunks: Vec<((usize, usize), bool)> = Vec::new();
+    let mut cursor = 0usize;
+    for (start, end) in merged {
+        push_prose(&chars, &mut chunks, cursor, start, paragraph_breaks);
+        chunks.push(((start, end), true));
+        cursor = end;
+    }
+    push_prose(&chars, &mut chunks, cursor, chars.len(), paragraph_breaks);
+    chunks
+}
+
+/// Sentence-chunks the prose span `[start..end)` (global char offsets),
+/// rebasing the results to page coordinates. Whitespace-only spans
+/// between listings produce nothing.
+fn push_prose(
+    chars: &[char],
+    chunks: &mut Vec<((usize, usize), bool)>,
+    start: usize,
+    end: usize,
+    paragraph_breaks: &[usize],
+) {
+    if end <= start {
+        return;
+    }
+    let span: String = chars[start..end].iter().collect();
+    if span.trim().is_empty() {
+        return;
+    }
+    let local_breaks: Vec<usize> = paragraph_breaks
+        .iter()
+        .copied()
+        .filter(|&offset| offset > start && offset < end)
+        .map(|offset| offset - start)
+        .collect();
+    for (chunk_start, chunk_end) in split_for_narration(&span, &local_breaks) {
+        chunks.push(((chunk_start + start, chunk_end + start), false));
+    }
+}
+
 /// Boundary offsets (sentence ends, paragraph starts, heading ends) with a
 /// flag: true when the next span may merge into this one (plain sentence
 /// terminators only — never colons, headings or paragraphs).
