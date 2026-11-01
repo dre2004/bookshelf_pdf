@@ -4,7 +4,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use crate::db::{BookState, BookSummary, Bookmark, Db, Highlight, NewHighlight};
 use crate::pdfium_engine::{
-    ApiError, DocumentInfo, Engine, OutlineNode, PageInfo, PageTextData, SearchMatch,
+    ApiError, DocumentInfo, Engine, OutlineNode, PageInfo, PageLink, PageTextData, SearchMatch,
 };
 use crate::tts::{SpeakRequest, TtsEngine, TtsVoiceInfo};
 
@@ -40,6 +40,17 @@ pub fn get_page_text(
     page: i32,
 ) -> Result<PageTextData, ApiError> {
     engine.page_text(doc_id, page)
+}
+
+/// Clickable links on a page: in-document destinations (table-of-contents
+/// entries, cross references) and external URIs.
+#[tauri::command]
+pub fn get_page_links(
+    engine: tauri::State<'_, Arc<Engine>>,
+    doc_id: u32,
+    page: i32,
+) -> Result<Vec<PageLink>, ApiError> {
+    engine.page_links(doc_id, page)
 }
 
 #[tauri::command]

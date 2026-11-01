@@ -1,6 +1,6 @@
 mod commands;
 mod db;
-mod pdfium_engine;
+pub mod pdfium_engine;
 mod tts;
 
 use std::sync::Arc;
@@ -101,6 +101,7 @@ pub fn run() {
             commands::close_document,
             commands::get_page_dims,
             commands::get_page_text,
+            commands::get_page_links,
             commands::search_document,
             commands::get_outline,
             commands::bookmarks_add,

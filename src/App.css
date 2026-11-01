@@ -619,6 +619,27 @@ body,
   background: rgba(120, 190, 255, 0.45);
 }
 
+/* Clickable links sit above the text layer so their areas always work;
+   hover shows a faint tint like a browser text link. */
+.link-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  pointer-events: none;
+}
+
+.page-link {
+  position: absolute;
+  pointer-events: auto;
+  cursor: pointer;
+  border-radius: 2px;
+}
+
+.page-link:hover {
+  background: rgba(70, 150, 255, 0.18);
+  outline: 1px solid rgba(70, 150, 255, 0.55);
+}
+
 .selection-menu {
   position: absolute;
   z-index: 10;

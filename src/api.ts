@@ -7,6 +7,7 @@ import type {
   DocumentInfo,
   Highlight,
   OutlineNode,
+  PageLink,
   PageTextData,
   PageInfo,
   SearchMatch,
@@ -93,6 +94,10 @@ export async function getStartupFile(): Promise<string | null> {
 
 export async function getPageText(docId: number, page: number): Promise<PageTextData> {
   return invoke<PageTextData>("get_page_text", { docId, page });
+}
+
+export async function getPageLinks(docId: number, page: number): Promise<PageLink[]> {
+  return invoke<PageLink[]>("get_page_links", { docId, page });
 }
 
 // ---- on-device narration (Kokoro) ----

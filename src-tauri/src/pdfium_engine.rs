@@ -68,6 +68,20 @@ pub struct SearchMatch {
     pub end: i64,
 }
 
+/// One clickable link on a page (a table-of-contents entry, cross
+/// reference or external URI). `rect` follows the `PageTextData::boxes`
+/// convention: (x, y, width, height) in PDF points, origin at the page's
+/// bottom-left corner.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PageLink {
+    pub rect: [f32; 4],
+    /// Target page index for in-document links.
+    pub dest_page: Option<PdfPageIndex>,
+    /// External URI, for links that open one.
+    pub uri: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OutlineNode {
@@ -335,6 +349,25 @@ impl Engine {
             width: page.width().value as f64,
             height: page.height().value as f64,
         })
+    }
+
+    /// Clickable links on a page. Links with neither an in-document
+    /// destination nor a URI are dropped — there is nothing to activate.
+    pub fn page_links(
+        &self,
+        doc_id: u32,
+        page_index: PdfPageIndex,
+    ) -> Result<Vec<PageLink>, ApiError> {
+        let docs = self.docs.lock().unwrap();
+        let doc = docs.get(&doc_id).ok_or(ApiError::UnknownDocument)?;
+        let pages = doc.pages();
+        if page_index < 0 || page_index >= pages.len() {
+            return Err(ApiError::UnknownPage);
+        }
+        let page = pages.get(page_index).map_err(|e| ApiError::RenderFailed {
+            reason: pdfium_error_reason(&e),
+        })?;
+        Ok(collect_page_links(&page))
     }
 
     /// Case-(in)sensitive substring search over every page. Matches are
@@ -682,6 +715,48 @@ fn collect_child_titles(bookmark: &PdfBookmark<'_>, page: PdfPageIndex, titles: 
 /// Code-block detection: 2+ consecutive lines whose text is predominantly
 /// fixed-pitch form a block. Lines split on PDFium's newline characters;
 /// blank lines between code lines keep the block open. Returns char ranges.
+/// Collects a page's clickable links as engine-independent data. The target
+/// of an in-document link is either the link's own destination or the
+/// destination wrapped in a GoTo action; links with neither a destination
+/// nor a URI are dropped (nothing to activate).
+pub fn collect_page_links(page: &PdfPage) -> Vec<PageLink> {
+    let mut links = Vec::new();
+    for link in page.links().iter() {
+        let action = link.action();
+        let dest_page = link
+            .destination()
+            .and_then(|dest| dest.page_index().ok())
+            .or_else(|| {
+                action
+                    .as_ref()
+                    .and_then(|action| action.as_local_destination_action())
+                    .and_then(|action| action.destination().ok())
+                    .and_then(|dest| dest.page_index().ok())
+            });
+        let uri = action
+            .as_ref()
+            .and_then(|action| action.as_uri_action())
+            .and_then(|action| action.uri().ok());
+        if dest_page.is_none() && uri.is_none() {
+            continue;
+        }
+        let Ok(rect) = link.rect() else {
+            continue;
+        };
+        links.push(PageLink {
+            rect: [
+                rect.left().value,
+                rect.bottom().value,
+                rect.width().value,
+                rect.height().value,
+            ],
+            dest_page,
+            uri,
+        });
+    }
+    links
+}
+
 pub fn detect_code_blocks(chars: &[char], mono: &[bool]) -> Vec<(usize, usize)> {
     #[derive(Default)]
     struct Line {

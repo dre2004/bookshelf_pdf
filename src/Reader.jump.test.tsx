@@ -15,6 +15,7 @@ vi.mock("./api", () => ({
     width: 595,
     height: 842,
   }),
+  getPageLinks: vi.fn().mockResolvedValue([]),
 }));
 
 beforeAll(() => {
@@ -53,6 +54,7 @@ function props(page: number, jumpSerial: number) {
     activeHitKey: null,
     spokenRange: null,
     onAddHighlight: vi.fn(),
+    onJumpPage: vi.fn(),
   };
 }
 

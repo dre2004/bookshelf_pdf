@@ -7,10 +7,11 @@ import {
   type CSSProperties,
   type ReactNode,
 } from "react";
-import { cachedPageText, pageImageUrl } from "./api";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import { cachedPageText, getPageLinks, pageImageUrl } from "./api";
 import type { SpokenRange } from "./narration";
 import { rangeBoxes, type OverlayBox } from "./textOverlay";
-import { HIGHLIGHT_COLORS, type HighlightColor, type PageTextData } from "./types";
+import { HIGHLIGHT_COLORS, type HighlightColor, type PageLink, type PageTextData } from "./types";
 import type { DocumentInfo, Highlight, PageInfo, ReadMode, SearchMatch, Theme, ZoomMode } from "./types";
 
 const PAD = 32;
@@ -101,6 +102,70 @@ function OverlayBoxes({ boxes, className }: { boxes: OverlayBox[]; className: st
   );
 }
 
+/** Clickable in-page links (TOC entries, cross references, URIs), positioned
+ *  with the same PDF-point → CSS transform the text layer uses. Sits above
+ *  the text layer so link areas always activate; the rest of the page keeps
+ *  its normal selection behavior. */
+function LinkLayer({
+  links,
+  pageWidth,
+  pageHeight,
+  cssWidth,
+  cssHeight,
+  onJump,
+}: {
+  links: PageLink[];
+  pageWidth: number;
+  pageHeight: number;
+  cssWidth: number;
+  cssHeight: number;
+  onJump: (page: number) => void;
+}) {
+  const boxes = useMemo(() => {
+    if (!pageWidth || !pageHeight) return [];
+    const sx = cssWidth / pageWidth;
+    const sy = cssHeight / pageHeight;
+    return links.map((link, i) => {
+      const [x, y, w, h] = link.rect;
+      return {
+        key: i,
+        style: {
+          left: `${x * sx}px`,
+          top: `${(pageHeight - (y + h)) * sy}px`,
+          width: `${w * sx}px`,
+          height: `${h * sy}px`,
+        } as CSSProperties,
+        link,
+      };
+    });
+  }, [links, pageWidth, pageHeight, cssWidth, cssHeight]);
+
+  return (
+    <div className="link-layer">
+      {boxes.map(({ key, style, link }) => (
+        <a
+          key={key}
+          className="page-link"
+          style={style}
+          href={link.uri ?? "#"}
+          target={link.uri ? "_blank" : undefined}
+          rel={link.uri ? "noreferrer" : undefined}
+          title={link.uri ?? `Go to page ${(link.destPage ?? 0) + 1}`}
+          onClick={(e) => {
+            if (link.destPage != null) {
+              e.preventDefault();
+              onJump(link.destPage);
+            } else if (link.uri) {
+              e.preventDefault();
+              void openUrl(link.uri).catch(() => {});
+            }
+          }}
+        />
+      ))}
+    </div>
+  );
+}
+
 interface SelectionMenuState {
   x: number;
   y: number;
@@ -127,6 +192,8 @@ interface PageImageProps {
     text: string,
     color: HighlightColor,
   ) => void;
+  /** Jumps to a page (in-page link navigation). */
+  onJumpPage: (page: number) => void;
 }
 
 function PageImage({
@@ -139,6 +206,7 @@ function PageImage({
   activeHitKey,
   spokenRange,
   onAddHighlight,
+  onJumpPage,
 }: PageImageProps) {
   // Load status is keyed by URL (see the note at the <img> below).
   const [status, setStatus] = useState<{
@@ -157,6 +225,21 @@ function PageImage({
       })
       .catch(() => {
         /* page stays without a text layer; image still renders */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [docId, index]);
+
+  const [links, setLinks] = useState<PageLink[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    getPageLinks(docId, index)
+      .then((data) => {
+        if (!cancelled) setLinks(data);
+      })
+      .catch(() => {
+        /* a page without link data just has no clickable links */
       });
     return () => {
       cancelled = true;
@@ -270,6 +353,17 @@ function PageImage({
         </div>
       )}
 
+      {text && links.length > 0 && (
+        <LinkLayer
+          links={links}
+          pageWidth={text.width}
+          pageHeight={text.height}
+          cssWidth={cssWidth}
+          cssHeight={cssHeight}
+          onJump={onJumpPage}
+        />
+      )}
+
       {menu && (
         <div className="selection-menu" style={{ left: menu.x, top: menu.y }} onMouseDown={(e) => e.preventDefault()}>
           {HIGHLIGHT_COLORS.map((color) => (
@@ -369,6 +463,8 @@ export interface ReaderProps {
     text: string,
     color: HighlightColor,
   ) => void;
+  /** Jumps to a page, recording history (in-page link navigation). */
+  onJumpPage: (page: number) => void;
 }
 
 export default function Reader({
@@ -388,6 +484,7 @@ export default function Reader({
   activeHitKey,
   spokenRange,
   onAddHighlight,
+  onJumpPage,
 }: ReaderProps) {
   const [containerRef, viewport] = useElementSize<HTMLDivElement>();
   const [containerEl, setContainerEl] = useState<HTMLElement | null>(null);
@@ -542,6 +639,7 @@ export default function Reader({
       ? { start: spokenRange.start, end: spokenRange.end }
       : null,
     onAddHighlight,
+    onJumpPage,
   });
 
   if (mode === "paged") {

@@ -883,6 +883,7 @@ export default function App() {
               activeHitKey={activeHit}
               spokenRange={narration.spokenRange}
               onAddHighlight={(p, s2, e2, text, color) => void addHighlight(p, s2, e2, text, color)}
+              onJumpPage={(target) => jumpTo(target)}
             />
           </div>
         </div>
