@@ -545,6 +545,11 @@ const HEADING_KICKER_PAUSE_MS: u32 = 1000;
 const PARAGRAPH_PAUSE_MS: u32 = 800;
 const SENTENCE_PAUSE_MS: u32 = 400;
 
+/// The silent beat played across a skipped code listing (skip mode): long
+/// enough that the selection visibly sweeps the block, short enough not to
+/// read as dead air. Announce mode says "Code listing." instead.
+const CODE_SKIP_BEAT_MS: u32 = 300;
+
 /// Heading detection, in order of confidence:
 /// 1. The chunk matches a PDF outline title (the sidebar's own TOC) —
 ///    exact after normalizing case/whitespace/typographic punctuation.
@@ -873,32 +878,44 @@ impl TtsEngine {
                     }
                     if code_chunks[index] {
                         // Code listing: synthesize nothing from its text —
-                        // either a single announcement or silence.
-                        if announce_code && !announce_pending {
-                            announce_pending = true;
-                            if let Ok((samples, piece_rate)) =
-                                model.synthesize(&dir, "Code listing.", &kokoro_voice, rate)
-                                && !samples.is_empty()
-                            {
-                                append_piece(
-                                    &player,
-                                    &schedule,
-                                    page,
-                                    (start, end),
-                                    samples,
-                                    piece_rate,
-                                    1500,
-                                    last_chunk,
-                                );
+                        // either a single announcement or a silent beat.
+                        if announce_code {
+                            if !announce_pending {
+                                announce_pending = true;
+                                if let Ok((samples, piece_rate)) =
+                                    model.synthesize(&dir, "Code listing.", &kokoro_voice, rate)
+                                    && !samples.is_empty()
+                                {
+                                    append_piece(
+                                        &player,
+                                        &schedule,
+                                        page,
+                                        (start, end),
+                                        samples,
+                                        piece_rate,
+                                        1500,
+                                        last_chunk,
+                                    );
+                                }
                             }
-                        } else if !announce_code {
-                            // Skip mode: still advance the highlight briefly
-                            // so the selection tracks past the listing.
-                            schedule(
-                                Vec::new(),
-                                24_000u32.try_into().expect("rate"),
+                        } else if !announce_pending {
+                            // Skip mode: play a short silent beat across the
+                            // listing so the selection sweeps it
+                            // deterministically. A zero-length highlight
+                            // schedules at the same clock offset as the next
+                            // sentence's event, and whichever thread emits
+                            // last wins the selection — the code block could
+                            // sit selected on top of the sentence being read.
+                            announce_pending = true;
+                            append_piece(
+                                &player,
+                                &schedule,
                                 page,
-                                Some((start, end)),
+                                (start, end),
+                                vec![0.0; 24_000 * CODE_SKIP_BEAT_MS as usize / 1000],
+                                24_000,
+                                0,
+                                last_chunk,
                             );
                         }
                         continue;
@@ -1527,6 +1544,54 @@ mod trace_probe {
                     piece.1,
                     preview(&piece_text, 70)
                 );
+            }
+        }
+    }
+}
+
+/// Dictionary-gap audit: every unique word in the book through the
+/// phonemizer, flagging ones it would spell letter by letter. The
+/// tell-tale signature of the letter-name fallback is a stress mark on
+/// (nearly) every syllable — real pronunciations stress one or two.
+/// Opt-in via BOOKSHELF_TRACE_BOOK; prints the gaps so they can be added
+/// to the homograph/lexicon table.
+#[cfg(test)]
+mod dictionary_audit_tests {
+    use piper_plus_g2p::Phonemizer as _;
+
+    #[test]
+    fn audit_book_for_spelled_out_words() {
+        let Ok(book) = std::env::var("BOOKSHELF_TRACE_BOOK") else {
+            return;
+        };
+        let library = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("resources/pdfium/pdfium.dll");
+        let engine = crate::pdfium_engine::Engine::with_library_path(&library).expect("pdfium");
+        let info = engine.open_document(&book, None).expect("book");
+        let phonemizer =
+            piper_plus_g2p::english::EnglishPhonemizer::new_bundled().expect("phonemizer");
+
+        let mut words = std::collections::BTreeMap::new();
+        for page in 0..info.page_count {
+            let Ok(data) = engine.page_text(info.doc_id, page as i32) else {
+                continue;
+            };
+            for token in data.chars.split_whitespace() {
+                let word: String = token.chars().filter(|c| c.is_ascii_alphabetic()).collect();
+                if word.len() >= 6 {
+                    words.insert(word.to_ascii_lowercase(), page);
+                }
+            }
+        }
+        println!("unique words >= 6 letters: {}", words.len());
+        for (word, page) in &words {
+            let Ok((tokens, _)) = phonemizer.phonemize_with_prosody(word) else {
+                continue;
+            };
+            let ipa = tokens.concat();
+            let stresses = ipa.matches('ˈ').count() + ipa.matches('ˌ').count();
+            if stresses * 2 >= word.chars().count() {
+                println!("  GAP p{page}: {word} => {ipa}");
             }
         }
     }
