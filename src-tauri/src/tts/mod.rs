@@ -19,7 +19,7 @@ use std::{
 use serde::Serialize;
 use tauri::Emitter;
 
-use chunker::split_for_narration;
+use chunker::split_with_code_blocks;
 use kokoro::KokoroModel;
 
 #[derive(Debug, Clone, Serialize)]
@@ -53,9 +53,13 @@ pub enum TtsEvent {
     },
 }
 
+/// Loaded Kokoro model plus the directory it came from; shared with the
+/// background voice-download thread so a fresh install can invalidate it.
+type KokoroHandle = Arc<Mutex<Option<(PathBuf, Arc<KokoroModel>)>>>;
+
 pub struct TtsEngine {
     app: tauri::AppHandle,
-    kokoro: Mutex<Option<(PathBuf, Arc<KokoroModel>)>>,
+    kokoro: KokoroHandle,
     playback: Mutex<PlaybackControl>,
     device: Mutex<Option<rodio::MixerDeviceSink>>,
 }
@@ -451,24 +455,6 @@ type Schedule<'a> = &'a dyn Fn(Vec<f32>, std::num::NonZero<u32>, i32, Option<(us
 
 /// Marks each narration chunk as code when >= 60% of its characters fall
 /// inside a detected code block.
-fn classify_code_chunks(chunks: &[(usize, usize)], code_blocks: &[(usize, usize)]) -> Vec<bool> {
-    chunks
-        .iter()
-        .map(|(start, end)| {
-            let length = end.saturating_sub(*start).max(1);
-            let covered: usize = code_blocks
-                .iter()
-                .map(|(bs, be)| {
-                    let lo = (*start).max(*bs);
-                    let hi = (*end).min(*be);
-                    hi.saturating_sub(lo)
-                })
-                .sum();
-            covered * 10 >= length * 6
-        })
-        .collect()
-}
-
 /// Playback pieces for one chunk: a heading lead at the chunk start, and
 /// standalone heading lines anywhere after it, become their own pieces
 /// carrying the heading pause; body text between them carries the
@@ -630,7 +616,7 @@ impl TtsEngine {
     pub fn new(app: tauri::AppHandle) -> Self {
         Self {
             app,
-            kokoro: Mutex::new(None),
+            kokoro: std::sync::Arc::new(Mutex::new(None)),
             playback: Mutex::new(PlaybackControl {
                 stop: Arc::new(AtomicBool::new(false)),
                 player: None,
@@ -699,6 +685,22 @@ impl TtsEngine {
         // A fresh voice file must not be hidden by a cached model handle.
         self.kokoro.lock().unwrap().take();
         kokoro::play_voice_sample(&dir, voice, speed)
+    }
+
+    /// Downloads the curated voice set in the background (setup flow).
+    /// Progress arrives as `kokoro-download` voice events plus a final
+    /// `done`.
+    pub fn download_all_voices(&self, app: &tauri::AppHandle) -> Result<(), String> {
+        let dir = self.kokoro_dir()?;
+        let cache = self.kokoro.clone();
+        let app = app.clone();
+        std::thread::spawn(move || {
+            if kokoro::download_all_voices(&app, &dir).is_ok() {
+                // Fresh voice files must not be hidden by a cached model.
+                cache.lock().unwrap().take();
+            }
+        });
+        Ok(())
     }
 
     fn ensure_device(&self) -> Result<(), String> {
@@ -861,23 +863,23 @@ impl TtsEngine {
         let rate = rate.clamp(0.5, 2.0) * SPEED_CALIBRATION;
         const SPEED_CALIBRATION: f32 = 0.95;
         let text_chars: Vec<char> = text.chars().collect();
-        let chunks = split_for_narration(&text, &paragraph_breaks);
-        // Code-block handling per the narration setting: chunk overlap
-        // with a detected block decides membership; announcements collapse
-        // consecutive code chunks into one "Code listing." piece.
+        // Code listings are kept whole: each detected block is one chunk,
+        // so the skip/announce decision below is exact rather than a
+        // coverage guess. Consecutive code chunks collapse into one
+        // announcement.
         let announce_code = code_handling != "skip";
-        let code_chunks = classify_code_chunks(&chunks, &code_blocks);
-        let last_chunk = chunks.last().copied().unwrap_or((0, 0));
+        let chunks = split_with_code_blocks(&text, &paragraph_breaks, &code_blocks);
+        let last_chunk = chunks.last().map(|(range, _)| *range).unwrap_or((0, 0));
 
         if let Some(kokoro_voice) = voice_id.strip_prefix("kokoro:").map(str::to_string) {
             let (dir, model) = self.kokoro_model()?;
             std::thread::spawn(move || {
                 let mut announce_pending = false;
-                for (index, (start, end)) in chunks.into_iter().enumerate() {
+                for ((start, end), is_code) in chunks.into_iter() {
                     if stop.load(Ordering::Relaxed) {
                         return;
                     }
-                    if code_chunks[index] {
+                    if is_code {
                         // Code listing: synthesize nothing from its text —
                         // either a single announcement or a silent beat.
                         if announce_code {
@@ -1316,6 +1318,7 @@ mod pause_tests {
 #[cfg(test)]
 mod book_trace_tests {
     use super::*;
+    use chunker::split_for_narration;
 
     fn escape(text: &str) -> String {
         text.chars()
@@ -1452,33 +1455,155 @@ mod book_trace_tests {
     }
 }
 
+/// Opt-in companion to `trace_real_book_page`: dumps how a page's lines
+/// score against the code detector and which narration chunks end up
+/// classified as code. Set BOOKSHELF_TRACE_BOOK (+ BOOKSHELF_TRACE_PAGE).
+#[cfg(test)]
+mod code_trace_tests {
+    use super::*;
+
+    #[test]
+    fn trace_code_classification() {
+        let Ok(book) = std::env::var("BOOKSHELF_TRACE_BOOK") else {
+            return;
+        };
+        let page: i32 = std::env::var("BOOKSHELF_TRACE_PAGE")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(10);
+        let library = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("resources/pdfium/pdfium.dll");
+        let engine = crate::pdfium_engine::Engine::with_library_path(&library)
+            .expect("bind pdfium (run npm run fetch:pdfium)");
+        let info = engine.open_document(&book, None).expect("open book");
+        let data = engine.page_text(info.doc_id, page).expect("read page text");
+
+        let chars: Vec<char> = data.chars.chars().collect();
+        let mono = &data.mono;
+        println!(
+            "== page {page}: {} chars, {} mono ({:.0}%) ==",
+            chars.len(),
+            mono.iter().filter(|m| **m).count(),
+            100.0 * mono.iter().filter(|m| **m).count() as f64 / chars.len().max(1) as f64
+        );
+
+        // Per-line mono stats: which lines the detector calls code.
+        let mut line_start = 0usize;
+        for (i, &c) in chars.iter().enumerate() {
+            if c == '\n' || c == '\r' {
+                if i > line_start {
+                    let text_count = chars[line_start..i]
+                        .iter()
+                        .filter(|c| c.is_alphanumeric())
+                        .count();
+                    let mono_count = chars[line_start..i]
+                        .iter()
+                        .enumerate()
+                        .filter(|(j, c)| c.is_alphanumeric() && mono[line_start + j])
+                        .count();
+                    let line: String = chars[line_start..i].iter().collect();
+                    println!(
+                        "line [{line_start}..{i}] alnum={text_count} mono={mono_count}: {:?}",
+                        &line[..line.len().min(70)]
+                    );
+                }
+                line_start = i + 1;
+            }
+        }
+
+        for (start, end) in crate::pdfium_engine::detect_code_blocks(&chars, mono) {
+            println!(
+                "code block [{start}..{end}]: {:?}",
+                &data.chars[start.min(data.chars.len())..end.min(data.chars.len())]
+            );
+        }
+
+        let breaks = engine
+            .paragraph_breaks(info.doc_id, page, chars.len())
+            .unwrap_or_default();
+        let blocks = crate::pdfium_engine::detect_code_blocks(&chars, mono);
+        let chunks = split_with_code_blocks(&data.chars, &breaks, &blocks);
+        println!("== {} chunks ==", chunks.len());
+        for (i, ((start, end), is_code)) in chunks.iter().copied().enumerate() {
+            let hi = end.min(chars.len());
+            let snippet: String = chars[start.min(chars.len())..hi].iter().take(400).collect();
+            println!("chunk {i} [{start}..{end}] code={is_code}: {snippet:?}");
+        }
+        // Segmentation invariant: a prose chunk must never intersect a
+        // detected block — that is the guarantee that listings are never
+        // narrated as text.
+        for ((start, end), is_code) in chunks.iter().copied() {
+            if is_code {
+                continue;
+            }
+            for (bs, be) in &blocks {
+                let overlap = end.min(*be).saturating_sub(start.max(*bs));
+                assert_eq!(
+                    overlap, 0,
+                    "prose chunk [{start}..{end}] intersects code block [{bs}..{be}]"
+                );
+            }
+        }
+        engine.close_document(info.doc_id);
+    }
+}
+
 #[cfg(test)]
 mod code_handling_tests {
     use super::*;
 
+    fn split(text: &str, blocks: &[(usize, usize)]) -> Vec<((usize, usize), bool)> {
+        split_with_code_blocks(text, &[], blocks)
+    }
+
+    /// The page-12 §0.3 shape: a listing glued to trailing prose used to
+    /// score under the old 60%-coverage bar and get narrated.
     #[test]
-    fn chunks_inside_blocks_classify_as_code() {
-        let chunks = vec![(0, 10), (10, 20), (20, 30)];
-        let blocks = vec![(10, 20)];
-        assert_eq!(
-            classify_code_chunks(&chunks, &blocks),
-            vec![false, true, false]
+    fn listings_fused_with_prose_stay_code_chunks() {
+        let text = "Wrap it:\r\nint c;\nwhile ((c = getchar()) != EOF)\nputchar(c);\r\nThat either looks obvious or looks like a typo. Next sentence.";
+        let code_start = text.find("int c;").unwrap();
+        let after = text.find("That either").unwrap();
+        let chunks = split(text, &[(code_start, after)]);
+        let listing = chunks
+            .iter()
+            .find(|(range, _)| text[range.0..range.1].contains("putchar"))
+            .expect("listing chunk");
+        assert!(listing.1, "listing must be a code chunk");
+        assert!(
+            !chunks
+                .iter()
+                .any(|(range, is_code)| *is_code && text[range.0..range.1].contains("obvious")),
+            "prose after the listing must not be swallowed by the code chunk"
+        );
+        assert!(
+            chunks.iter().any(|(_, is_code)| !*is_code),
+            "prose before and after must survive as chunks"
         );
     }
 
     #[test]
-    fn partial_overlap_under_sixty_percent_is_prose() {
-        let chunks = vec![(0, 100)];
-        let blocks = vec![(0, 50)];
-        assert_eq!(classify_code_chunks(&chunks, &blocks), vec![false]);
+    fn block_at_page_start_and_end() {
+        let text = "int main(void)\n{\n}\r\nProse only here.\r\nprintf(x);";
+        let head = text.find("Prose").unwrap();
+        let tail = text.find("printf").unwrap();
+        let chunks = split(text, &[(0, head), (tail, text.chars().count())]);
+        assert_eq!(chunks.first().copied(), Some(((0, head), true)));
+        assert_eq!(
+            chunks.last().copied(),
+            Some(((tail, text.chars().count()), true))
+        );
+        let prose: Vec<_> = chunks.iter().filter(|(_, code)| !code).collect();
+        assert_eq!(prose.len(), 1);
+        assert!(text[prose[0].0.0..prose[0].0.1].contains("Prose only"));
     }
 
     #[test]
-    fn overlapping_blocks_sum_coverage() {
-        let chunks = vec![(0, 20)];
-        let blocks = vec![(0, 8), (12, 20)];
-        // 16/20 = 80% covered
-        assert_eq!(classify_code_chunks(&chunks, &blocks), vec![true]);
+    fn overlapping_blocks_merge_into_one_chunk() {
+        let text = "alpha code here\r\nmore code\r\nprose tail.";
+        let chunks = split(text, &[(0, 15), (10, 26)]);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0], ((0, 26), true));
+        assert!(!chunks[1].1);
     }
 }
 
@@ -1525,15 +1650,13 @@ mod trace_probe {
             breaks.len()
         );
         eprintln!("breaks={breaks:?}");
-        let chunks = split_for_narration(&text, &breaks);
-        let code_chunks = classify_code_chunks(&chunks, &data.code_blocks);
+        let chunks = split_with_code_blocks(&text, &breaks, &data.code_blocks);
         let text_chars: Vec<char> = text.chars().collect();
         let preview = |text: &str, max: usize| text.chars().take(max).collect::<String>();
-        for (index, (start, end)) in chunks.iter().copied().enumerate() {
+        for (index, ((start, end), is_code)) in chunks.iter().copied().enumerate() {
             let chunk: String = text_chars[start..end].iter().collect();
             eprintln!(
-                "chunk {index} [{start},{end}) code={} {:?}",
-                code_chunks[index],
+                "chunk {index} [{start},{end}) code={is_code} {:?}",
                 preview(&chunk, 90)
             );
             for (piece, pause, piece_text) in

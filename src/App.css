@@ -1210,10 +1210,94 @@ body,
   outline: 2px solid rgba(70, 150, 255, 0.85);
 }
 
-.voice-download {
+.narration-setup {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--border, #ccc);
+  border-radius: 8px;
+  background: var(--panel-bg, rgba(127, 127, 127, 0.08));
+}
+
+.narration-setup h3 {
+  margin: 0;
+  font-size: 13px;
+}
+
+.setup-copy,
+.setup-status,
+.setup-hint,
+.setup-error {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+
+.setup-hint {
+  opacity: 0.75;
+}
+
+.setup-error {
+  color: #d66;
+  word-break: break-word;
+}
+
+.setup-progress {
+  height: 8px;
+  border-radius: 4px;
+  background: rgba(127, 127, 127, 0.25);
+  overflow: hidden;
+}
+
+.setup-progress-fill {
+  height: 100%;
+  border-radius: 4px;
+  background: #4a9;
+  transition: width 0.25s ease;
+}
+
+.setup-progress-fill[data-unknown="true"] {
+  animation: setup-indeterminate 1.2s ease-in-out infinite;
+}
+
+@keyframes setup-indeterminate {
+  0% {
+    opacity: 0.4;
+  }
+  50% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0.4;
+  }
+}
+
+.setup-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.narration-setup-modal {
+  max-width: 420px;
+}
+
+.narration-error {
+  position: fixed;
+  bottom: 52px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  border: 1px solid rgba(214, 102, 102, 0.6);
+  background: rgba(60, 20, 20, 0.92);
+  color: #f0c8c8;
+  font-size: 12.5px;
+  z-index: 40;
 }
 
 .narration-hint {

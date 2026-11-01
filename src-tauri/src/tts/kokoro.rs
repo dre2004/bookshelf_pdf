@@ -581,12 +581,6 @@ pub fn download_voice(app: &tauri::AppHandle, dir: &Path, voice: &str) -> Result
     if !KOKORO_VOICE_SPECS.iter().any(|(id, ..)| *id == voice) {
         return Err(format!("unknown voice '{voice}'"));
     }
-    let path = dir.join("voices").join(format!("{voice}.bin"));
-    if path.is_file() {
-        return Ok(());
-    }
-    std::fs::create_dir_all(dir.join("voices")).map_err(|e| format!("voices dir: {e}"))?;
-
     #[derive(Serialize, Clone)]
     #[serde(rename_all = "camelCase", tag = "kind")]
     enum Event {
@@ -597,6 +591,15 @@ pub fn download_voice(app: &tauri::AppHandle, dir: &Path, voice: &str) -> Result
     let emit = |event: Event| {
         let _ = app.emit("kokoro-download", event);
     };
+    let path = dir.join("voices").join(format!("{voice}.bin"));
+    if path.is_file() {
+        // Report presence so a setup UI waiting on this voice can settle.
+        emit(Event::VoiceDone {
+            voice: voice.to_string(),
+        });
+        return Ok(());
+    }
+    std::fs::create_dir_all(dir.join("voices")).map_err(|e| format!("voices dir: {e}"))?;
     emit(Event::VoiceStarted {
         voice: voice.to_string(),
     });
@@ -635,6 +638,23 @@ pub fn download_voice(app: &tauri::AppHandle, dir: &Path, voice: &str) -> Result
             Err(reason)
         }
     }
+}
+
+/// Downloads every curated voice (~0.5 MB each), emitting per-voice
+/// `kokoro-download` events and a final `done` so a setup screen can
+/// walk the list. Missing files are skipped silently via `download_voice`'s
+/// already-present fast path, which still reports each voice.
+pub fn download_all_voices(app: &tauri::AppHandle, dir: &Path) -> Result<(), String> {
+    for (id, ..) in KOKORO_VOICE_SPECS {
+        download_voice(app, dir, id)?;
+    }
+    #[derive(Serialize, Clone)]
+    #[serde(rename_all = "camelCase", tag = "kind")]
+    enum Event {
+        Done,
+    }
+    let _ = app.emit("kokoro-download", Event::Done);
+    Ok(())
 }
 
 /// The sentence spoken when sampling a voice from settings.

@@ -10,6 +10,7 @@ import Resizer from "./Resizer";
 import SearchPanel from "./SearchPanel";
 import SettingsScreen from "./SettingsScreen";
 import NarrationBar from "./NarrationBar";
+import NarrationSetup from "./NarrationSetup";
 import { useNarration } from "./narration";
 import {
   bookProgressSave,
@@ -480,6 +481,18 @@ export default function App() {
     onAdvancePage: changePage,
   });
 
+  // First boot with no narration engine: walk the user through the
+  // one-time download instead of letting the Narrate button fail
+  // silently. Prompted once per app session; dismissible.
+  const [setupOpen, setSetupOpen] = useState(false);
+  const setupPromptShown = useRef(false);
+  useEffect(() => {
+    if (!setupPromptShown.current && narration.needsSetup) {
+      setupPromptShown.current = true;
+      setSetupOpen(true);
+    }
+  }, [narration.needsSetup]);
+
   // Hydrate narration settings once persisted settings are loaded.
   useEffect(() => {
     if (!ready) return;
@@ -884,7 +897,9 @@ export default function App() {
           onToggleSidebar={() => setSidebarTab((t) => (t === null ? "outline" : null))}
           onSearch={() => setSearch((s) => ({ ...s, open: true }))}
           onNarration={() => narration.play(page)}
+          onNarrationSetup={() => setSetupOpen(true)}
           narrationActive={narration.speaking}
+          narrationSetupNeeded={narration.needsSetup}
           onAddBookmark={() => void addBookmarkNow()}
           onBack={goBack}
           onForward={goForward}
@@ -1004,6 +1019,38 @@ export default function App() {
           currentPage={page}
           pageCount={current.doc.pageCount}
         />
+      )}
+
+      {view === "reader" && current && narration.error && (
+        <div className="narration-error" role="alert">
+          <span>Narration stopped: {narration.error}</span>
+          {narration.needsSetup && (
+            <button className="btn" onClick={() => setSetupOpen(true)}>
+              Set up narration
+            </button>
+          )}
+          <button
+            className="btn icon"
+            onClick={narration.clearError}
+            title="Dismiss"
+          >
+            ✕
+          </button>
+        </div>
+      )}
+
+      {setupOpen && (
+        <div className="modal-backdrop" onClick={() => setSetupOpen(false)}>
+          <div
+            className="modal narration-setup-modal"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <NarrationSetup
+              narration={narration}
+              onDismiss={() => setSetupOpen(false)}
+            />
+          </div>
+        </div>
       )}
 
       {passwordFor && (

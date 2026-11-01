@@ -1,8 +1,8 @@
-import { useEffect, useState } from "react";
-import { listen } from "@tauri-apps/api/event";
-import { ttsPackInstalled, ttsPreviewVoice } from "./api";
+import { useState } from "react";
+import { ttsPreviewVoice } from "./api";
 import type { ReadMode, Theme } from "./types";
 import { stepped } from "./NarrationBar";
+import NarrationSetup from "./NarrationSetup";
 import { SAMPLE_SENTENCE, speechSupported, type NarrationController } from "./narration";
 
 interface Props {
@@ -22,24 +22,8 @@ export default function SettingsScreen({
   onThemeChange,
   narration,
 }: Props) {
-  const [packInstalled, setPackInstalled] = useState(true);
   const [sampling, setSampling] = useState(false);
   const [sampleError, setSampleError] = useState<string | null>(null);
-
-  useEffect(() => {
-    void ttsPackInstalled().then(setPackInstalled).catch(() => setPackInstalled(true));
-  }, []);
-
-  useEffect(() => {
-    const unlisten = listen<{ kind: string }>("kokoro-download", (event) => {
-      if (event.payload.kind === "done") {
-        void ttsPackInstalled().then(setPackInstalled).catch(() => {});
-      }
-    });
-    return () => {
-      void unlisten.then((fn) => fn());
-    };
-  }, []);
 
   const onDevice = narration.options.filter((option) => option.engine === "kokoro");
   const system = narration.options.filter((option) => option.engine === "speech");
@@ -186,19 +170,7 @@ export default function SettingsScreen({
             </select>
           </div>
 
-          {!packInstalled && (
-            <div className="voice-download">
-              <button
-                className="btn primary"
-                onClick={narration.download.start}
-                disabled={narration.download.active}
-              >
-                {narration.download.active
-                  ? `Downloading engine… ${Math.round(narration.download.progress * 100)}%`
-                  : "⬇ Download narration engine (~87 MB)"}
-              </button>
-            </div>
-          )}
+          <NarrationSetup narration={narration} />
           {sampleError && <p className="muted narration-unsupported">{sampleError}</p>}
         </section>
       </div>

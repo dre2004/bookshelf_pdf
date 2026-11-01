@@ -232,6 +232,16 @@ pub fn tts_pack_installed(engine: tauri::State<'_, Arc<TtsEngine>>) -> Result<bo
     Ok(engine.kokoro_pack_installed())
 }
 
+/// Downloads the curated voice set in the background; progress arrives
+/// as `kokoro-download` voice events followed by a final done.
+#[tauri::command]
+pub fn tts_download_voices(
+    engine: tauri::State<'_, Arc<TtsEngine>>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    engine.download_all_voices(&app)
+}
+
 /// Speaks the sample sentence in a voice for the settings screen,
 /// downloading whatever is missing first.
 #[tauri::command]

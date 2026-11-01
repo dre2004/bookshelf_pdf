@@ -68,6 +68,8 @@ vi.mock("./api", () => ({
   ttsResume: vi.fn().mockResolvedValue(undefined),
   ttsStop: vi.fn().mockResolvedValue(undefined),
   ttsInstallKokoro: vi.fn().mockResolvedValue(undefined),
+  ttsDownloadVoices: vi.fn().mockResolvedValue(undefined),
+  ttsPackInstalled: vi.fn().mockResolvedValue(true),
 }));
 
 vi.mock("@tauri-apps/plugin-dialog", () => ({
