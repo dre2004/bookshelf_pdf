@@ -296,6 +296,12 @@ impl KokoroModel {
     /// English text → IPA (word boundaries preserved, sentence punctuation
     /// kept for natural pausing).
     fn phonemize(&self, text: &str) -> Result<String, String> {
+        // Nothing-to-say input must stop here: normalization maps control
+        // chars to '-' (exotic-hyphen repair), so a bare "\r\n" would
+        // otherwise speak as dashes, and lone punctuation as a tick.
+        if !text.chars().any(|c| c.is_alphanumeric()) {
+            return Ok(String::new());
+        }
         // Typographic punctuation must become ASCII before G2P: publishers
         // use U+2019 etc., which breaks dictionary lookups and makes the
         // fallback spell words letter by letter ("you<U+2019>re" is heard
@@ -331,7 +337,14 @@ impl KokoroModel {
             .into_iter()
             .rev()
             .collect();
-        Ok(format!("{} {}", parts.join(" "), trailing))
+        let spoken = parts.join(" ");
+        // Nothing to say must produce no phonemes: a bare space is in the
+        // tokenizer vocab (id 16), so "format!("{ } { }")" on empties made
+        // the model synthesize a one-token blip for empty pieces.
+        if spoken.trim().is_empty() {
+            return Ok(String::new());
+        }
+        Ok(format!("{spoken} {trailing}"))
     }
 
     /// Text → audio samples at 24 kHz. Long windows split at token 0-pad
@@ -696,6 +709,29 @@ mod tests {
 mod g2p_tests {
     use super::*;
     use piper_plus_g2p::Phonemizer as _;
+
+    #[test]
+    fn empty_and_whitespace_text_synthesize_nothing() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../engine/kokoro");
+        let Ok(model) = KokoroModel::load(&dir) else {
+            eprintln!("skipping: no Kokoro pack installed");
+            return;
+        };
+        // Empty pieces used to synthesize a one-token blip: the space is a
+        // real vocab entry (id 16), so a " " phoneme string produced audio.
+        for text in ["", " ", "\r\n", ". "] {
+            let ipa = model.phonemize(text).expect("phonemize");
+            assert!(ipa.is_empty(), "{text:?} -> {ipa:?}");
+            let (samples, _) = model
+                .synthesize(&dir, text, "af_heart", 1.0)
+                .expect("synthesize");
+            assert!(
+                samples.is_empty(),
+                "{text:?} produced {} samples",
+                samples.len()
+            );
+        }
+    }
 
     #[test]
     fn contractions_phonemize_correctly() {

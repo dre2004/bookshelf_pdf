@@ -517,7 +517,12 @@ fn heading_aware_pieces(
 
     let mut all = lead_pieces;
     all.append(&mut pieces);
-    all.extend(split_at_beats(chars, (body_start, end), final_pause));
+    // A heading lead can consume the whole chunk (its title lives in the
+    // next one); the leftover range is then whitespace only and must not
+    // become an empty piece.
+    if chars[body_start..end].iter().any(|c| !c.is_whitespace()) {
+        all.extend(split_at_beats(chars, (body_start, end), final_pause));
+    }
     all
 }
 
@@ -1029,14 +1034,26 @@ mod heading_lead_tests {
         // A paragraph break can land between the \r and \n of a split
         // CRLF, so the kicker chunk carries only the \r and the title
         // lives in the next chunk. The kicker must still read whole (and
-        // the cursor must not scan past the chunk end). Shape traced from
-        // page 11 of the test book after the paragraph-break fix.
+        // the cursor must not scan past the chunk end), with no empty
+        // tail piece. Shape traced from page 11 of the test book after
+        // the paragraph-break fix.
         let text = "Chapter 0\r\nIf You\u{2019}re New Here";
         let chars = chars(text);
         let pieces = heading_aware_pieces(&chars, (0, 10), &[], &[]);
-        assert_eq!(pieces.len(), 2, "kicker + empty tail: {pieces:?}");
+        assert_eq!(pieces.len(), 1, "kicker only, no empty tail: {pieces:?}");
         assert_eq!(pieces[0].2.trim(), "Chapter 0");
         assert_eq!(pieces[0].1, HEADING_KICKER_PAUSE_MS);
+    }
+
+    #[test]
+    fn whitespace_only_remainder_makes_no_piece() {
+        // A chunk that is entirely consumed by its heading (title included)
+        // must not emit an empty body piece — those synthesized as a blip.
+        let text = "If You Are New Here\r\n";
+        let outline = ["If You Are New Here"];
+        let pieces = pieces(text, &outline);
+        assert_eq!(pieces.len(), 1, "heading only: {pieces:?}");
+        assert!(pieces[0].2.trim().contains("New Here"));
     }
 
     #[test]
