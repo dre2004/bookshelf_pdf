@@ -155,6 +155,27 @@ fn resolve_control_artifacts(token: &str, phonemizer: &EnglishPhonemizer) -> Str
     }
 }
 
+/// The lexicon rescue for a word the fallback letter-spells: the
+/// Wiktionary table first, the curated rows and suffix rules behind it.
+fn lexicon_override_for(phonemizer: &EnglishPhonemizer, word: &str) -> Option<String> {
+    use piper_plus_g2p::Phonemizer as _;
+    let (tokens, _) = phonemizer.phonemize_with_prosody(word).ok()?;
+    let ipa = tokens.concat();
+    if !crate::tts::lexicon::spells_letter_by_letter(word, &ipa) {
+        // The dictionary knows this word: nothing to override.
+        return None;
+    }
+    crate::tts::wiktionary::entry_ipa(word)
+        .or_else(|| crate::tts::lexicon::resolve_with_phonemizer(word, phonemizer))
+}
+
+/// The full pronunciation-override decision for one token: Wiktionary
+/// acronyms first (their fallback failures are confidently wrong, not
+/// detectably wrong), then the letter-spelling lexicon rescue.
+fn override_for_token(phonemizer: &EnglishPhonemizer, token: &str) -> Option<String> {
+    crate::tts::wiktionary::acronym_ipa(token).or_else(|| lexicon_override_for(phonemizer, token))
+}
+
 /// Char-level phoneme tokenizer parsed straight from `tokenizer.json`
 /// (115 single-character tokens; unknown characters are dropped, exactly
 /// what the reference normalizer achieves by stripping them).
@@ -366,24 +387,16 @@ impl KokoroModel {
     /// the primary phonemizer would spell letter by letter are worth
     /// deriving (dictionary words must keep their entries), so the word
     /// is checked against the phonemizer once and the outcome cached.
-    fn word_lexicon_override(&self, word: &str) -> Option<String> {
-        use piper_plus_g2p::Phonemizer as _;
+    /// Cached `override_for_token` — one phonemizer round-trip per
+    /// distinct token ever narrated.
+    fn override_for_token_cached(&self, word: &str) -> Option<String> {
         {
             let cache = self.lexicon_cache.lock().unwrap();
             if let Some(hit) = cache.get(word) {
                 return hit.clone();
             }
         }
-        let resolved = (|| {
-            let (tokens, _) = self.phonemizer.phonemize_with_prosody(word).ok()?;
-            let ipa = tokens.concat();
-            if !crate::tts::lexicon::spells_letter_by_letter(word, &ipa) {
-                // The dictionary knows this word: no override, and no
-                // need to re-check it ever.
-                return None;
-            }
-            crate::tts::lexicon::resolve_with_phonemizer(word, &self.phonemizer)
-        })();
+        let resolved = override_for_token(&self.phonemizer, word);
         self.lexicon_cache
             .lock()
             .unwrap()
@@ -437,12 +450,17 @@ impl KokoroModel {
         let tokens: Vec<&str> = repaired.iter().map(String::as_str).collect();
         use piper_plus_g2p::Phonemizer as _;
         // Words the dictionary would letter-spell get a lexicon-derived
-        // pronunciation (curated table or suffix rules); everything else
-        // flows through the phonemizer for sentence-level prosody.
+        // pronunciation (curated table or suffix rules), and all-caps
+        // tokens get the Wiktionary table — the fallback misreads
+        // acronyms confidently ("AI" as "eye"), so it must not be
+        // consulted first. Everything else flows through the phonemizer
+        // for sentence-level prosody.
         let lexicon_overrides: HashMap<usize, String> = tokens
             .iter()
             .enumerate()
-            .filter_map(|(index, word)| self.word_lexicon_override(word).map(|ipa| (index, ipa)))
+            .filter_map(|(index, word)| {
+                self.override_for_token_cached(word).map(|ipa| (index, ipa))
+            })
             .collect();
         let mut parts = Vec::new();
         for run in g2p_runs(&tokens, &lexicon_overrides) {
@@ -1053,5 +1071,24 @@ mod g2p_tests {
         let joined_garbage = format!("xyzz{}qwump", '\u{0002}');
         let resolved = resolve_control_artifacts(&joined_garbage, &p);
         assert_eq!(resolved, "xyzz-qwump", "unknown compound must hyphenate");
+    }
+
+    /// The pronunciation-override decision, end to end against the real
+    /// phonemizer and the bundled table: the reported ML-book failures.
+    /// "AI" is the sharp edge — the fallback reads it confidently wrong
+    /// ("eye"), so only the pre-G2P table can catch it.
+    #[test]
+    fn acronyms_and_coinages_resolve_before_the_fallback() {
+        let p = EnglishPhonemizer::new_bundled().expect("phonemizer");
+        assert_eq!(override_for_token(&p, "AI").as_deref(), Some("ˌeɪˈaɪ"));
+        assert_eq!(override_for_token(&p, "RAG").as_deref(), Some("ɹæɡ"));
+        assert_eq!(override_for_token(&p, "LLMs").as_deref(), Some("elˈelemz"));
+        // Double derivation no rule builds: the curated row.
+        assert_eq!(
+            override_for_token(&p, "productionizing").as_deref(),
+            Some("prəˌdʌkʃəˈnaɪzɪŋ")
+        );
+        // Ordinary dictionary words keep their sentence-level prosody.
+        assert_eq!(override_for_token(&p, "references"), None);
     }
 }

@@ -31,6 +31,8 @@ tauri-plugin-window-state = "2.5.0"
 tauri-plugin-single-instance = "2.5.5"
 rodio = "0.23.0"
 piper-plus-g2p = { version = "0.5.3", features = ["bundled-dicts"] }
+# Decompresses the bundled Wiktionary pronunciation table.
+flate2 = "1"
 ureq = "3.5.0"
 # Features mirror what the Kokoro engine needs: prebuilt ONNX Runtime
 # binaries over HTTPS, copied next to the app binary.

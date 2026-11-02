@@ -71,6 +71,10 @@ const SUPPLEMENTS: &[(&str, &str)] = &[
     // ("a-s-s-o-c-i-a-t-i-v-i-t-y").
     ("associative", "əsˈoʊsiˌeɪtɪv"),
     ("associativity", "əsˌoʊsiəˈtɪvəti"),
+    // Reported from an ML book: a double derivation CMU can't build
+    // (production + -ize + -ing) and Wiktionary doesn't carry.
+    ("productionize", "prəˌdʌkʃəˈnaɪz"),
+    ("productionizing", "prəˌdʌkʃəˈnaɪzɪŋ"),
 ];
 
 /// espeak-IPA appended to a stem's pronunciation for each derivational
@@ -268,6 +272,10 @@ mod tests {
         assert_eq!(
             resolve("associative", &f),
             Some("əsˈoʊsiˌeɪtɪv".to_string())
+        );
+        assert_eq!(
+            resolve("productionizing", &f),
+            Some("prəˌdʌkʃəˈnaɪzɪŋ".to_string())
         );
         // Inflections of curated words derive through the table with
         // allomorph selection on the stem's final phoneme.
