@@ -9,7 +9,7 @@
 // syllable dots, tie bars, non-syllabic breves or parentheses; r -> ɹ,
 // ASCII g -> ɡ. US-tagged pronunciations win; entries whose word contains
 // a space are skipped (the narrator looks words up one token at a time).
-import { createReadStream, createWriteStream, writeFileSync } from 'node:fs';
+import { createReadStream, createWriteStream, existsSync, writeFileSync } from 'node:fs';
 import { createGunzip, gunzipSync, gzipSync } from 'node:zlib';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -25,12 +25,40 @@ const OUT = join(
   '../src-tauri/resources/pronunciation/en-US.tsv.gz',
 );
 const STAGING = join(tmpdir(), 'kaikki-english.jsonl.gz');
+const force = process.argv.includes('--force');
 
-const res = await fetch(SOURCE, { headers: { 'User-Agent': 'bookshelf-pdf-lexicon' } });
-if (!res.ok) throw new Error(`kaikki download failed: HTTP ${res.status}`);
-console.log(`downloading ${SOURCE} ...`);
-await pipeline(res.body, createWriteStream(STAGING));
-console.log('download complete; extracting...');
+// The extract's accent tags are hyphenated wiktextract names
+// ("General-American", "Received-Pronunciation"), not wiki abbreviations.
+const US_TAGS = new Set(['US', 'General-American']);
+const ACCENT_TAGS = new Set([
+  'US',
+  'General-American',
+  'Received-Pronunciation',
+  'British',
+  'Canada',
+  'Australia',
+  'New-Zealand',
+  'Scotland',
+  'Ireland',
+  'India',
+  'Wales',
+  'Northern-England',
+  'Southern-England',
+]);
+const ACCENT_RANK = (tags) => {
+  const t = tags ?? [];
+  if (t.some((x) => US_TAGS.has(x))) return 0;
+  if (!t.some((x) => ACCENT_TAGS.has(x))) return 1; // untagged = general
+  return 2;
+};
+
+if (force || !existsSync(STAGING)) {
+  const res = await fetch(SOURCE, { headers: { 'User-Agent': 'bookshelf-pdf-lexicon' } });
+  if (!res.ok) throw new Error(`kaikki download failed: HTTP ${res.status}`);
+  console.log(`downloading ${SOURCE} ...`);
+  await pipeline(res.body, createWriteStream(STAGING));
+}
+console.log('extracting...');
 
 function normalizeIpa(raw) {
   return raw
@@ -39,16 +67,11 @@ function normalizeIpa(raw) {
     .replace(/[.\s()]/g, '') // syllable dots, spaces, optional-sound parens
     .replace(/r/g, 'ɹ')
     .replace(/g/g, 'ɡ')
-    .replace(/^[ˌˈ]+|[ˌˈ]+$/g, '') // leading/trailing stray stress marks
+    // Template damage leaves doubled stress marks at the edges; a single
+    // leading ˌ/ˈ is legitimate (ˌeɪˈaɪ) and must survive.
+    .replace(/^[ˌˈ]{2,}|[ˌˈ]{2,}$/g, '')
     .replace(/(.)\1{2,}/g, '$1$1'); // runaway repeats from template damage
 }
-
-const ACCENT_RANK = (tags) => {
-  const t = tags ?? [];
-  if (t.includes('US') || t.includes('GenAm')) return 0;
-  if (!t.some((x) => /RP|UK|CanE|AuE|NZE|ScE|InE/.test(x))) return 1; // untagged = general
-  return 2;
-};
 
 const WORD_OK = /^[A-Za-z0-9'’-]{1,40}$/;
 
@@ -96,9 +119,13 @@ if (lines.length === 0) throw new Error('no entries extracted — refusing to wr
 writeFileSync(OUT, gzipSync(lines.join('')));
 console.log(`wrote ${OUT} (${lines.length.toLocaleString()} entries)`);
 
-// Sanity: the table must decompress and contain the entries the narrator
-// pins in tests.
+// Sanity: the table must decompress and contain words the narrator's
+// tests depend on. LLM and RAG carry no IPA in the extract (verified
+// against the live data); the narrator's curated rows and the
+// RAG -> "rag" case fold cover them.
 const roundTrip = gunzipSync(gzipSync(lines.join(''))).toString();
-if (!roundTrip.includes('AI\t') || !roundTrip.includes('LLM\t')) {
-  throw new Error('sanity check failed: AI/LLM missing from the table');
+for (const must of ['AI\t', 'rag\t', 'dictionary\t']) {
+  if (!roundTrip.includes(must)) {
+    throw new Error(`sanity check failed: ${must.trim()} missing from the table`);
+  }
 }

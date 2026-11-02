@@ -17,6 +17,21 @@ use std::sync::OnceLock;
 
 const TABLE_GZ: &[u8] = include_bytes!("../../resources/pronunciation/en-US.tsv.gz");
 
+/// Hand-verified rows for words the extract can't provide (verified
+/// against the live pages, not the extraction) — consulted before the
+/// table so they survive every refresh.
+const CURATED: &[(&str, &str)] = &[
+    // Wiktionary's LLM page carries its IPA in a form wiktextract drops.
+    ("LLM", "elˈelem"),
+];
+
+fn curated(word: &str) -> Option<&'static str> {
+    CURATED
+        .iter()
+        .find(|(entry, _)| *entry == word)
+        .map(|(_, ipa)| *ipa)
+}
+
 fn table() -> &'static HashMap<String, String> {
     static TABLE: OnceLock<HashMap<String, String>> = OnceLock::new();
     TABLE.get_or_init(|| {
@@ -91,6 +106,9 @@ fn lookup_acronym(map: &HashMap<String, String>, token: &str) -> Option<String> 
     if !is_acronym(&cleaned) {
         return None;
     }
+    if let Some(ipa) = curated(&cleaned) {
+        return Some(ipa.to_string());
+    }
     if let Some(ipa) = map.get(&cleaned) {
         return Some(ipa.clone());
     }
@@ -100,8 +118,11 @@ fn lookup_acronym(map: &HashMap<String, String>, token: &str) -> Option<String> 
     }
     let stem = strip_plural(&cleaned);
     if stem.len() >= 2 && stem != cleaned {
-        let ipa = map.get(stem).or_else(|| map.get(&stem.to_lowercase()))?;
-        Some(format!("{ipa}{}", plural_suffix(ipa)))
+        let ipa = curated(stem)
+            .map(str::to_string)
+            .or_else(|| map.get(stem).cloned())
+            .or_else(|| map.get(&stem.to_lowercase()).cloned())?;
+        Some(format!("{ipa}{}", plural_suffix(&ipa)))
     } else {
         None
     }
@@ -118,6 +139,9 @@ pub(crate) fn acronym_ipa(token: &str) -> Option<String> {
 /// after a detectable failure, so normal words never pay for it.
 pub(crate) fn entry_ipa(word: &str) -> Option<String> {
     let cleaned = clean_token(word);
+    if let Some(ipa) = curated(&cleaned) {
+        return Some(ipa.to_string());
+    }
     table()
         .get(&cleaned)
         .or_else(|| table().get(&cleaned.to_lowercase()))
@@ -184,10 +208,15 @@ mod tests {
     }
 
     #[test]
-    fn bundled_table_loads_and_covers_the_seed_words() {
+    fn bundled_table_loads_and_covers_the_pinned_words() {
         let table = table();
-        assert!(table.contains_key("AI"), "seed table missing AI");
-        assert!(table.contains_key("LLM"), "seed table missing LLM");
-        assert!(acronym_ipa("AI").is_some());
+        assert!(table.contains_key("AI"), "table missing AI");
+        assert!(
+            table.contains_key("rag"),
+            "table missing rag (the RAG fold)"
+        );
+        // LLM has no IPA in the extract; the curated override answers.
+        assert!(!table.contains_key("LLM"));
+        assert_eq!(acronym_ipa("LLM").as_deref(), Some("elˈelem"));
     }
 }
