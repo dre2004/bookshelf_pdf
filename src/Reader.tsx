@@ -194,6 +194,39 @@ interface PageImageProps {
   ) => void;
   /** Jumps to a page (in-page link navigation). */
   onJumpPage: (page: number) => void;
+  /** Scroll-mode narration following; absent in paged mode. */
+  follow?: NarrationFollow;
+}
+
+/** What a page needs to keep its spoken line in view while narrating. */
+interface NarrationFollow {
+  container: HTMLElement | null;
+  pageEl: React.RefObject<HTMLDivElement | null>;
+  /** True once the user scrolls manually; following resumes on the next
+   *  spoken page (see the reset in Reader). */
+  suspended: React.MutableRefObject<boolean>;
+  /** `Date.now()` until which scroll events count as programmatic (ours),
+   *  not as the user taking over — smooth scrolling keeps firing events
+   *  for a few hundred ms after the call. */
+  programmaticUntil: React.MutableRefObject<number>;
+}
+
+/**
+ * Where the container should scroll to keep the spoken line
+ * `[lineTop, lineBottom]` (container-space pixels) inside a comfort band,
+ * or null when it already is. Only ever moves the view down the page —
+ * narration is forward, so anything above the viewport means the reader
+ * took over (and the suspension flag should have stopped us anyway).
+ */
+export function followScrollTarget(
+  scrollTop: number,
+  viewportHeight: number,
+  lineTop: number,
+  lineBottom: number,
+): number | null {
+  if (viewportHeight <= 0) return null;
+  if (lineBottom <= scrollTop + viewportHeight * 0.7) return null;
+  return Math.max(lineTop - viewportHeight * 0.4, scrollTop);
 }
 
 function PageImage({
@@ -207,6 +240,7 @@ function PageImage({
   spokenRange,
   onAddHighlight,
   onJumpPage,
+  follow,
 }: PageImageProps) {
   // Load status is keyed by URL (see the note at the <img> below).
   const [status, setStatus] = useState<{
@@ -277,6 +311,30 @@ function PageImage({
     if (!text || !spokenRange) return [] as OverlayBox[];
     return rangeBoxes(text, spokenRange.start, spokenRange.end, cssWidth, cssHeight);
   }, [text, spokenRange, cssWidth, cssHeight]);
+
+  // Narration following: when the spoken line drifts below the comfort
+  // band, bring it back to ~40% from the top. One adjustment per spoken
+  // chunk; nothing happens while the line is comfortably visible.
+  useEffect(() => {
+    const container = follow?.container;
+    const pageEl = follow?.pageEl.current;
+    if (!container || !pageEl || spokenBoxes.length === 0) return;
+    if (follow?.suspended.current) return;
+    const first = spokenBoxes[0];
+    const last = spokenBoxes[spokenBoxes.length - 1];
+    const target = followScrollTarget(
+      container.scrollTop,
+      container.clientHeight,
+      pageEl.offsetTop + first.top,
+      pageEl.offsetTop + last.top + last.height,
+    );
+    if (target != null) {
+      // Claim the next while of scroll events so our own smooth scroll
+      // does not read as the user grabbing the view.
+      follow.programmaticUntil.current = Date.now() + 800;
+      container.scrollTo({ top: target, behavior: "smooth" });
+    }
+  }, [spokenBoxes, follow]);
 
   const handleTextMouseUp = (e: React.MouseEvent) => {
     const selection = window.getSelection();
@@ -396,10 +454,19 @@ function PageImage({
 interface LazyPageProps extends PageImageProps {
   container: HTMLElement | null;
   registerEl: (index: number, el: HTMLDivElement | null) => void;
+  followSuspended: React.MutableRefObject<boolean>;
+  programmaticUntil: React.MutableRefObject<number>;
 }
 
 /** Deferred page in scroll mode: only renders once near the viewport. */
-function LazyPage({ container, registerEl, index, ...image }: LazyPageProps) {
+function LazyPage({
+  container,
+  registerEl,
+  followSuspended,
+  programmaticUntil,
+  index,
+  ...image
+}: LazyPageProps) {
   const ref = useRef<HTMLDivElement>(null);
   const [near, setNear] = useState(false);
 
@@ -423,7 +490,11 @@ function LazyPage({ container, registerEl, index, ...image }: LazyPageProps) {
   return (
     <div ref={ref} className="lazy-page">
       {near ? (
-        <PageImage {...image} index={index} />
+        <PageImage
+          {...image}
+          index={index}
+          follow={{ container, pageEl: ref, suspended: followSuspended, programmaticUntil }}
+        />
       ) : (
         <div
           className="page-frame placeholder"
@@ -603,8 +674,51 @@ export default function Reader({
     appliedJumpSerial.current = jumpSerial;
     if (!isJump && page === lastReported.current) return;
     lastReported.current = page;
-    pageEls.current.get(page)?.scrollIntoView({ block: "start", behavior: "auto" });
+    const el = pageEls.current.get(page);
+    if (el) {
+      // A narration-driven page turn must not read as the user scrolling.
+      programmaticScrollUntil.current = Date.now() + 800;
+      el.scrollIntoView({ block: "start", behavior: "auto" });
+    }
   }, [page, mode, jumpSerial]);
+
+  // ---- narration following (scroll mode) ----
+  // Manual scrolling (wheel, touch, scrollbar, scrolling keys) suspends
+  // following so re-reading never fights the view; narration crossing to
+  // a new page resumes it. Programmatic scrolls from the follow itself
+  // are excluded via a short window, since they fire the same scroll
+  // event the scrollbar drag does.
+  const followSuspended = useRef(false);
+  const programmaticScrollUntil = useRef(0);
+  useEffect(() => {
+    if (mode !== "scroll") return;
+    const container = containerRef.current;
+    if (!container) return;
+    const suspend = () => {
+      followSuspended.current = true;
+    };
+    const onScrollEvent = () => {
+      if (Date.now() > programmaticScrollUntil.current) suspend();
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "].includes(event.key)) {
+        suspend();
+      }
+    };
+    container.addEventListener("wheel", suspend, { passive: true });
+    container.addEventListener("touchmove", suspend, { passive: true });
+    container.addEventListener("keydown", onKeyDown);
+    container.addEventListener("scroll", onScrollEvent, { passive: true });
+    return () => {
+      container.removeEventListener("wheel", suspend);
+      container.removeEventListener("touchmove", suspend);
+      container.removeEventListener("keydown", onKeyDown);
+      container.removeEventListener("scroll", onScrollEvent);
+    };
+  }, [mode]);
+  useEffect(() => {
+    followSuspended.current = false;
+  }, [spokenRange?.page]);
 
   const lastProgressSent = useRef(0);
 
@@ -709,7 +823,14 @@ export default function Reader({
     >
       <div className="scroll-pages">
         {Array.from({ length: doc.pageCount }, (_, i) => (
-          <LazyPage key={i} {...pageImageProps(i)} container={containerEl} registerEl={registerEl} />
+          <LazyPage
+            key={i}
+            {...pageImageProps(i)}
+            container={containerEl}
+            registerEl={registerEl}
+            followSuspended={followSuspended}
+            programmaticUntil={programmaticScrollUntil}
+          />
         ))}
       </div>
       {searchHits.length > 0 && (
