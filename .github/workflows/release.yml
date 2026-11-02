@@ -3,7 +3,7 @@ name: Release
 # Tag-driven release builds. Push a version tag (e.g. v0.1.0) and each
 # platform builds installers attached to a draft GitHub Release:
 #   Windows: MSI + NSIS (x64)
-#   macOS:   universal DMG (Intel + Apple Silicon, unsigned)
+#   macOS:   Apple Silicon DMG (unsigned — see the Gatekeeper note below)
 #   Linux:   deb, rpm and AppImage (x64, built on 22.04 for glibc compat)
 on:
   push:
@@ -87,7 +87,10 @@ jobs:
 
             - **Windows**: `.msi` or `.exe` (NSIS) installer
             - **macOS**: `aarch64.dmg` (Apple Silicon) —
-              unsigned, so right-click → Open on first launch
+              unsigned: Gatekeeper reports the app as "damaged" for
+              downloaded un-notarized builds. After installing, run
+              `xattr -cr "/Applications/Bookshelf PDF.app"` once, then
+              open normally.
             - **Linux**: `.deb`, `.rpm` or `.AppImage`
           releaseDraft: true
           prerelease: false
