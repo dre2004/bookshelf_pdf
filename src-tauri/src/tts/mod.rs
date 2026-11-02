@@ -7,6 +7,7 @@ mod chunker;
 pub mod homograph;
 pub mod kokoro;
 pub mod lexicon;
+mod wiktionary;
 
 use std::{
     path::PathBuf,
