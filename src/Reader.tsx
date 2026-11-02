@@ -567,20 +567,24 @@ export default function Reader({
     if (resume.page <= 0 && resume.offset <= 0) return;
 
     let tries = 0;
-    const timer = window.setInterval(() => {
+    // Bare setInterval (not window.*): this callback must survive a jsdom
+    // test-environment teardown without throwing about `window`, and the
+    // cleanup below runs on unmount — but a fired-after-teardown callback
+    // is harmless when it can still clear itself.
+    const timer = setInterval(() => {
       const el = pageEls.current.get(resume.page);
       if (el) {
-        window.clearInterval(timer);
+        clearInterval(timer);
         const container = containerRef.current;
         if (container) {
           container.scrollTop = el.offsetTop - 12 + resume.offset * el.offsetHeight;
           lastReported.current = resume.page;
         }
       } else if (++tries > 60) {
-        window.clearInterval(timer);
+        clearInterval(timer);
       }
     }, 50);
-    return () => window.clearInterval(timer);
+    return () => clearInterval(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mode, doc.docId]);
 
