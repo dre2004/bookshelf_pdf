@@ -89,8 +89,9 @@ jobs:
             - **macOS**: `aarch64.dmg` (Apple Silicon) —
               unsigned: Gatekeeper reports the app as "damaged" for
               downloaded un-notarized builds. After installing, run
-              `xattr -cr "/Applications/Bookshelf PDF.app"` once, then
-              open normally.
+              `/usr/bin/xattr -cr "/Applications/Bookshelf PDF.app"`
+              once (Homebrew's xattr shadows the system one and rejects
+              `-cr`), then open normally.
             - **Linux**: `.deb`, `.rpm` or `.AppImage`
           releaseDraft: true
           prerelease: false
