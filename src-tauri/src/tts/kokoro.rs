@@ -169,11 +169,37 @@ fn lexicon_override_for(phonemizer: &EnglishPhonemizer, word: &str) -> Option<St
         .or_else(|| crate::tts::lexicon::resolve_with_phonemizer(word, phonemizer))
 }
 
+/// An unknown acronym is spelled with natural letter names: the
+/// fallback already produces the right phonemes, just with a stress mark
+/// on every letter ("ˈɛmˈɛl" for ML) — the stress goes, the letters stay
+/// ("ɛmɛl"). This retires the whole unknown-acronym class instead of
+/// chasing it dictionary row by dictionary row.
+fn graceful_acronym_spelling(phonemizer: &EnglishPhonemizer, token: &str) -> Option<String> {
+    use piper_plus_g2p::Phonemizer as _;
+    if !crate::tts::wiktionary::is_acronym(token) {
+        return None;
+    }
+    let (tokens, _) = phonemizer.phonemize_with_prosody(token).ok()?;
+    let ipa = tokens.concat();
+    if ipa.is_empty() {
+        return None;
+    }
+    let destressed: String = ipa.chars().filter(|c| *c != 'ˈ' && *c != 'ˌ').collect();
+    if destressed.is_empty() {
+        None
+    } else {
+        Some(destressed)
+    }
+}
+
 /// The full pronunciation-override decision for one token: Wiktionary
 /// acronyms first (their fallback failures are confidently wrong, not
-/// detectably wrong), then the letter-spelling lexicon rescue.
+/// detectably wrong), then natural letter-spelling for unknown acronyms,
+/// then the letter-spelling lexicon rescue.
 fn override_for_token(phonemizer: &EnglishPhonemizer, token: &str) -> Option<String> {
-    crate::tts::wiktionary::acronym_ipa(token).or_else(|| lexicon_override_for(phonemizer, token))
+    crate::tts::wiktionary::acronym_ipa(token)
+        .or_else(|| graceful_acronym_spelling(phonemizer, token))
+        .or_else(|| lexicon_override_for(phonemizer, token))
 }
 
 /// Char-level phoneme tokenizer parsed straight from `tokenizer.json`
@@ -225,6 +251,9 @@ pub struct KokoroModel {
     /// Resolved control-char artifacts ("assign<U+0002>ment"), cached per
     /// raw token.
     artifact_cache: Mutex<HashMap<String, String>>,
+    /// OCR/glued-token repairs, cached per token (the identity mapping is
+    /// the common case and also cached, so unknown words phonemize once).
+    repair_cache: Mutex<HashMap<String, String>>,
 }
 
 /// A stretch of words to hand the phonemizer in one piece.
@@ -360,6 +389,7 @@ impl KokoroModel {
             style_is_full,
             lexicon_cache: Mutex::new(HashMap::new()),
             artifact_cache: Mutex::new(HashMap::new()),
+            repair_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -377,6 +407,53 @@ impl KokoroModel {
         }
         let resolved = resolve_control_artifacts(&token, &self.phonemizer);
         self.artifact_cache
+            .lock()
+            .unwrap()
+            .insert(token, resolved.clone());
+        resolved
+    }
+
+    /// Dictionary-guided repairs for a single word-shaped token: OCR l→I
+    /// swaps and glued-word segmentation. Both run only for tokens that
+    /// are unknown to the table AND letter-spell through the fallback —
+    /// pronounceable words are never reinterpreted.
+    fn repair_unknown_token(&self, token: String) -> String {
+        let is_candidate = |token: &str| {
+            let bare = token.trim_matches(|c: char| !c.is_alphanumeric());
+            !bare.is_empty()
+                && !crate::tts::wiktionary::is_known_word(&bare.to_lowercase())
+                && !crate::tts::wiktionary::is_acronym(token)
+        };
+        if !is_candidate(&token) {
+            return token;
+        }
+        {
+            let cache = self.repair_cache.lock().unwrap();
+            if let Some(hit) = cache.get(&token) {
+                return hit.clone();
+            }
+        }
+        use piper_plus_g2p::Phonemizer as _;
+        let resolved = (|| {
+            // Only tokens the fallback fails on are worth repairing.
+            let Ok((tokens, _)) = self.phonemizer.phonemize_with_prosody(&token) else {
+                return token.clone();
+            };
+            let ipa = tokens.concat();
+            if ipa.is_empty()
+                || !crate::tts::lexicon::spells_letter_by_letter(&token.to_lowercase(), &ipa)
+            {
+                return token.clone();
+            }
+            let known = |word: &str| crate::tts::wiktionary::is_known_word(word);
+            crate::tts::repair::repair_ocr(&token, &known)
+                .or_else(|| crate::tts::repair::segment_glued(&token, &known))
+                // The repaired string is itself identifier-shaped
+                // ("anInteger") — split it into its words.
+                .map(|repaired| crate::tts::repair::split_structural(&repaired).join(" "))
+                .unwrap_or_else(|| token.clone())
+        })();
+        self.repair_cache
             .lock()
             .unwrap()
             .insert(token, resolved.clone());
@@ -431,6 +508,31 @@ impl KokoroModel {
 
     /// English text → IPA (word boundaries preserved, sentence punctuation
     /// kept for natural pausing).
+    /// Raw page text to speakable word tokens: typographic punctuation
+    /// normalized, letter-spaced runs rejoined, control-char artifacts
+    /// resolved, then machine-shaped tokens split (identifiers on case
+    /// and separator boundaries), classified (URLs read as "link",
+    /// permission strings and versions dropped) and repaired (OCR l→I
+    /// swaps, glued-word segmentation — only for tokens that would
+    /// letter-spell, so real words are never reinterpreted).
+    fn speakable_tokens(&self, text: &str) -> Vec<String> {
+        let text = normalize_typographic(text);
+        let mut repaired: Vec<String> = Vec::new();
+        for token in repair_letter_spaced(&text) {
+            let token = self.resolve_token_artifacts(token);
+            for piece in crate::tts::repair::split_structural(&token) {
+                match crate::tts::repair::classify_machine_text(&piece) {
+                    crate::tts::repair::MachineText::Speak => {
+                        repaired.push(self.repair_unknown_token(piece));
+                    }
+                    crate::tts::repair::MachineText::Link => repaired.push("link".to_string()),
+                    crate::tts::repair::MachineText::Drop => {}
+                }
+            }
+        }
+        repaired
+    }
+
     fn phonemize(&self, text: &str) -> Result<String, String> {
         // Nothing-to-say input must stop here: normalization maps control
         // chars to '-' (exotic-hyphen repair), so a bare "\r\n" would
@@ -438,15 +540,7 @@ impl KokoroModel {
         if !text.chars().any(|c| c.is_alphanumeric()) {
             return Ok(String::new());
         }
-        // Typographic punctuation must become ASCII before G2P: publishers
-        // use U+2019 etc., which breaks dictionary lookups and makes the
-        // fallback spell words letter by letter ("you<U+2019>re" is heard
-        // as "y-o-u-r-e").
-        let text = normalize_typographic(text);
-        let repaired: Vec<String> = repair_letter_spaced(&text)
-            .into_iter()
-            .map(|token| self.resolve_token_artifacts(token))
-            .collect();
+        let repaired = self.speakable_tokens(text);
         let tokens: Vec<&str> = repaired.iter().map(String::as_str).collect();
         use piper_plus_g2p::Phonemizer as _;
         // Words the dictionary would letter-spell get a lexicon-derived
@@ -884,6 +978,87 @@ mod g2p_tests {
     use super::*;
     use piper_plus_g2p::Phonemizer as _;
 
+    /// Document pronunciation audit: every unique word of a PDF through
+    /// the exact production decision chain, reporting what the narrator
+    /// would fix and what would letter-spell. Opt-in:
+    ///   BOOKSHELF_AUDIT_BOOK="doc.pdf" cargo test --lib audit_document -- --nocapture
+    #[test]
+    fn audit_document_pronunciation() {
+        let Ok(book) = std::env::var("BOOKSHELF_AUDIT_BOOK") else {
+            return;
+        };
+        let engine = crate::pdfium_engine::Engine::with_library_path(
+            &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/pdfium/pdfium.dll"),
+        )
+        .expect("pdfium");
+        let info = engine.open_document(&book, None).expect("open book");
+        let phonemizer =
+            piper_plus_g2p::english::EnglishPhonemizer::new_bundled().expect("phonemizer");
+        let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../engine/kokoro");
+        let model = KokoroModel::load(&model_dir).expect("kokoro pack (engine/kokoro)");
+
+        // Token occurrences after the full production pipeline: splits,
+        // machine-text policy, OCR and glued-word repair included.
+        let mut freq = std::collections::BTreeMap::<String, usize>::new();
+        for page in 0..info.page_count {
+            let Ok(data) = engine.page_text(info.doc_id, page as i32) else {
+                continue;
+            };
+            for piece in model.speakable_tokens(&data.chars) {
+                for token in piece.split_whitespace() {
+                    let word =
+                        token.trim_matches(|c: char| !c.is_alphanumeric() && c != '\'' && c != '-');
+                    if word.chars().any(|c| c.is_alphabetic()) && word.chars().count() >= 2 {
+                        *freq.entry(word.to_string()).or_default() += 1;
+                    }
+                }
+            }
+        }
+        engine.close_document(info.doc_id);
+
+        let mut clean = 0usize;
+        let mut acronym_fixed = 0usize;
+        let mut lexicon_fixed = 0usize;
+        let mut gaps: Vec<(String, usize, String)> = Vec::new();
+        for (word, count) in &freq {
+            let lower = word.to_lowercase();
+            let probed = [&lower, word];
+            let ipa = probed
+                .iter()
+                .find_map(|w| phonemizer.phonemize_with_prosody(w).ok())
+                .map(|(tokens, _)| tokens.concat())
+                .unwrap_or_default();
+            let spelled =
+                crate::tts::lexicon::spells_letter_by_letter(&lower, &ipa) && !ipa.is_empty();
+            if spelled {
+                match override_for_token(&phonemizer, &lower) {
+                    Some(_) => lexicon_fixed += 1,
+                    None => gaps.push((word.clone(), *count, format!("letter-spells: {ipa}"))),
+                }
+            } else if crate::tts::wiktionary::is_acronym(word)
+                && crate::tts::wiktionary::acronym_ipa(word).is_some()
+            {
+                acronym_fixed += 1;
+            } else {
+                clean += 1;
+            }
+        }
+
+        let total = freq.len();
+        println!(
+            "== {book}: {total} unique words, {} pages ==",
+            info.page_count
+        );
+        println!(
+            "clean(dict): {clean} | acronyms fixed: {acronym_fixed} | lexicon fixed: {lexicon_fixed} | GAPS: {}",
+            gaps.len()
+        );
+        println!("== GAPS (word, occurrences, reason) ==");
+        gaps.sort_by_key(|(_, count, _)| std::cmp::Reverse(*count));
+        for (word, count, reason) in &gaps {
+            println!("  {word:>24} x{count:<4} {reason}");
+        }
+    }
     #[test]
     fn empty_and_whitespace_text_synthesize_nothing() {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../engine/kokoro");
