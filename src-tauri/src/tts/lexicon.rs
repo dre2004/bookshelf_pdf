@@ -247,9 +247,10 @@ fn resolve_inner(word: &str, phonemize: &mut dyn FnMut(&str) -> Option<String>) 
             continue;
         };
         if rest.len() >= 5
-            && let Some(rest_ipa) = resolve_inner(rest, phonemize) {
-                return Some(format!("{prefix_ipa}{rest_ipa}"));
-            }
+            && let Some(rest_ipa) = resolve_inner(rest, phonemize)
+        {
+            return Some(format!("{prefix_ipa}{rest_ipa}"));
+        }
     }
     None
 }

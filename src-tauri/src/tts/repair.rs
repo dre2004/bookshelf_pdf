@@ -193,15 +193,15 @@ pub(crate) fn classify_machine_text(token: &str) -> MachineText {
     let bare = token.trim_matches(|c: char| !c.is_alphanumeric());
     if let Some((stem, ext)) = bare.rsplit_once('.')
         && !stem.is_empty()
-            && stem
-                .chars()
-                .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
-            && (2..=5).contains(&ext.len())
-            && ext.chars().all(|c| c.is_ascii_alphabetic())
-            && LINK_SUFFIXES.contains(&ext.to_lowercase().as_str())
-        {
-            return MachineText::Link;
-        }
+        && stem
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+        && (2..=5).contains(&ext.len())
+        && ext.chars().all(|c| c.is_ascii_alphabetic())
+        && LINK_SUFFIXES.contains(&ext.to_lowercase().as_str())
+    {
+        return MachineText::Link;
+    }
     // Unix permission strings: -rw-rw-r--, drwxr-xr-x.
     if bare.len() >= 6 && bare.chars().all(|c| "drwx-".contains(c)) {
         return MachineText::Drop;
