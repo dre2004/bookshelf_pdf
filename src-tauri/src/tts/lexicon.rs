@@ -75,6 +75,70 @@ const SUPPLEMENTS: &[(&str, &str)] = &[
     // (production + -ize + -ing) and Wiktionary doesn't carry.
     ("productionize", "prəˌdʌkʃəˈnaɪz"),
     ("productionizing", "prəˌdʌkʃəˈnaɪzɪŋ"),
+    // Audit-driven burst (five technical books): recurring vocabulary
+    // CMU lacks. Language keywords first — "struct" alone was the
+    // largest single gap in two of the books.
+    ("struct", "strˈʌkt"),
+    ("superclass", "sˈuːpɚklæs"),
+    ("metaclass", "mˈɛtəklæs"),
+    ("subclass", "sˈʌbklæs"),
+    ("frontend", "fɹʌntˈɛnd"),
+    ("middleware", "mˈɪdlwɛɹ"),
+    ("username", "jˈuːzɚnɛm"),
+    ("logout", "lˈɔɡaʊt"),
+    ("resize", "ɹiːˈsaɪz"),
+    ("postgres", "pˈɒstɡɹɛs"),
+    ("subdirectory", "sˈʌbdaɪɹɛktɚɹi"),
+    ("breakpoint", "bɹˈeɪkpɔɪnt"),
+    ("radians", "ɹˈeɪdiənz"),
+    ("encapsulation", "ɪnkˌæpsəlˈeɪʃən"),
+    ("dockerhub", "dˈɑkɚhʌb"),
+    ("dockerfile", "dˈɑkɚfaɪl"),
+    ("iterator", "ˈɪtəɹeɪtɚ"),
+    ("iterating", "ˈɪtəɹeɪtɪŋ"),
+    ("iterations", "ˌɪtəɹˈeɪʃənz"),
+    ("refactor", "ɹiːˈfæktɚ"),
+    ("refactoring", "ɹiːˈfæktɚɪŋ"),
+    ("bitmap", "bˈɪtmæp"),
+    ("factorial", "fækˈtɔɹiəl"),
+    ("subroutines", "sˈʌbɹuːtiːnz"),
+    ("microservices", "ˈmaɪkɹoʊsˌɜːvɪsɪz"),
+    ("multithreaded", "ˈmʌltɪθɹɛdɪd"),
+    ("predefined", "pɹˌiːdɪˈfaɪnd"),
+    ("prebuilt", "pɹˈiːbɪlt"),
+    ("predebugger", "pɹˌiːdˈiːbʌɡɚ"),
+    ("padovan", "ˈpædəvən"),
+    ("pragmas", "pɹˈæɡɹəməz"),
+    ("referents", "ɹˈɛfɚənts"),
+    ("reinitialize", "ɹiːˌɪnɪʃəˈlaɪz"),
+    ("dotenv", "dɑtˈɛnv"),
+    ("bcrypt", "ˈbiːkɹɪpt"),
+    ("gitignore", "ɡˈɪtɪɡnɔːɹ"),
+    ("newline", "njˈuːlaɪn"),
+    ("datetime", "ˈdeɪtaɪtaɪm"),
+    ("nonzero", "nˌɑːnˈzɪɹoʊ"),
+    ("metalanguage", "mˈɛtəlˌæŋɡwɪdʒ"),
+    ("contextual", "kəntˈɛkstʃuəl"),
+    ("parenthesized", "pəɹˈɛnθəˌsaɪzd"),
+    ("modifiable", "mˈɑdɪfaɪəbəl"),
+    // Proper nouns from the same books (frameworks, authors).
+    ("morphic", "mˈɔɹfɪk"),
+    ("smalltalk", "ˈsmɔːltˈɔːk"),
+    ("unicode", "jˈuːnɪkoʊd"),
+    ("mandelbrot", "mˈændəlbɹɑt"),
+    ("nierstrasz", "nˈɪɹstɹɑːs"),
+    ("pelrine", "pˈɛlɹaɪn"),
+    ("ducasse", "dʊˈkɑːs"),
+    ("cassou", "kəˈsuː"),
+    ("blandy", "blˈændi"),
+    ("flitton", "flˈɪtən"),
+    ("hilaire", "ɪˈlɛɹ"),
+    ("metacello", "mˈɛtəsɛloʊ"),
+    ("digitalk", "dˈɪdʒɪtɑk"),
+    ("whizzard", "wˈɪzɚd"),
+    ("fortran", "fˈɔːtɹæn"),
+    ("kubernetes", "kˌuːbɚnˈɛtiz"),
+    ("metaprogramming", "mˈɛtəpɹˌoʊɡɹæmɪŋ"),
 ];
 
 /// espeak-IPA appended to a stem's pronunciation for each derivational
@@ -102,7 +166,17 @@ const SUFFIX_RULES: &[(&str, &str)] = &[
     ("able", "əbəl"),
     ("ism", "ɪzəm"),
     ("ist", "ɪst"),
+    // adverbial -ally on -ic stems (dynamically = dynamic + ally; the
+    // spelling is literally stem+ally, the sound is stem+ɪkli).
+    ("ally", "li"),
+    // -less keeps the stem's stress (serverless = server + less).
+    ("less", "ləs"),
 ];
+
+/// espeak-IPA prepended to a stem's pronunciation for each prefix.
+/// Prefixes are stress-neutral enough for narration; only "un-" is
+/// listed because it is by far the most productive in technical prose.
+const PREFIX_RULES: &[(&str, &str)] = &[("un", "ˌʌn")];
 
 /// The pronunciation for `word`, or None when neither the curated table
 /// nor suffix rules can build one (the phonemizer's fallback stands).
@@ -112,6 +186,12 @@ pub(crate) fn resolve<F>(word: &str, mut phonemize: F) -> Option<String>
 where
     F: FnMut(&str) -> Option<String>,
 {
+    resolve_inner(word, &mut phonemize)
+}
+
+/// Monomorphic core so prefix handling can recurse without the generic
+/// nesting on itself.
+fn resolve_inner(word: &str, phonemize: &mut dyn FnMut(&str) -> Option<String>) -> Option<String> {
     let word = word
         .trim_matches(|c: char| !c.is_alphanumeric() && c != '\'')
         .to_ascii_lowercase();
@@ -133,7 +213,7 @@ where
         // Stem candidates: bare, and with a restored 'e' for e-dropping
         // verbs not already covered by a rule (comparable -> comparable).
         for candidate in [stem, &format!("{stem}e")] {
-            if let Some(stem_ipa) = stem_pronunciation(candidate, &mut phonemize) {
+            if let Some(stem_ipa) = stem_pronunciation(candidate, phonemize) {
                 return Some(format!("{stem_ipa}{suffix_ipa}"));
             }
         }
@@ -152,11 +232,24 @@ where
             continue;
         }
         for candidate in [stem, &format!("{stem}e")] {
-            let Some(stem_ipa) = stem_pronunciation(candidate, &mut phonemize) else {
+            let Some(stem_ipa) = stem_pronunciation(candidate, phonemize) else {
                 continue;
             };
             let ending = inflection_ipa(kind, stem_ipa.chars().last())?;
             return Some(format!("{stem_ipa}{ending}"));
+        }
+    }
+
+    // Prefixes: strip and resolve the rest recursively, so "un-" chains
+    // with suffixes and inflections (uninitialized = un + initialized).
+    for (prefix, prefix_ipa) in PREFIX_RULES {
+        let Some(rest) = word.strip_prefix(prefix) else {
+            continue;
+        };
+        if rest.len() >= 5
+            && let Some(rest_ipa) = resolve_inner(rest, phonemize)
+        {
+            return Some(format!("{prefix_ipa}{rest_ipa}"));
         }
     }
     None
@@ -191,10 +284,10 @@ fn inflection_ipa(kind: char, last_phoneme: Option<char>) -> Option<&'static str
 /// The pronunciation of a stem: curated table first (so inflections of
 /// curated words derive), otherwise the phonemizer — which rejects
 /// stems it would spell letter by letter.
-fn stem_pronunciation<F>(stem: &str, phonemize: &mut F) -> Option<String>
-where
-    F: FnMut(&str) -> Option<String>,
-{
+fn stem_pronunciation(
+    stem: &str,
+    phonemize: &mut dyn FnMut(&str) -> Option<String>,
+) -> Option<String> {
     if let Some((_, ipa)) = SUPPLEMENTS.iter().find(|(w, _)| *w == stem) {
         return Some((*ipa).to_string());
     }

@@ -7,6 +7,7 @@ mod chunker;
 pub mod homograph;
 pub mod kokoro;
 pub mod lexicon;
+mod repair;
 mod wiktionary;
 
 use std::{

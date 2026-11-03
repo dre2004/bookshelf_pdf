@@ -19,10 +19,39 @@ const TABLE_GZ: &[u8] = include_bytes!("../../resources/pronunciation/en-US.tsv.
 
 /// Hand-verified rows for words the extract can't provide (verified
 /// against the live pages, not the extraction) — consulted before the
-/// table so they survive every refresh.
+/// table so they survive every refresh. Web/tech acronyms dominate:
+/// prose leans on them hardest and Wiktionary's IPA coverage has holes
+/// exactly there.
 const CURATED: &[(&str, &str)] = &[
     // Wiktionary's LLM page carries its IPA in a form wiktextract drops.
     ("LLM", "elˈelem"),
+    ("HTML", "ˌeɪtʃˌtiːˌɛmˈɛl"),
+    ("URL", "ˌjuːˌɑːɹˈɛl"),
+    ("HTTP", "ˌeɪtʃˌtiːˌtiːˈpiː"),
+    ("AWS", "ˌeɪˌdʌbəljuːˈɛs"),
+    ("EC2", "ˌiːˈsiːˈtuː"),
+    ("NGINX", "ˈɛndʒɪnˌɛks"),
+    ("ISBN", "ˌaɪɛsˌbiːˈɛn"),
+    ("SSH", "ˌɛsɛsˈeɪtʃ"),
+    ("UTF-8", "ˌjuːtiːˈɛfˈeɪt"),
+    ("EOF", "ˌiːoʊˈɛf"),
+    ("I/O", "ˌaɪˈoʊ"),
+    ("UNIX", "ˈjuːnɪks"),
+    ("PHP", "ˌpiːeɪtʃˈpiː"),
+    ("AST", "ˌeɪɛsˈtiː"),
+    ("GCD", "ˌdʒiːsiːˈdiː"),
+    ("EGA", "ˈiːdʒiːˈeɪ"),
+    ("VGA", "ˌviːdʒiːˈeɪ"),
+    ("CGA", "ˈsiːdʒiːˈeɪ"),
+    ("CMD", "ˌsiːɛmˈdiː"),
+    ("EBNF", "ˌiːbiːɛnˈɛf"),
+    ("SBE", "ˌɛsbiːˈiː"),
+    ("GPU", "ˌdʒiːpiːˈjuː"),
+    ("UI", "ˌjuːˈaɪ"),
+    ("ML", "ˌɛmˈɛl"),
+    ("AQI", "ˌeɪˌkjuːˈaɪ"),
+    ("III", "ˈθriː"),
+    ("R&D", "ˌɑːɹændˈdiː"),
 ];
 
 fn curated(word: &str) -> Option<&'static str> {
@@ -69,7 +98,7 @@ fn clean_token(token: &str) -> String {
 /// All-caps shape: "LLM", "LLM's", "LLMs" (a trailing plural s may be
 /// lowercase). Single letters are excluded — they are ordinary words
 /// ("A", "I").
-fn is_acronym(word: &str) -> bool {
+pub(crate) fn is_acronym(word: &str) -> bool {
     let mut letters: Vec<char> = word.chars().filter(|c| c.is_ascii_alphabetic()).collect();
     if matches!(letters.last(), Some('s' | 'S')) {
         letters.pop();
@@ -142,10 +171,35 @@ pub(crate) fn entry_ipa(word: &str) -> Option<String> {
     if let Some(ipa) = curated(&cleaned) {
         return Some(ipa.to_string());
     }
+    let lower = cleaned.to_lowercase();
     table()
         .get(&cleaned)
-        .or_else(|| table().get(&cleaned.to_lowercase()))
+        // Split identifier pieces arrive Capitalized ("Http"): try the
+        // lower and upper shapes too.
+        .or_else(|| table().get(&lower))
+        .or_else(|| table().get(&lower.to_uppercase()))
         .cloned()
+}
+
+/// Segmentation dictionary: is this a word the table (or curated rows)
+/// knows? Used by the token repairs that split glued identifiers and OCR
+/// damage. Function words some extracts omit are backed by a small core
+/// list so segmentation never misses glue like "a" or "of".
+pub(crate) fn is_known_word(word: &str) -> bool {
+    const CORE: &[&str] = &[
+        "a", "an", "as", "at", "be", "by", "do", "go", "he", "if", "in", "is", "it", "me", "my",
+        "no", "of", "on", "or", "so", "to", "up", "us", "we", "can", "and", "the", "you", "for",
+        "not", "but", "all", "out", "get", "new", "now", "old", "see", "two", "way", "who", "its",
+        "did", "yes",
+    ];
+    if word.is_empty() {
+        return false;
+    }
+    if CORE.contains(&word) || curated(word).is_some() {
+        return true;
+    }
+    let table = table();
+    table.contains_key(word) || table.contains_key(&word.to_lowercase())
 }
 
 #[cfg(test)]
